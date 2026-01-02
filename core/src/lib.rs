@@ -1,80 +1,114 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
-    sync::RwLock,
+    path::{Path, PathBuf},
+    sync::{atomic::AtomicU64, RwLock},
+    time::SystemTime,
 };
 
-use fst::{automaton::Subsequence, IntoStreamer, Map, Streamer};
-use memmap2::Mmap;
+use fst::{IntoStreamer, Streamer};
+
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Opstamp(u64);
+mod matcher;
+use matcher::*;
+mod segmented_index;
+use segmented_index::*;
+mod opstamp;
+use opstamp::*;
 
-impl Opstamp {
-    const TOMBSTONE_BIT: u64 = 1 << 63;
-    const SEQ_MASK: u64 = !Self::TOMBSTONE_BIT;
-
-    #[inline]
-    fn deletion(seq: u64) -> Self {
-        Self(seq | Self::TOMBSTONE_BIT)
-    }
-
-    #[inline]
-    fn insertion(seq: u64) -> Self {
-        Self(seq & Self::SEQ_MASK)
-    }
-
-    #[inline]
-    fn is_deletion(&self) -> bool {
-        self.0 & Self::TOMBSTONE_BIT == 1
-    }
-
-    #[inline]
-    fn sequence(&self) -> u64 {
-        self.0 & Self::SEQ_MASK
-    }
-}
-
-struct SegmentedIndex {
-    segments: Vec<Map<Mmap>>,
-}
-
-impl SegmentedIndex {
-    pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self, std::io::Error> {
-        let mut segments = Vec::new();
-
-        let entries = std::fs::read_dir(dir)?;
-
-        for entry in entries.flatten() {
-            let entry_file = std::fs::File::open(entry.path())?;
-            let mmap = unsafe { Mmap::map(&entry_file)? };
-            if let Ok(map) = Map::new(mmap) {
-                segments.push(map);
-            }
-        }
-
-        Ok(Self { segments })
+impl From<std::io::Error> for SegmentedIndexError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
 pub struct Index {
+    path: PathBuf,
     base: RwLock<SegmentedIndex>,
+    next_op_seq: AtomicU64,
     mem_idx: RwLock<BTreeMap<String, Opstamp>>,
 }
 
 impl Index {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
-        let base = SegmentedIndex::open(path)
-            .map_err(IndexError::Open)
-            .map(RwLock::new)?;
+        let (base, last_op) = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
+
+        let last_op = last_op.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        });
+
+        let base = RwLock::new(base);
+        let next_op_seq = AtomicU64::new(last_op);
         let mem_idx = RwLock::new(BTreeMap::new());
 
-        Ok(Self { base, mem_idx })
+        Ok(Self {
+            path: path.as_ref().to_path_buf(),
+            base,
+            next_op_seq,
+            mem_idx,
+        })
+    }
+
+    fn next_op_seq(&self) -> u64 {
+        self.next_op_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn insert(&self, item: &str) -> Result<(), IndexError> {
+        let seq = self.next_op_seq();
+        self.mem_idx
+            .write()
+            .map_err(|_| IndexError::WriteLock)?
+            .insert(item.to_string(), Opstamp::insertion(seq));
+        Ok(())
+    }
+
+    pub fn delete(&self, item: &str) -> Result<(), IndexError> {
+        let seq = self.next_op_seq();
+        self.mem_idx
+            .write()
+            .map_err(|_| IndexError::WriteLock)?
+            .insert(item.to_string(), Opstamp::deletion(seq));
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<(), IndexError> {
+        let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
+
+        if mem.is_empty() {
+            return Ok(());
+        };
+
+        let segment_path = self.path.join(format!("{}.seg", self.next_op_seq()));
+
+        self.base
+            .write()
+            .map_err(|_| IndexError::WriteLock)?
+            .append_segment(&segment_path, std::mem::take(&mut *mem).into_iter())
+            .map_err(IndexError::SegmentedIndex)?;
+
+        self.base
+            .write()
+            .map_err(|_| IndexError::WriteLock)?
+            .load(&segment_path)
+            .map_err(IndexError::SegmentedIndex)?;
+
+        Ok(())
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<String>, IndexError> {
-        let matcher = Subsequence::new(query);
+        let mut pattern = String::from("(?i)(?s).*");
+
+        for ch in query.chars() {
+            let escaped = regex_syntax::escape(&ch.to_string());
+            pattern.push_str(&escaped);
+            pattern.push_str(".*");
+        }
+
+        let matcher = RegexMatcher::new(&pattern).map_err(|e| IndexError::Regex(e.to_string()))?;
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
@@ -86,10 +120,10 @@ impl Index {
             }
         }
 
-        for segment in segments.segments.iter() {
-            let mut stream = segment.search(matcher.clone()).into_stream();
+        for segment in segments.segments() {
+            let mut stream = segment.search(&matcher).into_stream();
             while let Some((term, val)) = stream.next() {
-                let val = Opstamp(val);
+                let val = Opstamp::from(val);
                 let s = std::str::from_utf8(term).expect("invalid term");
 
                 candidates
@@ -131,8 +165,14 @@ impl Index {
 
 #[derive(Debug, Error)]
 pub enum IndexError {
-    #[error("failed to open index on disk")]
+    #[error("failed to open index on disk: {0}")]
     Open(std::io::Error),
     #[error("failed to read lock data")]
     ReadLock,
+    #[error("failed to write lock data")]
+    WriteLock,
+    #[error(transparent)]
+    SegmentedIndex(SegmentedIndexError),
+    #[error("failed to compile matching regex: {0}")]
+    Regex(String),
 }
