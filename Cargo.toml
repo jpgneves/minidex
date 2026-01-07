@@ -2,5 +2,7 @@
 resolver = "3"
 members = [
         "core",
-        "server"
+]
+exclude = [
+        "examples/fs-index"
 ]

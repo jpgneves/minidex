@@ -1,0 +1,8 @@
+[package]
+name = "fs-index"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+minidex-core = { path = "../../core" }
+ignore = "0.4.25"

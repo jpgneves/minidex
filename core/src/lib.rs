@@ -9,28 +9,38 @@ use fst::{IntoStreamer, Streamer};
 
 use thiserror::Error;
 
+mod common;
+pub use common::Kind;
+use common::*;
+mod entry;
+pub use entry::FilesystemEntry;
+use entry::*;
 mod matcher;
 use matcher::*;
 mod segmented_index;
 use segmented_index::*;
 mod opstamp;
 use opstamp::*;
-
-impl From<std::io::Error> for SegmentedIndexError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
+mod compactor;
+use compactor::*;
 
 pub struct Index {
     path: PathBuf,
     base: RwLock<SegmentedIndex>,
     next_op_seq: AtomicU64,
-    mem_idx: RwLock<BTreeMap<String, Opstamp>>,
+    mem_idx: RwLock<BTreeMap<String, IndexEntry>>,
+    compactor_config: CompactorConfig,
 }
 
 impl Index {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
+        Self::open_with_config(path, CompactorConfig::default())
+    }
+
+    pub fn open_with_config<P: AsRef<Path>>(
+        path: P,
+        compactor_config: CompactorConfig,
+    ) -> Result<Self, IndexError> {
         let (base, last_op) = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
 
         let last_op = last_op.unwrap_or_else(|| {
@@ -49,6 +59,7 @@ impl Index {
             base,
             next_op_seq,
             mem_idx,
+            compactor_config,
         })
     }
 
@@ -57,21 +68,43 @@ impl Index {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    pub fn insert(&self, item: &str) -> Result<(), IndexError> {
+    pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
         self.mem_idx
             .write()
             .map_err(|_| IndexError::WriteLock)?
-            .insert(item.to_string(), Opstamp::insertion(seq));
+            .insert(
+                item.path.to_string_lossy().to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::insertion(seq),
+                    kind: item.kind,
+                    content_type: 0,
+                    last_modified: item.last_modified,
+                    last_accessed: item.last_accessed,
+                },
+            );
+
+        if self.should_compact() {
+            self.compact();
+        }
         Ok(())
     }
 
-    pub fn delete(&self, item: &str) -> Result<(), IndexError> {
+    pub fn delete(&self, item: &PathBuf) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
         self.mem_idx
             .write()
             .map_err(|_| IndexError::WriteLock)?
-            .insert(item.to_string(), Opstamp::deletion(seq));
+            .insert(
+                item.to_string_lossy().to_string(),
+                IndexEntry {
+                    opstamp: Opstamp::deletion(seq),
+                    kind: Kind::File,
+                    content_type: 0,
+                    last_modified: 0,
+                    last_accessed: 0,
+                },
+            );
         Ok(())
     }
 
@@ -82,29 +115,37 @@ impl Index {
             return Ok(());
         };
 
-        let segment_path = self.path.join(format!("{}.seg", self.next_op_seq()));
+        let segment_path = self.path.join(format!("{}", self.next_op_seq()));
 
-        self.base
-            .write()
-            .map_err(|_| IndexError::WriteLock)?
-            .append_segment(&segment_path, std::mem::take(&mut *mem).into_iter())
+        let mut base = self.base.write().map_err(|_| IndexError::WriteLock)?;
+        base.write_segment(&segment_path, std::mem::take(&mut *mem).into_iter())
             .map_err(IndexError::SegmentedIndex)?;
 
-        self.base
-            .write()
-            .map_err(|_| IndexError::WriteLock)?
-            .load(&segment_path)
+        base.load(&segment_path)
+            .map_err(IndexError::SegmentedIndex)?;
+
+        base.save_last_op(self.next_op_seq.load(std::sync::atomic::Ordering::SeqCst))
             .map_err(IndexError::SegmentedIndex)?;
 
         Ok(())
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<String>, IndexError> {
+    pub fn rollback(&self) -> Result<(), IndexError> {
+        let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
+
+        mem.clear();
+
+        Ok(())
+    }
+
+    pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, IndexError> {
         let mut pattern = String::from("(?i)(?s).*");
 
-        for ch in query.chars() {
-            let escaped = regex_syntax::escape(&ch.to_string());
-            pattern.push_str(&escaped);
+        for word in query.split_whitespace() {
+            for ch in word.chars() {
+                let escaped = regex_syntax::escape(&ch.to_string());
+                pattern.push_str(&escaped);
+            }
             pattern.push_str(".*");
         }
 
@@ -112,37 +153,55 @@ impl Index {
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
-        let mut candidates: HashMap<String, Opstamp> = HashMap::new();
+        let mut candidates: HashMap<String, (String, IndexEntry)> = HashMap::new();
 
-        for (k, v) in mem.iter() {
-            if self.is_fuzzy_match(query, k) {
-                candidates.insert(k.clone(), *v);
+        for (path, entry) in mem.iter() {
+            if matcher.is_match(path) {
+                let normalized = path.to_lowercase();
+
+                candidates
+                    .entry(normalized)
+                    .and_modify(|(current_path, current_entry)| {
+                        if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
+                            *current_entry = *entry;
+                            *current_path = path.clone()
+                        }
+                    })
+                    .or_insert((path.clone(), *entry));
             }
         }
 
         for segment in segments.segments() {
-            let mut stream = segment.search(&matcher).into_stream();
-            while let Some((term, val)) = stream.next() {
-                let val = Opstamp::from(val);
-                let s = std::str::from_utf8(term).expect("invalid term");
+            let mut stream = segment.as_ref().search(&matcher).into_stream();
+            while let Some((term, offset)) = stream.next() {
+                if let Some(entry) = segment.get_entry(offset) {
+                    let path = std::str::from_utf8(term).expect("invalid term").to_string();
 
-                candidates
-                    .entry(s.to_string())
-                    .and_modify(|current| {
-                        let current_seq = current.sequence();
-                        let new_seq = val.sequence();
-                        if new_seq > current_seq {
-                            *current = val;
-                        }
-                    })
-                    .or_insert(val);
+                    let key = path.to_lowercase();
+                    candidates
+                        .entry(key)
+                        .and_modify(|(current_path, current_entry)| {
+                            let current_seq = current_entry.opstamp.sequence();
+                            let new_seq = entry.opstamp.sequence();
+                            if new_seq > current_seq {
+                                *current_entry = entry;
+                                *current_path = path.clone();
+                            }
+                        })
+                        .or_insert((path, entry));
+                }
             }
         }
 
         let mut results = Vec::new();
-        for (k, v) in candidates {
-            if !v.is_deletion() {
-                results.push(k);
+        for (_, (path, entry)) in candidates {
+            if !entry.opstamp.is_deletion() {
+                results.push(SearchResult {
+                    path: PathBuf::from(path),
+                    kind: entry.kind,
+                    last_modified: entry.last_modified,
+                    last_accessed: entry.last_accessed,
+                });
             }
         }
 
@@ -150,16 +209,39 @@ impl Index {
         Ok(results)
     }
 
-    fn is_fuzzy_match(&self, query: &str, target: &str) -> bool {
-        let mut target_chars = target.chars();
+    fn compact(&self) {
+        let _ = std::thread::Builder::new()
+            .name("minidex-compactor".to_string())
+            .spawn(move || ())
+            .unwrap();
+    }
 
-        for query_char in query.chars() {
-            if !target_chars.any(|c| c == query_char) {
-                return false;
-            }
-        }
+    fn should_compact(&self) -> bool {
+        self.mem_idx.read().unwrap().len() > 100000
+    }
+}
 
-        true
+#[derive(Debug, PartialEq, Eq)]
+pub struct SearchResult {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub last_modified: u64,
+    pub last_accessed: u64,
+}
+
+impl Ord for SearchResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .last_modified
+            .cmp(&self.last_modified)
+            .then_with(|| self.kind.cmp(&other.kind))
+            .then_with(|| self.path.cmp(&other.path))
+    }
+}
+
+impl PartialOrd for SearchResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

@@ -1,7 +1,10 @@
-use std::io::BufWriter;
-use std::str::FromStr;
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    str::FromStr,
+};
 
-use crate::{opstamp::Opstamp, Path, PathBuf};
+use crate::{entry::IndexEntry, Path, PathBuf};
 use fst::{Map, MapBuilder};
 use lockfile::Lockfile;
 use memmap2::Mmap;
@@ -10,13 +13,43 @@ use thiserror::Error;
 const LAST_OP_FILE: &str = "last_op";
 const LOCK_FILE: &str = ".minidex.lock";
 
-pub(crate) struct Segment(Map<Mmap>);
+const SEGMENT_EXT: &str = "seg";
+const DATA_EXT: &str = "dat";
 
-impl std::ops::Deref for Segment {
-    type Target = Map<Mmap>;
+pub(crate) struct Segment {
+    map: Map<Mmap>,
+    data: Mmap,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl Segment {
+    pub fn load(path: PathBuf) -> Result<Self, SegmentedIndexError> {
+        let entry_file_path = path.with_extension(SEGMENT_EXT);
+        let entry_file = File::open(&entry_file_path).map_err(SegmentedIndexError::Io)?;
+        let mmap = unsafe { Mmap::map(&entry_file).map_err(SegmentedIndexError::Io)? };
+        let map = Map::new(mmap).map_err(SegmentedIndexError::Fst)?;
+
+        // Load the data file for the same segment
+        let dat_file_path = path.with_extension(DATA_EXT);
+        let dat_file = File::open(dat_file_path).map_err(SegmentedIndexError::Io)?;
+        let data = unsafe { Mmap::map(&dat_file).map_err(SegmentedIndexError::Io)? };
+        Ok(Self { map, data })
+    }
+
+    pub(crate) fn get_entry(&self, offset: u64) -> Option<IndexEntry> {
+        let start = offset as usize;
+        let end = start + IndexEntry::SIZE;
+
+        if end > self.data.len() {
+            None
+        } else {
+            Some(IndexEntry::from_bytes(&self.data[start..end]))
+        }
+    }
+}
+
+impl AsRef<Map<Mmap>> for Segment {
+    fn as_ref(&self) -> &Map<Mmap> {
+        &self.map
     }
 }
 
@@ -24,6 +57,7 @@ impl std::ops::Deref for Segment {
 /// that are committed with index data.
 pub(crate) struct SegmentedIndex {
     segments: Vec<Segment>,
+    dir: PathBuf,
     _lockfile: Lockfile,
 }
 
@@ -44,11 +78,16 @@ impl SegmentedIndex {
 
         let mut result = Self {
             segments: Vec::new(),
+            dir: dir.as_ref().to_path_buf(),
             _lockfile: lockfile,
         };
 
         for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "seg") {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == SEGMENT_EXT)
+            {
                 result.load(entry.path())?;
             }
         }
@@ -57,12 +96,14 @@ impl SegmentedIndex {
     }
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), SegmentedIndexError> {
-        let entry_file = std::fs::File::open(path).map_err(SegmentedIndexError::Io)?;
-        let mmap = unsafe { Mmap::map(&entry_file).map_err(SegmentedIndexError::Io)? };
-        if let Ok(map) = Map::new(mmap) {
-            self.segments.push(Segment(map));
-        }
+        let segment = Segment::load(path.as_ref().to_path_buf())?;
 
+        Ok(self.segments.push(segment))
+    }
+
+    pub fn save_last_op(&self, seq: u64) -> Result<(), SegmentedIndexError> {
+        let op_file = self.dir.join(LAST_OP_FILE);
+        std::fs::write(op_file, seq.to_string()).map_err(SegmentedIndexError::Io)?;
         Ok(())
     }
 
@@ -70,22 +111,39 @@ impl SegmentedIndex {
         self.segments.iter()
     }
 
-    pub fn append_segment<I>(
-        &self,
-        segment_path: &PathBuf,
-        it: I,
-    ) -> Result<(), SegmentedIndexError>
+    pub fn write_segment<I>(&self, segment_path: &PathBuf, it: I) -> Result<(), SegmentedIndexError>
     where
-        I: Iterator<Item = (String, Opstamp)>,
+        I: Iterator<Item = (String, IndexEntry)>,
     {
-        let file = std::fs::File::create_new(segment_path).map_err(SegmentedIndexError::Io)?;
-        let mut writer = BufWriter::new(file);
-        let mut builder = MapBuilder::new(&mut writer).map_err(SegmentedIndexError::Fst)?;
-        for (k, v) in it {
-            builder.insert(k, *v).map_err(SegmentedIndexError::Fst)?;
+        let seg_path = segment_path.with_extension(SEGMENT_EXT);
+        let data_path = segment_path.with_extension(DATA_EXT);
+
+        let seg_file = File::create_new(seg_path).map_err(SegmentedIndexError::Io)?;
+        let mut seg_writer = BufWriter::new(seg_file);
+
+        let dat_file = File::create(&data_path).map_err(SegmentedIndexError::Io)?;
+        let mut dat_writer = BufWriter::new(dat_file);
+
+        let mut builder = MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
+
+        let mut current_offset = 0u64;
+        for (path, entry) in it {
+            let bytes = entry.to_bytes();
+            dat_writer.write_all(&bytes)?;
+            builder
+                .insert(path, current_offset)
+                .map_err(SegmentedIndexError::Fst)?;
+            current_offset += bytes.len() as u64;
         }
+
+        dat_writer
+            .into_inner()
+            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
+            .sync_all()
+            .map_err(SegmentedIndexError::Io)?;
+
         builder.finish().map_err(SegmentedIndexError::Fst)?;
-        writer
+        seg_writer
             .into_inner()
             .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
             .sync_all()
@@ -103,4 +161,10 @@ pub enum SegmentedIndexError {
     Io(std::io::Error),
     #[error(transparent)]
     Fst(fst::Error),
+}
+
+impl From<std::io::Error> for SegmentedIndexError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
 }
