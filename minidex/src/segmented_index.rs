@@ -2,13 +2,16 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     str::FromStr,
+    sync::Arc,
 };
 
-use crate::{entry::IndexEntry, Path, PathBuf};
+use crate::{Path, PathBuf, entry::IndexEntry};
 use fst::{Map, MapBuilder};
 use lockfile::Lockfile;
 use memmap2::Mmap;
 use thiserror::Error;
+
+pub(crate) mod compactor;
 
 const LAST_OP_FILE: &str = "last_op";
 const LOCK_FILE: &str = ".minidex.lock";
@@ -56,7 +59,7 @@ impl AsRef<Map<Mmap>> for Segment {
 /// A `SegmentedIndex` contains the (on-disk) segments
 /// that are committed with index data.
 pub(crate) struct SegmentedIndex {
-    segments: Vec<Segment>,
+    segments: Vec<Arc<Segment>>,
     dir: PathBuf,
     _lockfile: Lockfile,
 }
@@ -98,7 +101,11 @@ impl SegmentedIndex {
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), SegmentedIndexError> {
         let segment = Segment::load(path.as_ref().to_path_buf())?;
 
-        Ok(self.segments.push(segment))
+        Ok(self.segments.push(Arc::new(segment)))
+    }
+
+    pub fn snapshot(&self) -> Vec<Arc<Segment>> {
+        self.segments.clone()
     }
 
     pub fn save_last_op(&self, seq: u64) -> Result<(), SegmentedIndexError> {
@@ -107,7 +114,7 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    pub fn segments(&self) -> impl Iterator<Item = &Segment> {
+    pub fn segments(&self) -> impl Iterator<Item = &Arc<Segment>> {
         self.segments.iter()
     }
 
@@ -155,7 +162,9 @@ impl SegmentedIndex {
 
 #[derive(Debug, Error)]
 pub enum SegmentedIndexError {
-    #[error("failed to create lockfile, this typically means there is another instance of an index running in the same directory")]
+    #[error(
+        "failed to create lockfile, this typically means there is another instance of an index running in the same directory"
+    )]
     LockfileError(lockfile::Error),
     #[error(transparent)]
     Io(std::io::Error),

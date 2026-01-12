@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, RwLock},
+    sync::{RwLock, atomic::AtomicU64},
+    thread::JoinHandle,
     time::SystemTime,
 };
 
@@ -18,18 +19,17 @@ use entry::*;
 mod matcher;
 use matcher::*;
 mod segmented_index;
-use segmented_index::*;
+use segmented_index::{compactor::CompactorConfig, *};
 mod opstamp;
 use opstamp::*;
-mod compactor;
-use compactor::*;
 
 pub struct Index {
     path: PathBuf,
     base: RwLock<SegmentedIndex>,
     next_op_seq: AtomicU64,
     mem_idx: RwLock<BTreeMap<String, IndexEntry>>,
-    compactor_config: CompactorConfig,
+    compactor_config: segmented_index::compactor::CompactorConfig,
+    compactor: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl Index {
@@ -60,6 +60,7 @@ impl Index {
             next_op_seq,
             mem_idx,
             compactor_config,
+            compactor: RwLock::new(None),
         })
     }
 
@@ -84,8 +85,10 @@ impl Index {
                 },
             );
 
-        if self.should_compact() {
-            self.compact();
+        if let Ok(true) = self.should_compact() {
+            if let Err(e) = self.compact() {
+                eprintln!("Failed to compact: {}", e);
+            }
         }
         Ok(())
     }
@@ -172,7 +175,7 @@ impl Index {
         }
 
         for segment in segments.segments() {
-            let mut stream = segment.as_ref().search(&matcher).into_stream();
+            let mut stream = segment.as_ref().as_ref().search(&matcher).into_stream();
             while let Some((term, offset)) = stream.next() {
                 if let Some(entry) = segment.get_entry(offset) {
                     let path = std::str::from_utf8(term).expect("invalid term").to_string();
@@ -209,15 +212,54 @@ impl Index {
         Ok(results)
     }
 
-    fn compact(&self) {
-        let _ = std::thread::Builder::new()
-            .name("minidex-compactor".to_string())
-            .spawn(move || ())
-            .unwrap();
+    fn compact(&self) -> Result<(), IndexError> {
+        let mut compactor = self
+            .compactor
+            .write()
+            .expect("failed to get compactor lock");
+        let snapshot = {
+            let base = self.base.read().map_err(|_| IndexError::ReadLock)?;
+            base.snapshot()
+        };
+
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+
+        let path = self.path.clone();
+        let next_seq = self.next_op_seq();
+
+        *compactor = Some(
+            std::thread::Builder::new()
+                .name("minidex-compactor".to_string())
+                .spawn(move || {
+                    let tmp_path = path.join(&format!("{}.tmp", next_seq));
+
+                    println!("Starting compaction with {} segments", snapshot.len());
+                    match compactor::merge_segments(&snapshot, tmp_path.clone()) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Compaction failed: {}", e),
+                    }
+                })
+                .map_err(IndexError::Io)?,
+        );
+
+        Ok(())
     }
 
-    fn should_compact(&self) -> bool {
-        self.mem_idx.read().unwrap().len() > 100000
+    fn should_compact(&self) -> Result<bool, IndexError> {
+        if let Some(ref compactor) = *self.compactor.read().expect("failed to get compactor")
+            && !compactor.is_finished()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .base
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .segments()
+            .count()
+            > self.compactor_config.min_merge_count)
     }
 }
 
@@ -257,4 +299,6 @@ pub enum IndexError {
     SegmentedIndex(SegmentedIndexError),
     #[error("failed to compile matching regex: {0}")]
     Regex(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }

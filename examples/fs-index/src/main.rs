@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use minidex_core::{FilesystemEntry, Index, Kind, SearchResult};
 

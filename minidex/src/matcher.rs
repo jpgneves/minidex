@@ -1,7 +1,7 @@
 use fst::Automaton;
-use regex_automata::dfa::{dense, Automaton as _};
+use regex_automata::dfa::{Automaton as _, dense};
 use regex_automata::util::primitives::StateID;
-use regex_automata::Input;
+use regex_automata::{Anchored, Input};
 
 pub(crate) struct RegexMatcher {
     dfa: dense::DFA<Vec<u32>>,
@@ -18,7 +18,7 @@ impl RegexMatcher {
     pub fn is_match(&self, text: &str) -> bool {
         // Input::new wraps the byte slice.
         // The DFA engine processes the UTF-8 bytes directly.
-        let input = Input::new(text.as_bytes());
+        let input = Input::new(text.as_bytes()).anchored(Anchored::Yes);
 
         // try_search_fwd returns Ok(Some(Match)) if found
         self.dfa
