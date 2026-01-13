@@ -592,15 +592,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "minidex-cli"
-version = "0.1.0"
-dependencies = [
- "minidex-core",
- "ratatui",
-]
-
-[[package]]
-name = "minidex-core"
+name = "minidex"
 version = "0.1.0"
 dependencies = [
  "fst",
@@ -609,6 +601,14 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "minidex-cli"
+version = "0.1.0"
+dependencies = [
+ "minidex",
+ "ratatui",
 ]
 
 [[package]]
