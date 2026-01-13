@@ -6,3 +6,7 @@ members = ["cli",
 exclude = [
         "examples/fs-index"
 ]
+
+[workspace.package]
+license = "MIT"
+authors = ["Joao Neves <joao@jpgneves.com>"]

@@ -1,0 +1,3 @@
+* Minidex - an indexing engine for your filesystem
+
+WIP

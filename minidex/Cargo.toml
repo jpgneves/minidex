@@ -1,7 +1,10 @@
 [package]
-name = "minidex-core"
+name = "minidex"
+description = "A lightweight indexing engine for filesystem entries"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+authors.workspace = true
 
 [dependencies]
 fst = "0.4.7"
