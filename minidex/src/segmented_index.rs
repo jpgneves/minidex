@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Write},
     sync::{
@@ -7,9 +8,9 @@ use std::{
     },
 };
 
-use crate::{Path, PathBuf, entry::IndexEntry, payload::FstPayload};
+use crate::{Path, PathBuf, entry::IndexEntry};
 use fs4::fs_std::FileExt;
-use fst::{Map, MapBuilder};
+use fst::Map;
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -17,20 +18,25 @@ pub(crate) mod compactor;
 
 const LOCK_FILE: &str = ".minidex.lock";
 
-pub const SEGMENT_EXT: &str = "seg";
-pub const DATA_EXT: &str = "dat";
+const SEGMENT_EXT: &str = "seg";
+const DATA_EXT: &str = "dat";
+const POST_EXT: &str = "post";
 
+/// A live index segment
 pub(crate) struct Segment {
     map: Option<Map<Vec<u8>>>,
     data: Option<Mmap>,
+    post: Option<Mmap>,
     path: PathBuf,
     deleted: AtomicBool,
 }
 
 impl Segment {
+    /// Load a segment (segment, data and postings) from disk into memory
     pub fn load(path: PathBuf) -> Result<Self, SegmentedIndexError> {
-        let entry_file_path = path.with_extension(SEGMENT_EXT);
-        let mut entry_file = File::open(&entry_file_path).map_err(SegmentedIndexError::Io)?;
+        let (seg_path, dat_path, post_path) = Self::to_paths(&path);
+
+        let mut entry_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
         let mut buf = Vec::new();
         entry_file
             .read_to_end(&mut buf)
@@ -39,37 +45,107 @@ impl Segment {
         let map = Map::new(buf).map_err(SegmentedIndexError::Fst)?;
 
         // Load the data file for the same segment
-        let dat_file_path = path.with_extension(DATA_EXT);
-        let dat_file = File::open(dat_file_path).map_err(SegmentedIndexError::Io)?;
+        let dat_file = File::open(dat_path).map_err(SegmentedIndexError::Io)?;
         let data = unsafe { Mmap::map(&dat_file).map_err(SegmentedIndexError::Io)? };
+
+        // Load the postings
+        let post_file = File::open(post_path).map_err(SegmentedIndexError::Io)?;
+        let post = unsafe { Mmap::map(&post_file).map_err(SegmentedIndexError::Io)? };
+
         Ok(Self {
             map: Some(map),
             data: Some(data),
+            post: Some(post),
             path,
             deleted: AtomicBool::new(false),
         })
     }
 
-    pub fn mark_deleted(&self) {
+    pub(crate) fn mark_deleted(&self) {
         self.deleted.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn get_entry(&self, offset: u64) -> Option<IndexEntry> {
-        let data = self.data.as_ref()?;
-        let start = offset as usize;
-        let end = start + IndexEntry::SIZE;
+    pub(crate) fn to_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            path.with_extension(SEGMENT_EXT),
+            path.with_extension(DATA_EXT),
+            path.with_extension(POST_EXT),
+        )
+    }
 
-        if end > data.len() {
-            None
-        } else {
-            Some(IndexEntry::from_bytes(&data[start..end]))
+    pub(crate) fn paths_with_additional_extension(path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            path.with_added_extension(SEGMENT_EXT),
+            path.with_added_extension(DATA_EXT),
+            path.with_added_extension(POST_EXT),
+        )
+    }
+
+    /// Helper to read posting list for given offset.
+    pub(crate) fn read_posting_list(&self, offset: u64) -> Vec<u64> {
+        let start = offset as usize;
+
+        let post = self.post.as_ref().expect("posting should be loaded");
+
+        if start + size_of::<u32>() > post.len() {
+            return Vec::new();
         }
+
+        let count =
+            u32::from_le_bytes(post[start..start + size_of::<u32>()].try_into().unwrap()) as usize;
+
+        let mut docs = Vec::with_capacity(count);
+        let mut cursor = start + size_of::<u32>();
+        let post_count = post.len();
+
+        for _ in 0..count {
+            if cursor + size_of::<u64>() > post_count {
+                break;
+            }
+            docs.push(u64::from_le_bytes(
+                post[cursor..cursor + size_of::<u64>()].try_into().unwrap(),
+            ));
+            cursor += size_of::<u64>();
+        }
+
+        docs
+    }
+
+    /// Reads document data for the given offset.
+    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, IndexEntry)> {
+        let cursor = offset as usize;
+        let data = self.data.as_ref().expect("expected data to be loaded");
+        let data_len = data.len();
+
+        if cursor + size_of::<u32>() > data_len {
+            return None;
+        }
+
+        let path_len =
+            u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                as usize;
+        let path_start = cursor + size_of::<u32>();
+
+        if path_start + path_len > data_len {
+            return None;
+        }
+        let path_str = std::str::from_utf8(&data[path_start..path_start + path_len])
+            .ok()?
+            .to_string();
+
+        let entry_start = path_start + path_len;
+        if entry_start + IndexEntry::SIZE > data_len {
+            return None;
+        }
+        let entry = IndexEntry::from_bytes(&data[entry_start..entry_start + IndexEntry::SIZE]);
+
+        Some((path_str, entry))
     }
 }
 
 impl AsRef<Map<Vec<u8>>> for Segment {
     fn as_ref(&self) -> &Map<Vec<u8>> {
-        &self.map.as_ref().unwrap()
+        self.map.as_ref().unwrap()
     }
 }
 
@@ -79,8 +155,11 @@ impl Drop for Segment {
             self.map.take();
             self.data.take();
 
-            let _ = std::fs::remove_file(self.path.with_extension(SEGMENT_EXT));
-            let _ = std::fs::remove_file(self.path.with_extension(DATA_EXT));
+            let (seg_path, dat_path, post_path) = Self::to_paths(&self.path);
+
+            let _ = std::fs::remove_file(seg_path);
+            let _ = std::fs::remove_file(dat_path);
+            let _ = std::fs::remove_file(post_path);
         }
     }
 }
@@ -102,6 +181,7 @@ impl SegmentedIndex {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&lock_path)
             .map_err(SegmentedIndexError::Io)?;
 
@@ -121,7 +201,7 @@ impl SegmentedIndex {
             if path.extension().is_some_and(|ext| ext == SEGMENT_EXT) {
                 let file_name = path.file_name().unwrap_or_default().to_string_lossy();
                 if file_name.contains(".tmp") {
-                    println!("Cleaning up orphaned temporary file: {}", file_name);
+                    log::trace!("Cleaning up orphaned temporary file: {}", file_name);
 
                     // We can safely delete the .seg and its matching .dat file
                     let _ = std::fs::remove_file(&path);
@@ -136,88 +216,55 @@ impl SegmentedIndex {
         Ok(result)
     }
 
-    pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), SegmentedIndexError> {
+    /// Load a segment into the index
+    pub(crate) fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), SegmentedIndexError> {
         let segment = Segment::load(path.as_ref().to_path_buf())?;
 
-        Ok(self.segments.push(Arc::new(segment)))
+        self.segments.push(Arc::new(segment));
+        Ok(())
     }
 
-    pub fn snapshot(&self) -> Vec<Arc<Segment>> {
+    /// Take a snapshop of all currently living segments
+    pub(crate) fn snapshot(&self) -> Vec<Arc<Segment>> {
         self.segments.clone()
     }
 
-    pub fn segments(&self) -> impl Iterator<Item = &Arc<Segment>> {
+    pub(crate) fn segments(&self) -> impl Iterator<Item = &Arc<Segment>> {
         self.segments.iter()
     }
 
-    pub fn write_segment<I>(&self, segment_path: &PathBuf, it: I) -> Result<(), SegmentedIndexError>
+    /// Write a segment to disk
+    pub(crate) fn write_segment<I>(
+        &self,
+        segment_path: &Path,
+        it: I,
+    ) -> Result<(), SegmentedIndexError>
     where
         I: Iterator<Item = (String, IndexEntry)>,
     {
-        let seg_path = segment_path.with_added_extension(SEGMENT_EXT);
-        let data_path = segment_path.with_added_extension(DATA_EXT);
-
-        let seg_file = File::create_new(seg_path).map_err(SegmentedIndexError::Io)?;
-        let mut seg_writer = BufWriter::with_capacity(4 * 1024 * 1024, seg_file);
-
-        let dat_file = File::create(&data_path).map_err(SegmentedIndexError::Io)?;
-        let mut dat_writer = BufWriter::with_capacity(4 * 1024 * 1024, dat_file);
-
-        let mut builder = MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
-
-        let mut current_offset = 0u64;
-        for (path, entry) in it {
-            let bytes = entry.to_bytes();
-            dat_writer.write_all(&bytes)?;
-
-            let ext = std::path::Path::new(&path)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-
-            let payload = FstPayload::pack(current_offset, entry.kind as u8, &ext.to_lowercase());
-
-            builder
-                .insert(path, payload)
-                .map_err(SegmentedIndexError::Fst)?;
-            current_offset += bytes.len() as u64;
-        }
-
-        dat_writer
-            .into_inner()
-            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
-            .sync_all()
-            .map_err(SegmentedIndexError::Io)?;
-
-        builder.finish().map_err(SegmentedIndexError::Fst)?;
-        seg_writer
-            .into_inner()
-            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
-            .sync_all()
-            .map_err(SegmentedIndexError::Io)?;
-
+        Self::build_segment_files(segment_path, it, false)?;
         Ok(())
     }
 
     /// Atomically swaps out old segments for a newly compacted segment,
     /// and cleans up the old files from disk.
-    pub fn apply_compaction(
+    pub(crate) fn apply_compaction(
         &mut self,
         old_segments: &[Arc<Segment>],
         tmp_path: PathBuf,
     ) -> Result<(), SegmentedIndexError> {
-        let tmp_seg = tmp_path.with_added_extension(SEGMENT_EXT);
-        let tmp_dat = tmp_path.with_added_extension(DATA_EXT);
+        let (tmp_seg, tmp_dat, tmp_post) = Segment::paths_with_additional_extension(&tmp_path);
 
         let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
         let final_path = PathBuf::from(final_path_str);
 
-        let final_seg = final_path.with_extension(SEGMENT_EXT);
-        let final_dat = final_path.with_extension(DATA_EXT);
+        let (final_seg, final_dat, final_post) = Segment::to_paths(&final_path);
 
         std::fs::rename(tmp_seg, &final_seg).map_err(SegmentedIndexError::Io)?;
 
         std::fs::rename(tmp_dat, &final_dat).map_err(SegmentedIndexError::Io)?;
+
+        std::fs::rename(tmp_post, &final_post).map_err(SegmentedIndexError::Io)?;
 
         let new_seg = Arc::new(Segment::load(final_path)?);
 
@@ -231,6 +278,89 @@ impl SegmentedIndex {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn build_segment_files<I, S>(
+        out_path: &Path,
+        items: I,
+        drop_deletions: bool,
+    ) -> Result<u64, SegmentedIndexError>
+    where
+        I: IntoIterator<Item = (S, IndexEntry)>,
+        S: AsRef<str>,
+    {
+        let seg_path = out_path.with_extension(SEGMENT_EXT);
+        let dat_path = out_path.with_extension(DATA_EXT);
+        let post_path = out_path.with_extension(POST_EXT);
+
+        let capacity = 8 * 1024 * 1024;
+        let mut dat_writer = BufWriter::with_capacity(capacity, File::create(&dat_path)?);
+        let mut post_writer = BufWriter::with_capacity(capacity, File::create(&post_path)?);
+        let mut seg_writer = BufWriter::with_capacity(capacity, File::create(&seg_path)?);
+
+        let mut inverted_index: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut current_dat_offset = 0u64;
+        let mut written = 0;
+
+        for (path, entry) in items {
+            let path_ref = path.as_ref();
+
+            if drop_deletions && entry.opstamp.is_deletion() {
+                continue; // Always drop deletions before they hit the disk segment!
+            }
+
+            let path_bytes = path_ref.as_bytes();
+            let entry_bytes = entry.to_bytes();
+
+            dat_writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
+            dat_writer.write_all(path_bytes)?;
+            dat_writer.write_all(&entry_bytes)?;
+
+            let tokens = crate::tokenizer::tokenize(path_ref);
+            for token in tokens {
+                inverted_index
+                    .entry(token)
+                    .or_default()
+                    .push(current_dat_offset);
+            }
+
+            current_dat_offset += (4 + path_bytes.len() + entry_bytes.len()) as u64;
+            written += 1;
+        }
+
+        dat_writer
+            .into_inner()
+            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
+            .sync_all()?;
+
+        let mut seg_builder =
+            fst::MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
+        let mut current_post_offset = 0u64;
+
+        for (token, doc_offsets) in inverted_index {
+            post_writer.write_all(&(doc_offsets.len() as u32).to_le_bytes())?;
+            for offset in &doc_offsets {
+                post_writer.write_all(&offset.to_le_bytes())?;
+            }
+
+            seg_builder
+                .insert(token, current_post_offset)
+                .map_err(SegmentedIndexError::Fst)?;
+
+            current_post_offset += (4 + doc_offsets.len() * 8) as u64;
+        }
+
+        post_writer
+            .into_inner()
+            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
+            .sync_all()?;
+        seg_builder.finish().map_err(SegmentedIndexError::Fst)?;
+        seg_writer
+            .into_inner()
+            .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
+            .sync_all()?;
+
+        Ok(written)
     }
 }
 

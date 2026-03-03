@@ -1,17 +1,13 @@
-use std::{
-    fs::File,
-    io::{BufWriter, Write},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-use fst::{MapBuilder, Streamer as _, map::OpBuilder};
+use crate::{entry::IndexEntry, segmented_index::SegmentedIndexError};
 
-use crate::{entry::IndexEntry, payload::FstPayload, segmented_index::SegmentedIndexError};
+use super::{Segment, SegmentedIndex};
 
-use super::{DATA_EXT, SEGMENT_EXT, Segment};
-
+#[allow(dead_code)]
+/// Configuration for compaction
 pub struct CompactorConfig {
+    /// Minimum number of segments required for compaction
     pub min_merge_count: usize,
     max_size_ratio: f32,
     memory_threshold: usize,
@@ -24,6 +20,9 @@ impl Default for CompactorConfig {
     }
 }
 
+/// Compaction configuration builder
+// TODO: Clean up dead parameters
+#[allow(dead_code)]
 pub struct CompactorConfigBuilder {
     min_merge_count: usize,
     max_size_ratio: f32,
@@ -47,6 +46,8 @@ impl CompactorConfigBuilder {
         Default::default()
     }
 
+    /// Set the minimum number of live segments required to trigger
+    /// compaction
     pub fn min_merge_count(self, min_merge_count: usize) -> Self {
         Self {
             min_merge_count,
@@ -85,82 +86,53 @@ impl CompactorConfigBuilder {
     }
 }
 
-pub fn merge_segments(segments: &[Arc<Segment>], out: PathBuf) -> Result<u64, SegmentedIndexError> {
-    let mut union_builder = OpBuilder::new();
+/// Merge live segments into smaller ones.
+/// Drops data that is outdated - only the latest opstamp wins.
+/// Note: atomic replacement of old segment files is done by the caller
+pub(crate) fn merge_segments(
+    segments: &[Arc<Segment>],
+    out: PathBuf,
+) -> Result<u64, SegmentedIndexError> {
+    let mut survivors: BTreeMap<String, IndexEntry> = BTreeMap::new();
+
     for seg in segments {
-        union_builder.push(seg.map.as_ref().expect("expected a loaded map").stream());
-    }
+        let data = seg.data.as_ref().expect("expected a loaded data map");
+        let mut cursor = 0;
 
-    let mut stream = union_builder.union();
+        while cursor < data.len() {
+            if cursor + size_of::<u32>() > data.len() {
+                break;
+            }
+            let path_len =
+                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                    as usize;
+            cursor += size_of::<u32>();
 
-    let seg_path = PathBuf::from(format!("{}.seg", out.display()));
-    let dat_path = PathBuf::from(format!("{}.dat", out.display()));
+            if cursor + path_len > data.len() {
+                break;
+            }
 
-    let mut dat_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&dat_path)?);
-    let mut seg_writer = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&seg_path)?);
-    let mut seg_builder = MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
+            let path_str = std::str::from_utf8(&data[cursor..cursor + path_len])
+                .unwrap_or("")
+                .to_string();
+            cursor += path_len;
 
-    let mut current_offset = 0u64;
-    let mut written = 0;
+            if cursor + IndexEntry::SIZE > data.len() {
+                break;
+            }
+            let entry = IndexEntry::from_bytes(&data[cursor..cursor + IndexEntry::SIZE]);
+            cursor += IndexEntry::SIZE;
 
-    while let Some((key, indexed_values)) = stream.next() {
-        let mut highest_opstamp: Option<IndexEntry> = None;
-
-        for iv in indexed_values {
-            let segment = &segments[iv.index];
-            let offset = FstPayload::unpack_offset(iv.value);
-
-            if let Some(entry) = segment.get_entry(offset) {
-                if let Some(highest) = highest_opstamp {
-                    let current_seq = highest.opstamp.sequence();
-                    let new_seq = entry.opstamp.sequence();
-                    if new_seq > current_seq {
-                        highest_opstamp = Some(entry);
+            survivors
+                .entry(path_str)
+                .and_modify(|existing| {
+                    if entry.opstamp.sequence() > existing.opstamp.sequence() {
+                        *existing = entry;
                     }
-                } else {
-                    highest_opstamp = Some(entry)
-                }
-            }
-        }
-
-        if let Some(highest) = highest_opstamp {
-            if highest.opstamp.is_deletion() {
-                // Skip if latest change in segment is a deletion
-                continue;
-            }
-
-            let bytes = highest.to_bytes();
-            dat_writer.write_all(&bytes)?;
-
-            let path_str = std::str::from_utf8(key).unwrap_or("");
-            let ext = std::path::Path::new(path_str)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-
-            let new_payload =
-                FstPayload::pack(current_offset, highest.kind as u8, &ext.to_lowercase());
-
-            seg_builder
-                .insert(key, new_payload)
-                .map_err(SegmentedIndexError::Fst)?;
-
-            current_offset += bytes.len() as u64;
-            written += 1;
+                })
+                .or_insert(entry);
         }
     }
 
-    dat_writer
-        .into_inner()
-        .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
-        .sync_all()
-        .map_err(SegmentedIndexError::Io)?;
-    seg_builder.finish().map_err(SegmentedIndexError::Fst)?;
-    seg_writer
-        .into_inner()
-        .map_err(|e| SegmentedIndexError::Io(e.into_error()))?
-        .sync_all()
-        .map_err(SegmentedIndexError::Io)?;
-
-    Ok(written)
+    SegmentedIndex::build_segment_files(&out, survivors, true)
 }

@@ -597,10 +597,11 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs4",
  "fst",
+ "log",
  "memmap2",
  "regex-automata",
  "regex-syntax",

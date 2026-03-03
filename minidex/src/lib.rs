@@ -6,30 +6,27 @@ use std::{
     time::SystemTime,
 };
 
-use fst::{IntoStreamer, Streamer};
+use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
-use payload::FstPayload;
 use thiserror::Error;
 
 mod common;
 pub use common::Kind;
-use common::*;
 mod entry;
 pub use entry::FilesystemEntry;
 use entry::*;
-mod matcher;
-use matcher::*;
 mod segmented_index;
-use segmented_index::{compactor::CompactorConfig, *};
+pub use segmented_index::compactor::*;
+use segmented_index::*;
 mod opstamp;
 use opstamp::*;
 use wal::Wal;
-mod payload;
+mod tokenizer;
 mod wal;
 
 /// A Minidex Index, managing both the in-memory and disk data.
-/// Data that is never `commit`ted is transient and will be lost
-/// if the `Index` is dropped.
+/// Insertions and deletions auto-commit to the Write-Ahead Log
+/// and may trigger compaction.
 pub struct Index {
     path: PathBuf,
     base: Arc<RwLock<SegmentedIndex>>,
@@ -46,12 +43,16 @@ impl Index {
     /// This function will:
     /// 1. Create (if it doesn't exist) the directory at `path`
     /// 2. Try to obtain a lock on the directory
-    /// 3. Obtain the last commited Opstamp (if possible)
-    /// 4. Load the discovered segments.
+    /// 3. Load the discovered segments, data and posting
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
         Self::open_with_config(path, CompactorConfig::default())
     }
 
+    /// Open the index on disk with a custom compactor configuration.
+    /// This function will:
+    /// 1. Create (if it doesn't exist) the directory at `path`
+    /// 2. Try to obtain a lock on the directory
+    /// 3. Load the discovered segments, data and posting
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
         compactor_config: CompactorConfig,
@@ -89,6 +90,7 @@ impl Index {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Insert a filesystem entry into the index.
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
         let path_str = item.path.to_string_lossy().to_string();
@@ -118,7 +120,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn delete(&self, item: &PathBuf) -> Result<(), IndexError> {
+    pub fn delete(&self, item: &Path) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
 
         let path_str = item.to_string_lossy().to_string();
@@ -150,46 +152,44 @@ impl Index {
 
     /// Writes the in-memory index to disk.
     /// This method can fail if the disk is not writable.
-    pub fn commit(&self) -> Result<(), IndexError> {
+    pub fn sync(&self) -> Result<(), IndexError> {
         let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
         wal.flush().map_err(IndexError::Io)?;
 
         Ok(())
     }
 
-    /// Deletes modifications that exist in memory and have not yet
-    /// been committed.
-    pub fn rollback(&self) -> Result<(), IndexError> {
-        let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
+    /// Search the index for the given search term (usually a path or
+    /// file name), bound by limit and offset.
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>, IndexError> {
+        let mut tokens = crate::tokenizer::tokenize(query);
 
-        mem.clear();
-
-        Ok(())
-    }
-
-    pub fn search(&self, query: &str) -> Result<Vec<SearchResult>, IndexError> {
-        let mut pattern = String::from("(?i)(?s).*");
-
-        for word in query.split_whitespace() {
-            for ch in word.chars() {
-                let escaped = regex_syntax::escape(&ch.to_string());
-                pattern.push_str(&escaped);
-            }
-            pattern.push_str(".*");
+        if tokens.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let matcher = RegexMatcher::new(&pattern).map_err(|e| IndexError::Regex(e.to_string()))?;
+        tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
         let mut candidates: HashMap<String, (String, IndexEntry)> = HashMap::new();
 
-        for (path, entry) in mem.iter() {
-            if matcher.is_match(path) {
-                let normalized = path.to_lowercase();
+        let required_matches = limit + offset;
 
+        let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
+
+        for (path, entry) in mem.iter() {
+            let normalized = path.to_lowercase();
+            let matches_all = tokens.iter().all(|t| normalized.contains(t));
+            if matches_all {
                 candidates
-                    .entry(normalized)
+                    .entry(normalized.clone())
                     .and_modify(|(current_path, current_entry)| {
                         if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                             *current_entry = *entry;
@@ -201,25 +201,65 @@ impl Index {
         }
 
         for segment in segments.segments() {
-            let mut stream = segment.as_ref().as_ref().search(&matcher).into_stream();
-            while let Some((term, payload)) = stream.next() {
-                let offset = FstPayload::unpack_offset(payload);
+            let mut segment_doc_matches: Option<Vec<u64>> = None;
 
-                if let Some(entry) = segment.get_entry(offset) {
-                    let path = std::str::from_utf8(term).expect("invalid term").to_string();
+            for token in &tokens {
+                if let Some(existing) = &segment_doc_matches
+                    && existing.len() <= short_circuit_threshold
+                {
+                    break;
+                }
+                let matcher = Str::new(token).starts_with();
 
-                    let key = path.to_lowercase();
-                    candidates
-                        .entry(key)
-                        .and_modify(|(current_path, current_entry)| {
-                            let current_seq = current_entry.opstamp.sequence();
-                            let new_seq = entry.opstamp.sequence();
-                            if new_seq > current_seq {
-                                *current_entry = entry;
-                                *current_path = path.clone();
-                            }
-                        })
-                        .or_insert((path, entry));
+                let mut token_docs = Vec::new();
+                let map = segment.as_ref().as_ref();
+                let mut stream = map.search(&matcher).into_stream();
+
+                while let Some((_, post_offset)) = stream.next() {
+                    let docs = segment.read_posting_list(post_offset);
+                    token_docs.extend(docs);
+
+                    if segment_doc_matches.is_none() && token_docs.len() > short_circuit_threshold {
+                        break;
+                    }
+                }
+
+                token_docs.sort_unstable();
+                token_docs.dedup();
+
+                if let Some(mut existing) = segment_doc_matches {
+                    existing.retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
+                    segment_doc_matches = Some(existing);
+                } else {
+                    segment_doc_matches = Some(token_docs);
+                }
+
+                if segment_doc_matches.as_ref().is_some_and(|m| m.is_empty()) {
+                    break;
+                }
+            }
+
+            if let Some(mut valid_docs) = segment_doc_matches {
+                valid_docs.reverse();
+                let mut resolved_count = 0;
+                for dat_offset in valid_docs {
+                    if resolved_count >= required_matches {
+                        break;
+                    }
+                    if let Some((path, entry)) = segment.read_document(dat_offset) {
+                        let key = path.to_lowercase();
+                        candidates
+                            .entry(key)
+                            .and_modify(|(current_path, current_entry)| {
+                                if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
+                                    *current_entry = entry;
+                                    *current_path = path.clone();
+                                }
+                            })
+                            .or_insert((path, entry));
+
+                        resolved_count += 1;
+                    }
                 }
             }
         }
@@ -237,22 +277,28 @@ impl Index {
         }
 
         results.sort();
-        Ok(results)
+
+        let paginated_results = results.into_iter().skip(offset).take(limit).collect();
+
+        Ok(paginated_results)
     }
 
+    /// Force index compaction, minimizing the amount of disk space
+    /// utilized by the index.
+    /// NOTE: this operation is very IO intensive and can take some time
     pub fn force_compact_all(&self) -> Result<(), IndexError> {
-        if let Ok(mut flusher) = self.flusher.write() {
-            if let Some(handle) = flusher.take() {
-                println!("Waiting for background flush to finish...");
-                let _ = handle.join();
-            }
+        if let Ok(mut flusher) = self.flusher.write()
+            && let Some(handle) = flusher.take()
+        {
+            log::debug!("Waiting for background flush to finish...");
+            let _ = handle.join();
         }
 
-        if let Ok(mut compactor) = self.compactor.write() {
-            if let Some(handle) = compactor.take() {
-                println!("Waiting for background compactor to finish...");
-                let _ = handle.join();
-            }
+        if let Ok(mut compactor) = self.compactor.write()
+            && let Some(handle) = compactor.take()
+        {
+            log::debug!("Waiting for background compactor to finish...");
+            let _ = handle.join();
         }
 
         let snapshot = {
@@ -261,27 +307,27 @@ impl Index {
 
             // If we have 1 or 0 segments, the database is already perfectly compacted!
             if segments.len() <= 1 {
-                println!("Database is already fully compacted.");
+                log::debug!("Database is already fully compacted.");
                 return Ok(());
             }
             segments
         };
 
-        println!("Forcing full compaction of {} segments...", snapshot.len());
+        log::debug!("Forcing full compaction of {} segments...", snapshot.len());
 
         let compactor_seq = Self::generate_op_seq();
 
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
 
         compactor::merge_segments(&snapshot, tmp_path.clone())
-            .map_err(|e| IndexError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
 
         let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
         base_guard
             .apply_compaction(&snapshot, tmp_path)
-            .map_err(|e| IndexError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
 
-        println!("Full compaction complete");
+        log::debug!("Full compaction complete");
         Ok(())
     }
 
@@ -328,27 +374,30 @@ impl Index {
                     if let Err(e) =
                         base_guard.write_segment(&tmp_segment_path, snapshot.into_iter())
                     {
-                        eprintln!("flush failed to write: {}", e);
-                        let _ = std::fs::remove_file(tmp_segment_path.with_extension(SEGMENT_EXT));
-                        let _ = std::fs::remove_file(tmp_segment_path.with_extension(DATA_EXT));
+                        log::error!("flush failed to write: {}", e);
+                        let (tmp_seg, tmp_dat, tmp_post) = Segment::to_paths(&tmp_segment_path);
+                        let _ = std::fs::remove_file(tmp_seg);
+                        let _ = std::fs::remove_file(tmp_dat);
+                        let _ = std::fs::remove_file(tmp_post);
                         return;
                     }
 
-                    let tmp_seg = tmp_segment_path.with_added_extension(SEGMENT_EXT);
-                    let tmp_dat = tmp_segment_path.with_added_extension(DATA_EXT);
+                    let (tmp_seg, tmp_dat, tmp_post) =
+                        Segment::paths_with_additional_extension(&tmp_segment_path);
 
-                    let final_seg = final_segment_path.with_added_extension(SEGMENT_EXT);
-                    let final_dat = final_segment_path.with_added_extension(DATA_EXT);
+                    let (final_seg, final_dat, final_post) =
+                        Segment::paths_with_additional_extension(&final_segment_path);
 
                     let _ = std::fs::rename(tmp_seg, final_seg);
                     let _ = std::fs::rename(tmp_dat, final_dat);
+                    let _ = std::fs::rename(tmp_post, final_post);
                     base_guard
                         .load(&final_segment_path)
                         .expect("failed to reload segment during flush");
                 }
 
                 if let Err(e) = std::fs::remove_file(&flushing_path) {
-                    eprintln!("failed to delete rotated WAL: {}", e);
+                    log::error!("failed to delete rotated WAL: {}", e);
                 }
 
                 let snapshot = {
@@ -390,20 +439,20 @@ impl Index {
             .name("minidex-compactor".to_string())
             .spawn(move || {
                 let next_seq = Self::generate_op_seq();
-                let tmp_path = path.join(&format!("{}.tmp", next_seq));
+                let tmp_path = path.join(format!("{}.tmp", next_seq));
 
-                println!("Starting compaction with {} segments", snapshot.len());
+                log::debug!("Starting compaction with {} segments", snapshot.len());
                 match compactor::merge_segments(&snapshot, tmp_path.clone()) {
                     Ok(_) => {
                         let mut base_guard = base
                             .write()
                             .expect("failed to lock base for compaction apply");
                         if let Err(e) = base_guard.apply_compaction(&snapshot, tmp_path) {
-                            eprintln!("Failed to apply compaction: {}", e);
+                            log::error!("Failed to apply compaction: {}", e);
                         }
-                        println!("Compaction finished");
+                        log::debug!("Compaction finished");
                     }
-                    Err(e) => eprintln!("Compaction failed: {}", e),
+                    Err(e) => log::error!("Compaction failed: {}", e),
                 }
             })
             .ok()
@@ -419,22 +468,24 @@ impl Index {
 
 impl Drop for Index {
     fn drop(&mut self) {
-        let _ = self.commit();
+        let _ = self.sync();
 
-        if let Ok(mut flusher) = self.flusher.write() {
-            if let Some(flusher) = flusher.take() {
-                let _ = flusher.join();
-            }
+        if let Ok(mut flusher) = self.flusher.write()
+            && let Some(flusher) = flusher.take()
+        {
+            let _ = flusher.join();
         }
 
-        if let Ok(mut compactor) = self.compactor.write() {
-            if let Some(compactor) = compactor.take() {
-                let _ = compactor.join();
-            }
+        if let Ok(mut compactor) = self.compactor.write()
+            && let Some(compactor) = compactor.take()
+        {
+            let _ = compactor.join();
         }
     }
 }
 
+/// A Minidex search result, containing the found metadata for
+/// the given file
 #[derive(Debug, PartialEq, Eq)]
 pub struct SearchResult {
     pub path: PathBuf,

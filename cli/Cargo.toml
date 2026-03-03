@@ -7,5 +7,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-minidex = { path = "../minidex", version = "0.1.0" }
+minidex = { path = "../minidex", version = "*" }
 ratatui = "0.30.0"

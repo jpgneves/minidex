@@ -12,7 +12,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
@@ -22,7 +22,7 @@ impl Wal {
         })
     }
 
-    pub fn append(&mut self, path: &str, entry: &IndexEntry) -> std::io::Result<()> {
+    pub(crate) fn append(&mut self, path: &str, entry: &IndexEntry) -> std::io::Result<()> {
         let writer = self.writer.as_mut().expect("WAL writer missing");
 
         let path_bytes = path.as_bytes();
@@ -34,7 +34,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn flush(&mut self) -> std::io::Result<()> {
+    pub(crate) fn flush(&mut self) -> std::io::Result<()> {
         if let Some(writer) = self.writer.as_mut() {
             writer.flush()?;
             writer.get_ref().sync_all()?;
@@ -43,7 +43,7 @@ impl Wal {
         Ok(())
     }
 
-    pub fn replay<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<(String, IndexEntry)>> {
+    pub(crate) fn replay<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<(String, IndexEntry)>> {
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -74,7 +74,7 @@ impl Wal {
             let mut entry_buf = [0u8; IndexEntry::SIZE];
             if let Err(e) = reader.read_exact(&mut entry_buf) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    println!("Wal parser hit EOF early! Stopped at {}", results.len());
+                    log::warn!("Wal parser hit EOF early! Stopped at {}", results.len());
                     break;
                 }
                 return Err(e);
@@ -84,16 +84,11 @@ impl Wal {
             results.push((path, entry));
         }
 
-        println!("Wal replay complete, recovered {} entries", results.len());
+        log::debug!("Wal replay complete, recovered {} entries", results.len());
         Ok(results)
     }
 
-    pub fn clear<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
-        File::create(path)?;
-        Ok(())
-    }
-
-    pub fn rotate<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
+    pub(crate) fn rotate<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
         if let Some(mut writer) = self.writer.take() {
             writer.flush()?;
             writer.get_ref().sync_all()?;

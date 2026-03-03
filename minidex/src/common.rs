@@ -17,9 +17,9 @@ impl From<u8> for Kind {
     }
 }
 
-impl Into<u8> for Kind {
-    fn into(self) -> u8 {
-        match self {
+impl From<Kind> for u8 {
+    fn from(val: Kind) -> Self {
+        match val {
             Kind::File => 0,
             Kind::Directory => 1,
             Kind::Symlink => 2,

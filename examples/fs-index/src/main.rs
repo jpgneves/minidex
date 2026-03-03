@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use minidex::{FilesystemEntry, Index, Kind, SearchResult};
+use minidex::{FilesystemEntry, Index, Kind};
 
 struct Scanner<'a> {
     index: &'a Index,
@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let walk = builder.threads(2).build_parallel();
 
+    let now = std::time::Instant::now();
     let mut scanner = Scanner {
         index: &index,
         file_count: Arc::new(AtomicU64::new(0)),
@@ -77,16 +78,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     walk.visit(&mut scanner);
 
     println!(
-        "Done scanning, scanned {} files",
-        scanner.file_count.load(Ordering::SeqCst)
+        "Done scanning, scanned {} files in {} ms",
+        scanner.file_count.load(Ordering::SeqCst),
+        now.elapsed().as_millis()
     );
 
-    //index.commit()?;
+    let now = std::time::Instant::now();
     println!("Searching");
-    let results = index.search("jpg")?;
-    println!("Found {} results", results.len());
-
-    index.force_compact_all()?;
+    let results = index.search("jpg", 500, 0)?;
+    println!(
+        "Found {} results in {} ms",
+        results.len(),
+        now.elapsed().as_millis()
+    );
 
     Ok(())
 }
