@@ -1,6 +1,6 @@
 # Minidex - a filesystem index library
 
-![Crates.io License](https://img.shields.io/crates/l/minidex) ![docs.rs](https://img.shields.io/docsrs/:crate) ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/:user/:repo/:workflow) ![Crates.io Version](https://img.shields.io/crates/v/minidex)
+![Crates.io License](https://img.shields.io/crates/l/minidex) ![docs.rs](https://img.shields.io/docsrs/minidex) ![Crates.io Version](https://img.shields.io/crates/v/minidex)
 
 Minidex is a fast, lightweight index for filesystem entries meant to be
 embedded in desktop applications.
