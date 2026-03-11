@@ -56,3 +56,14 @@ fn is_cjk(c: char) -> bool {
     (0x4E00..=0x9FFF).contains(&u) || // CJK Unified Ideographs
     (0xAC00..=0xD7AF).contains(&u) // Hangul Syllables
 }
+
+const SYNTH_PATH_TOKEN_TAG: char = '\x00';
+const SYNTH_VOLUME_TOKEN_TAG: char = '\x01';
+
+pub(crate) fn synthesize_path_token(orig: &str) -> String {
+    format!("{SYNTH_PATH_TOKEN_TAG}{orig}")
+}
+
+pub(crate) fn synthesize_volume_token(orig: &str) -> String {
+    format!("{SYNTH_VOLUME_TOKEN_TAG}{orig}")
+}

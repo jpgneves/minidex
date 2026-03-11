@@ -22,14 +22,24 @@ impl Wal {
         })
     }
 
-    pub(crate) fn append(&mut self, path: &str, entry: &IndexEntry) -> std::io::Result<()> {
+    pub(crate) fn append(
+        &mut self,
+        path: &str,
+        volume: &str,
+        entry: &IndexEntry,
+    ) -> std::io::Result<()> {
         let writer = self.writer.as_mut().expect("WAL writer missing");
 
         let path_bytes = path.as_bytes();
         let path_len = path_bytes.len() as u32;
 
+        let volume_bytes = volume.as_bytes();
+        let volume_len = volume_bytes.len() as u32;
+
         writer.write_all(&path_len.to_le_bytes())?;
         writer.write_all(path_bytes)?;
+        writer.write_all(&volume_len.to_le_bytes())?;
+        writer.write_all(volume_bytes)?;
         writer.write_all(&entry.to_bytes())?;
         Ok(())
     }
@@ -43,7 +53,9 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn replay<P: AsRef<Path>>(path: P) -> std::io::Result<Vec<(String, IndexEntry)>> {
+    pub(crate) fn replay<P: AsRef<Path>>(
+        path: P,
+    ) -> std::io::Result<Vec<(String, String, IndexEntry)>> {
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -71,6 +83,24 @@ impl Wal {
             }
             let path = String::from_utf8_lossy(&path_buf).to_string();
 
+            if let Err(e) = reader.read_exact(&mut len_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    log::warn!("Wal parser hit EOF early! Stopped at {}", results.len());
+                }
+                return Err(e);
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut vol_buf = vec![0u8; len];
+
+            if let Err(e) = reader.read_exact(&mut vol_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(e);
+            }
+
+            let volume = String::from_utf8_lossy(&vol_buf).to_string();
+
             let mut entry_buf = [0u8; IndexEntry::SIZE];
             if let Err(e) = reader.read_exact(&mut entry_buf) {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -81,7 +111,7 @@ impl Wal {
             }
             let entry = IndexEntry::from_bytes(&entry_buf);
 
-            results.push((path, entry));
+            results.push((path, volume, entry));
         }
 
         log::debug!("Wal replay complete, recovered {} entries", results.len());

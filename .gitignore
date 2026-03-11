@@ -3,3 +3,6 @@
 target/
 result
 .\#*
+
+# demo index
+examples/fs-index/index/

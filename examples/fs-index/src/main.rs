@@ -42,6 +42,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
             let last_accessed = last_modified;
             let _ = self.index.insert(FilesystemEntry {
                 path: entry.path().to_path_buf(),
+                volume: "/".to_string(),
                 kind,
                 last_modified,
                 last_accessed,

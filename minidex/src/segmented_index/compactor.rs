@@ -93,7 +93,7 @@ pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
-    let mut survivors: BTreeMap<String, IndexEntry> = BTreeMap::new();
+    let mut survivors: BTreeMap<String, (String, IndexEntry)> = BTreeMap::new();
 
     for seg in segments {
         let data = seg.data.as_ref().expect("expected a loaded data map");
@@ -117,6 +117,20 @@ pub(crate) fn merge_segments(
                 .to_string();
             cursor += path_len;
 
+            let volume_len =
+                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                    as usize;
+            cursor += size_of::<u32>();
+
+            if cursor + volume_len > data.len() {
+                break;
+            }
+
+            let volume_str = std::str::from_utf8(&data[cursor..cursor + volume_len])
+                .unwrap_or("")
+                .to_string();
+            cursor += volume_len;
+
             if cursor + IndexEntry::SIZE > data.len() {
                 break;
             }
@@ -126,13 +140,17 @@ pub(crate) fn merge_segments(
             survivors
                 .entry(path_str)
                 .and_modify(|existing| {
-                    if entry.opstamp.sequence() > existing.opstamp.sequence() {
-                        *existing = entry;
+                    if entry.opstamp.sequence() > existing.1.opstamp.sequence() {
+                        *existing = (volume_str.clone(), entry);
                     }
                 })
-                .or_insert(entry);
+                .or_insert((volume_str, entry));
         }
     }
+
+    let survivors = survivors
+        .into_iter()
+        .map(|(path, (volume, entry))| (path, volume, entry));
 
     SegmentedIndex::build_segment_files(&out, survivors, true)
 }

@@ -24,9 +24,19 @@ impl IndexEntry {
     }
 }
 
+/// A filesystem entry in Minidex, containing information extracted
+/// from files, directories or symlinks by systems populating the index.
 pub struct FilesystemEntry {
+    /// Path of the entry
     pub path: PathBuf,
+    /// Volume mount where the entry exists. On Windows this can be a
+    /// letter drive, or a UNC path prefix. On UNIX this should be the
+    /// volume mount path
+    pub volume: String,
+    /// Entry kind (File, Directory or Symlink)
     pub kind: Kind,
+    /// Last modified timestamp
     pub last_modified: u64,
+    /// Last accessed timestamp
     pub last_accessed: u64,
 }

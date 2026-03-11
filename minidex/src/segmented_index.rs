@@ -112,7 +112,7 @@ impl Segment {
     }
 
     /// Reads document data for the given offset.
-    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, IndexEntry)> {
+    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
         let data = self.data.as_ref().expect("expected data to be loaded");
         let data_len = data.len();
@@ -133,13 +133,25 @@ impl Segment {
             .ok()?
             .to_string();
 
-        let entry_start = path_start + path_len;
+        let volume_len =
+            u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                as usize;
+        let volume_start = cursor + size_of::<u32>();
+
+        if volume_start + volume_len > data_len {
+            return None;
+        }
+        let volume_str = std::str::from_utf8(&data[volume_start..volume_start + volume_len])
+            .ok()?
+            .to_string();
+
+        let entry_start = volume_start + volume_len;
         if entry_start + IndexEntry::SIZE > data_len {
             return None;
         }
         let entry = IndexEntry::from_bytes(&data[entry_start..entry_start + IndexEntry::SIZE]);
 
-        Some((path_str, entry))
+        Some((path_str, volume_str, entry))
     }
 }
 
@@ -240,7 +252,7 @@ impl SegmentedIndex {
         it: I,
     ) -> Result<(), SegmentedIndexError>
     where
-        I: Iterator<Item = (String, IndexEntry)>,
+        I: Iterator<Item = (String, String, IndexEntry)>,
     {
         Self::build_segment_files(segment_path, it, false)?;
         Ok(())
@@ -286,7 +298,7 @@ impl SegmentedIndex {
         drop_deletions: bool,
     ) -> Result<u64, SegmentedIndexError>
     where
-        I: IntoIterator<Item = (S, IndexEntry)>,
+        I: IntoIterator<Item = (S, S, IndexEntry)>,
         S: AsRef<str>,
     {
         let seg_path = out_path.with_extension(SEGMENT_EXT);
@@ -302,19 +314,25 @@ impl SegmentedIndex {
         let mut current_dat_offset = 0u64;
         let mut written = 0;
 
-        for (path, entry) in items {
-            let path_ref = path.as_ref();
-
+        for (path, volume, entry) in items {
             if drop_deletions && entry.opstamp.is_deletion() {
                 continue; // Always drop deletions before they hit the disk segment!
             }
 
+            let path_ref = path.as_ref();
             let path_bytes = path_ref.as_bytes();
+            let volume_ref = volume.as_ref();
+            let volume_bytes = volume_ref.as_bytes();
+
             let entry_bytes = entry.to_bytes();
 
             dat_writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
             dat_writer.write_all(path_bytes)?;
+            dat_writer.write_all(&(volume_bytes.len() as u32).to_le_bytes())?;
+            dat_writer.write_all(volume_bytes)?;
             dat_writer.write_all(&entry_bytes)?;
+
+            // Tokenize the path, generate synthetic tokens and add them too.
 
             let tokens = crate::tokenizer::tokenize(path_ref);
             for token in tokens {
@@ -324,7 +342,29 @@ impl SegmentedIndex {
                     .push(current_dat_offset);
             }
 
-            current_dat_offset += (4 + path_bytes.len() + entry_bytes.len()) as u64;
+            let path_lower = path_ref.to_lowercase();
+            for (i, _) in path_lower.match_indices(['/', '\\']) {
+                if i > 0 {
+                    let synth = crate::tokenizer::synthesize_path_token(&path_lower[..=i]);
+                    inverted_index
+                        .entry(synth)
+                        .or_default()
+                        .push(current_dat_offset);
+                }
+            }
+
+            // Generate synthetic tokens for the volume data and insert them
+            if !volume_ref.is_empty() {
+                let synth = crate::tokenizer::synthesize_volume_token(&volume_ref.to_lowercase());
+                inverted_index
+                    .entry(synth)
+                    .or_default()
+                    .push(current_dat_offset);
+            }
+
+            current_dat_offset +=
+                (size_of::<u32>() + path_bytes.len() + volume_bytes.len() + entry_bytes.len())
+                    as u64;
             written += 1;
         }
 

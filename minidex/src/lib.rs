@@ -31,7 +31,7 @@ pub struct Index {
     path: PathBuf,
     base: Arc<RwLock<SegmentedIndex>>,
     next_op_seq: AtomicU64,
-    mem_idx: RwLock<BTreeMap<String, IndexEntry>>,
+    mem_idx: RwLock<BTreeMap<String, (String, IndexEntry)>>,
     wal: RwLock<Wal>,
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -67,8 +67,8 @@ impl Index {
         let wal_path = path.as_ref().join("journal.wal");
 
         let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
-        for (k, v) in recovered {
-            mem_idx.insert(k, v);
+        for (path, volume, entry) in recovered {
+            mem_idx.insert(path, (volume, entry));
         }
 
         let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
@@ -94,6 +94,7 @@ impl Index {
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
         let path_str = item.path.to_string_lossy().to_string();
+        let volume = item.volume;
         let entry = IndexEntry {
             opstamp: Opstamp::insertion(seq),
             kind: item.kind,
@@ -103,14 +104,15 @@ impl Index {
 
         {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-            wal.append(&path_str, &entry).map_err(IndexError::Io)?;
+            wal.append(&path_str, &volume, &entry)
+                .map_err(IndexError::Io)?;
         }
 
         {
             self.mem_idx
                 .write()
                 .map_err(|_| IndexError::WriteLock)?
-                .insert(path_str, entry);
+                .insert(path_str, (volume, entry));
         }
 
         if self.should_flush() {
@@ -133,14 +135,14 @@ impl Index {
 
         {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-            wal.append(&path_str, &entry).map_err(IndexError::Io)?;
+            wal.append(&path_str, "", &entry).map_err(IndexError::Io)?;
         }
 
         {
             self.mem_idx
                 .write()
                 .map_err(|_| IndexError::WriteLock)?
-                .insert(path_str, entry);
+                .insert(path_str, ("".to_owned(), entry));
         }
 
         if self.should_flush() {
@@ -178,25 +180,26 @@ impl Index {
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
-        let mut candidates: HashMap<String, (String, IndexEntry)> = HashMap::new();
+        let mut candidates: HashMap<String, (String, String, IndexEntry)> = HashMap::new();
 
         let required_matches = limit + offset;
 
         let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
 
-        for (path, entry) in mem.iter() {
+        for (path, (volume, entry)) in mem.iter() {
             let normalized = path.to_lowercase();
             let matches_all = tokens.iter().all(|t| normalized.contains(t));
             if matches_all {
                 candidates
                     .entry(normalized.clone())
-                    .and_modify(|(current_path, current_entry)| {
+                    .and_modify(|(current_path, current_volume, current_entry)| {
                         if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                             *current_entry = *entry;
+                            *current_volume = volume.clone();
                             *current_path = path.clone()
                         }
                     })
-                    .or_insert((path.clone(), *entry));
+                    .or_insert((path.clone(), volume.clone(), *entry));
             }
         }
 
@@ -246,17 +249,18 @@ impl Index {
                     if resolved_count >= required_matches {
                         break;
                     }
-                    if let Some((path, entry)) = segment.read_document(dat_offset) {
+                    if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         let key = path.to_lowercase();
                         candidates
                             .entry(key)
-                            .and_modify(|(current_path, current_entry)| {
+                            .and_modify(|(current_path, current_volume, current_entry)| {
                                 if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                                     *current_entry = entry;
+                                    *current_volume = volume.clone();
                                     *current_path = path.clone();
                                 }
                             })
-                            .or_insert((path, entry));
+                            .or_insert((path, volume, entry));
 
                         resolved_count += 1;
                     }
@@ -265,10 +269,11 @@ impl Index {
         }
 
         let mut results = Vec::new();
-        for (_, (path, entry)) in candidates {
+        for (_, (path, volume, entry)) in candidates {
             if !entry.opstamp.is_deletion() {
                 results.push(SearchResult {
                     path: PathBuf::from(path),
+                    volume: volume,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
                     last_accessed: entry.last_accessed,
@@ -371,9 +376,12 @@ impl Index {
                 {
                     let mut base_guard = base.write().expect("failed to lock base");
 
-                    if let Err(e) =
-                        base_guard.write_segment(&tmp_segment_path, snapshot.into_iter())
-                    {
+                    if let Err(e) = base_guard.write_segment(
+                        &tmp_segment_path,
+                        snapshot
+                            .into_iter()
+                            .map(|(path, (volume, entry))| (path, volume, entry)),
+                    ) {
                         log::error!("flush failed to write: {}", e);
                         let (tmp_seg, tmp_dat, tmp_post) = Segment::to_paths(&tmp_segment_path);
                         let _ = std::fs::remove_file(tmp_seg);
@@ -489,6 +497,7 @@ impl Drop for Index {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SearchResult {
     pub path: PathBuf,
+    pub volume: String,
     pub kind: Kind,
     pub last_modified: u64,
     pub last_accessed: u64,
