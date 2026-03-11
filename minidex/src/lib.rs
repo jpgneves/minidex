@@ -180,10 +180,6 @@ impl Index {
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-        if let Some(volume_filter) = options.volume_filter {
-            tokens.insert(0, crate::tokenizer::synthesize_volume_token(volume_filter))
-        }
-
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
@@ -195,12 +191,12 @@ impl Index {
 
         for (path, (volume, entry)) in mem.iter() {
             let normalized = path.to_lowercase();
-            let matches_volume = if let Some(filter) = options.volume_filter {
-                volume == filter
-            } else {
-                true
-            };
-            let matches_all = matches_volume && tokens.iter().all(|t| normalized.contains(t));
+            if let Some(filter) = options.volume_filter {
+                if volume != filter {
+                    continue;
+                }
+            }
+            let matches_all = tokens.iter().all(|t| normalized.contains(t));
             if matches_all {
                 candidates
                     .entry(normalized.clone())

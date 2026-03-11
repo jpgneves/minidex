@@ -111,6 +111,17 @@ impl Segment {
         docs
     }
 
+    /// Iterator over the documents in this segment
+    pub(crate) fn documents(&self) -> DocumentIterator<'_> {
+        DocumentIterator::new(self.data.as_ref().expect("Expected data to be loaded"))
+    }
+
+    /// Find all document offsets whose path starts with `prefix.
+    pub(crate) fn find_docs_by_prefix(&self, prefix: &str) -> Vec<u64> {
+        let synth = crate::tokenizer::synthesize_path_token(&prefix.to_lowercase());
+        todo!()
+    }
+
     /// Reads document data for the given offset.
     pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
@@ -419,5 +430,72 @@ pub enum SegmentedIndexError {
 impl From<std::io::Error> for SegmentedIndexError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+pub(crate) struct DocumentIterator<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> DocumentIterator<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, cursor: 0 }
+    }
+}
+
+impl Iterator for DocumentIterator<'_> {
+    type Item = (String, String, IndexEntry);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = self.data;
+
+        if self.cursor + size_of::<u32>() > data.len() {
+            return None;
+        }
+
+        let path_len = u32::from_le_bytes(
+            data[self.cursor..self.cursor + size_of::<u32>()]
+                .try_into()
+                .expect("failed to read path_len"),
+        ) as usize;
+        self.cursor += size_of::<u32>();
+
+        if self.cursor + path_len > data.len() {
+            return None;
+        }
+
+        let path = std::str::from_utf8(&data[self.cursor..self.cursor + path_len])
+            .ok()?
+            .to_string();
+        self.cursor += path_len;
+
+        if self.cursor + size_of::<u32>() > data.len() {
+            return None;
+        }
+
+        let volume_len = u32::from_le_bytes(
+            data[self.cursor..self.cursor + size_of::<u32>()]
+                .try_into()
+                .expect("failed to read path_len"),
+        ) as usize;
+        self.cursor += size_of::<u32>();
+
+        if self.cursor + path_len > data.len() {
+            return None;
+        }
+
+        let volume = std::str::from_utf8(&data[self.cursor..self.cursor + volume_len])
+            .ok()?
+            .to_string();
+        self.cursor += volume_len;
+
+        if self.cursor + IndexEntry::SIZE > data.len() {
+            return None;
+        }
+        let entry = IndexEntry::from_bytes(&data[self.cursor..self.cursor + IndexEntry::SIZE]);
+        self.cursor += IndexEntry::SIZE;
+
+        Some((path, volume, entry))
     }
 }

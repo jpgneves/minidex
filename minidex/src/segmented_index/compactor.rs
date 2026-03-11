@@ -96,55 +96,15 @@ pub(crate) fn merge_segments(
     let mut survivors: BTreeMap<String, (String, IndexEntry)> = BTreeMap::new();
 
     for seg in segments {
-        let data = seg.data.as_ref().expect("expected a loaded data map");
-        let mut cursor = 0;
-
-        while cursor < data.len() {
-            if cursor + size_of::<u32>() > data.len() {
-                break;
-            }
-            let path_len =
-                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
-                    as usize;
-            cursor += size_of::<u32>();
-
-            if cursor + path_len > data.len() {
-                break;
-            }
-
-            let path_str = std::str::from_utf8(&data[cursor..cursor + path_len])
-                .unwrap_or("")
-                .to_string();
-            cursor += path_len;
-
-            let volume_len =
-                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
-                    as usize;
-            cursor += size_of::<u32>();
-
-            if cursor + volume_len > data.len() {
-                break;
-            }
-
-            let volume_str = std::str::from_utf8(&data[cursor..cursor + volume_len])
-                .unwrap_or("")
-                .to_string();
-            cursor += volume_len;
-
-            if cursor + IndexEntry::SIZE > data.len() {
-                break;
-            }
-            let entry = IndexEntry::from_bytes(&data[cursor..cursor + IndexEntry::SIZE]);
-            cursor += IndexEntry::SIZE;
-
+        for (path, volume, entry) in seg.documents() {
             survivors
-                .entry(path_str)
+                .entry(path)
                 .and_modify(|existing| {
                     if entry.opstamp.sequence() > existing.1.opstamp.sequence() {
-                        *existing = (volume_str.clone(), entry);
+                        *existing = (volume.clone(), entry);
                     }
                 })
-                .or_insert((volume_str, entry));
+                .or_insert((volume, entry));
         }
     }
 
