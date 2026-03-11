@@ -31,7 +31,7 @@ const META_EXT: &str = "meta";
 
 /// A live index segment
 pub(crate) struct Segment {
-    map: Option<Map<Vec<u8>>>,
+    map: Option<Map<Mmap>>,
     data: Option<Mmap>,
     post: Option<Mmap>,
     meta: Option<Mmap>,
@@ -44,13 +44,10 @@ impl Segment {
     pub fn load(path: PathBuf) -> Result<Self, SegmentedIndexError> {
         let (seg_path, dat_path, post_path, meta_path) = Self::to_paths(&path);
 
-        let mut entry_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
-        let mut buf = Vec::new();
-        entry_file
-            .read_to_end(&mut buf)
-            .map_err(SegmentedIndexError::Io)?;
+        let mut seg_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
+        let seg = unsafe { Mmap::map(&seg_file).map_err(SegmentedIndexError::Io)? };
 
-        let map = Map::new(buf).map_err(SegmentedIndexError::Fst)?;
+        let map = Map::new(seg).map_err(SegmentedIndexError::Fst)?;
 
         // Load the data file for the same segment
         let dat_file = File::open(dat_path).map_err(SegmentedIndexError::Io)?;
@@ -201,8 +198,8 @@ impl Segment {
     }
 }
 
-impl AsRef<Map<Vec<u8>>> for Segment {
-    fn as_ref(&self) -> &Map<Vec<u8>> {
+impl AsRef<Map<Mmap>> for Segment {
+    fn as_ref(&self) -> &Map<Mmap> {
         self.map.as_ref().unwrap()
     }
 }
