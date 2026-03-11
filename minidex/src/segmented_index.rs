@@ -10,7 +10,7 @@ use std::{
 
 use crate::{Kind, Path, PathBuf, entry::IndexEntry};
 use fs4::fs_std::FileExt;
-use fst::{Automaton, Map, automaton::Str};
+use fst::{Automaton, IntoStreamer, Map, Streamer, automaton::Str};
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -263,7 +263,7 @@ impl SegmentedIndex {
                     log::trace!("Cleaning up orphaned temporary file: {}", file_name);
 
                     // We can safely delete the all the files
-                    let (seg_path, data_path, post_path, meta_path) = Segment::to_paths(path);
+                    let (seg_path, data_path, post_path, meta_path) = Segment::to_paths(&path);
                     let _ = std::fs::remove_file(seg_path);
                     let _ = std::fs::remove_file(data_path);
                     let _ = std::fs::remove_file(post_path);
