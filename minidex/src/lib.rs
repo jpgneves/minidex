@@ -9,6 +9,7 @@ use std::{
     time::SystemTime,
 };
 
+use bstr::ByteSlice;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
 use thiserror::Error;
@@ -95,7 +96,7 @@ impl Index {
             compactor_config,
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
-            prefix_tombstones: Arc::new(RwLock::new(Vec::new())),
+            prefix_tombstones: Arc::new(RwLock::new(prefix_tombstones)),
         })
     }
 
@@ -215,7 +216,7 @@ impl Index {
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
-        let mut candidates: HashMap<String, (String, String, IndexEntry)> = HashMap::new();
+        let mut candidates: HashMap<String, (String, IndexEntry)> = HashMap::new();
 
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
@@ -229,9 +230,12 @@ impl Index {
             .clone();
 
         for (path, (volume, entry)) in mem.iter() {
-            let normalized = path.to_lowercase();
+            let path_bytes = path.as_bytes();
             let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
-                normalized.starts_with(prefix) && entry.opstamp.sequence() < *stamp
+                let prefix_bytes = prefix.as_bytes();
+                path_bytes.len() >= prefix_bytes.len()
+                    && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+                    && entry.opstamp.sequence() < *stamp
             });
 
             if is_tombstoned {
@@ -243,18 +247,19 @@ impl Index {
                     continue;
                 }
             }
-            let matches_all = tokens.iter().all(|t| normalized.contains(t));
+            let matches_all = tokens
+                .iter()
+                .all(|t| path_bytes.find_iter(t.as_bytes()).next().is_some());
             if matches_all {
                 candidates
-                    .entry(normalized.clone())
-                    .and_modify(|(current_path, current_volume, current_entry)| {
+                    .entry(path.clone())
+                    .and_modify(|(current_volume, current_entry)| {
                         if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                             *current_entry = *entry;
                             *current_volume = volume.clone();
-                            *current_path = path.clone()
                         }
                     })
-                    .or_insert((path.clone(), volume.clone(), *entry));
+                    .or_insert((volume.clone(), *entry));
             }
         }
 
@@ -351,31 +356,36 @@ impl Index {
                     let (dat_offset, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                        let normalized = path.to_lowercase();
+                        let path_bytes = path.as_bytes();
 
                         let is_tombstoned = active_tombstones.iter().any(|(prefix, stamp)| {
-                            normalized.starts_with(prefix) && entry.opstamp.sequence() < *stamp
+                            let prefix_bytes = prefix.as_bytes();
+                            path_bytes.len() >= prefix_bytes.len()
+                                && path_bytes[..prefix_bytes.len()]
+                                    .eq_ignore_ascii_case(prefix_bytes)
+                                && entry.opstamp.sequence() < *stamp
                         });
 
                         if is_tombstoned {
                             continue;
                         }
 
-                        let matches_all = tokens.iter().all(|t| normalized.contains(t));
+                        let matches_all = tokens
+                            .iter()
+                            .all(|t| path_bytes.find_iter(t.as_bytes()).next().is_some());
 
                         if !matches_all {
                             continue;
                         }
                         candidates
-                            .entry(normalized)
-                            .and_modify(|(current_path, current_volume, current_entry)| {
+                            .entry(path)
+                            .and_modify(|(current_volume, current_entry)| {
                                 if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                                     *current_entry = entry;
                                     *current_volume = volume.clone();
-                                    *current_path = path.clone();
                                 }
                             })
-                            .or_insert((path, volume, entry));
+                            .or_insert((volume, entry));
                     }
                 }
             }
@@ -383,13 +393,14 @@ impl Index {
 
         let mut results: Vec<_> = candidates
             .into_iter()
-            .filter(|(_, (_, _, entry))| !entry.opstamp.is_deletion())
+            .filter(|(_, (_, entry))| !entry.opstamp.is_deletion())
+            .map(|(path, (volume, entry))| (path, volume, entry))
             .collect();
 
         // Rough top-k
         if results.len() > scoring_cap {
             results.select_nth_unstable_by(scoring_cap, |a, b| {
-                b.1.2.last_modified.cmp(&a.1.2.last_modified)
+                b.2.last_modified.cmp(&a.2.last_modified)
             });
             results.truncate(scoring_cap);
         }
@@ -407,7 +418,7 @@ impl Index {
 
         let mut scored: Vec<_> = results
             .into_iter()
-            .map(|(_, (path, volume, entry))| {
+            .map(|(path, volume, entry)| {
                 let score = crate::search::compute_score(
                     config,
                     &path,
