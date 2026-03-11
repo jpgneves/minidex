@@ -291,35 +291,56 @@ impl Index {
             }
         }
 
-        let mut results = Vec::new();
-        for (_, (path, volume, entry)) in candidates {
-            if !entry.opstamp.is_deletion() {
-                let config = if let Some(config) = options.scoring {
-                    config
-                } else {
-                    &ScoringConfig::default()
-                };
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .filter(|(_, (_, _, entry))| !entry.opstamp.is_deletion())
+            .collect();
+
+        // Rough top-k
+        let scoring_cap = std::cmp::max(500, (offset + limit) * 10);
+        if results.len() > scoring_cap {
+            results.select_nth_unstable_by(scoring_cap, |a, b| {
+                b.1.2.last_modified.cmp(&a.1.2.last_modified)
+            });
+            results.truncate(scoring_cap);
+        }
+
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("failed to get system time")
+            .as_micros() as f64;
+
+        let config = if let Some(config) = options.scoring {
+            config
+        } else {
+            &ScoringConfig::default()
+        };
+
+        let mut scored: Vec<_> = results
+            .into_iter()
+            .map(|(_, (path, volume, entry))| {
                 let score = crate::search::compute_score(
                     config,
                     &path,
                     &tokens,
                     entry.last_modified,
                     entry.kind,
+                    now_micros,
                 );
-                results.push(SearchResult {
+                SearchResult {
                     path: PathBuf::from(path),
                     volume: volume,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
                     last_accessed: entry.last_accessed,
                     score,
-                });
-            }
-        }
+                }
+            })
+            .collect();
 
-        results.sort();
+        scored.sort();
 
-        let paginated_results = results.into_iter().skip(offset).take(limit).collect();
+        let paginated_results = scored.into_iter().skip(offset).take(limit).collect();
 
         Ok(paginated_results)
     }

@@ -40,10 +40,10 @@ pub(crate) fn compute_score(
     query_tokens: &[String],
     last_modified: u64,
     kind: Kind,
+    now_micros: f64,
 ) -> f64 {
     let path_tokens = crate::tokenizer::tokenize(path);
     let normalized = path.to_lowercase();
-    let path_buf = std::path::PathBuf::from(path);
 
     let mut score = 0.0;
 
@@ -74,27 +74,29 @@ pub(crate) fn compute_score(
     score += config.exact_match * exact as f64;
 
     // Filename match: query tokens found in the last path component
-    if let Some(filename) = path_buf.file_name().and_then(|f| f.to_str()) {
-        let filename_lower = filename.to_lowercase();
-        let filename_hits = query_tokens
-            .iter()
-            .filter(|query_token| filename_lower.contains(query_token.as_str()))
-            .count();
+    let filename_start = path
+        .rfind(std::path::MAIN_SEPARATOR)
+        .map(|i| i + 1)
+        .unwrap_or(0);
 
-        score += config.filename_match * filename_hits as f64;
-    }
+    let filename_lower = &normalized[filename_start..];
+    let filename_hits = query_tokens
+        .iter()
+        .filter(|query_token| filename_lower.contains(query_token.as_str()))
+        .count();
+
+    score += config.filename_match * filename_hits as f64;
 
     // Path depth penalty
-    let depth = path_buf.components().count();
+    let depth = path
+        .chars()
+        .filter(|c| *c == std::path::MAIN_SEPARATOR)
+        .count();
     if depth > 1 {
         score -= config.depth_penalty * (depth as f64).ln();
     }
 
     // Recency boost
-    let now_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("failed to get system time")
-        .as_micros() as f64;
     let age_days = (now_micros - last_modified as f64) / (1_000_000.0 * 86_400.0);
     if age_days > 0.0 {
         score += config.recency_boost / (1.0 + age_days.ln());
