@@ -10,7 +10,7 @@ use std::{
 
 use crate::{Kind, Path, PathBuf, entry::IndexEntry};
 use fs4::fs_std::FileExt;
-use fst::Map;
+use fst::{Automaton, Map, automaton::Str};
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -131,9 +131,19 @@ impl Segment {
     }
 
     /// Find all document offsets whose path starts with `prefix.
-    pub(crate) fn find_docs_by_prefix(&self, prefix: &str) -> Vec<u64> {
+    pub(crate) fn find_docs_by_prefix(&self, prefix: &str) -> Vec<DocumentId> {
         let synth = crate::tokenizer::synthesize_path_token(&prefix.to_lowercase());
-        todo!()
+        let matcher = Str::new(&synth).starts_with();
+        let map = self.map.as_ref().expect("segment map should be loaded");
+        let mut stream = map.search(&matcher).into_stream();
+        let mut all_docs = Vec::new();
+
+        while let Some((_, post_offset)) = stream.next() {
+            all_docs.extend(self.read_posting_list(post_offset));
+        }
+        all_docs.sort_unstable();
+        all_docs.dedup();
+        all_docs
     }
 
     /// Reads document data for the given offset.
@@ -158,15 +168,15 @@ impl Segment {
             .ok()?
             .to_string();
 
+        if path_start + path_len + size_of::<u32>() > data_len {
+            return None;
+        }
+
         let volume_len = u32::from_le_bytes(
             data[path_start + path_len..path_start + path_len + size_of::<u32>()]
                 .try_into()
                 .unwrap(),
         ) as usize;
-
-        if path_start + path_len + size_of::<u32>() > data_len {
-            return None;
-        }
 
         let volume_start = path_start + path_len + size_of::<u32>();
 
@@ -252,9 +262,12 @@ impl SegmentedIndex {
                 if file_name.contains(".tmp") {
                     log::trace!("Cleaning up orphaned temporary file: {}", file_name);
 
-                    // We can safely delete the .seg and its matching .dat file
-                    let _ = std::fs::remove_file(&path);
-                    let _ = std::fs::remove_file(path.with_extension(DATA_EXT));
+                    // We can safely delete the all the files
+                    let (seg_path, data_path, post_path, meta_path) = Segment::to_paths(path);
+                    let _ = std::fs::remove_file(seg_path);
+                    let _ = std::fs::remove_file(data_path);
+                    let _ = std::fs::remove_file(post_path);
+                    let _ = std::fs::remove_file(meta_path);
 
                     continue; // Skip loading!
                 }
