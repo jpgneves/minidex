@@ -88,29 +88,68 @@ impl CompactorConfigBuilder {
 
 /// Merge live segments into smaller ones.
 /// Drops data that is outdated - only the latest opstamp wins.
+/// Implemented via a K-Way Merge with zero allocations
 /// Note: atomic replacement of old segment files is done by the caller
 pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
-    let mut survivors: BTreeMap<String, (String, IndexEntry)> = BTreeMap::new();
+    let mut iterators: Vec<_> = segments
+        .iter()
+        .map(|seg| seg.documents().into_iter())
+        .collect();
 
-    for seg in segments {
-        for (path, volume, entry) in seg.documents() {
-            survivors
-                .entry(path)
-                .and_modify(|existing| {
-                    if entry.opstamp.sequence() > existing.1.opstamp.sequence() {
-                        *existing = (volume.clone(), entry);
+    let mut currents: Vec<Option<(String, String, IndexEntry)>> =
+        iterators.iter_mut().map(|iter| iter.next()).collect();
+
+    let merged_iterator = std::iter::from_fn(move || {
+        // Find the index of the segment with the alphabetically smallest path
+        let mut min_idx = None;
+
+        for i in 0..currents.len() {
+            if let Some((path_i, _, _)) = &currents[i] {
+                min_idx = match min_idx {
+                    None => Some(i), // We're the first
+                    Some(idx) => {
+                        let (path_min, _, _) = currents[idx].as_ref().unwrap();
+                        if path_i < path_min {
+                            Some(i)
+                        } else {
+                            Some(idx)
+                        }
                     }
-                })
-                .or_insert((volume, entry));
+                };
+            }
         }
-    }
 
-    let survivors = survivors
-        .into_iter()
-        .map(|(path, (volume, entry))| (path, volume, entry));
+        // If we've exhausted all iterators, merge completed.
+        let target_idx = min_idx?;
 
-    SegmentedIndex::build_segment_files(&out, survivors, true)
+        let mut best_item = currents[target_idx].take().unwrap();
+
+        // Refill the head with the next one.
+        currents[target_idx] = iterators[target_idx].next();
+
+        // Check all other heads for the exact same path.
+        // If they are the same, consume and resolve opstamp ties.
+        for i in 0..currents.len() {
+            while let Some((path, _, _)) = &currents[i] {
+                if *path == best_item.0 {
+                    let item = currents[i].take().unwrap();
+
+                    if item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
+                        best_item = item;
+                    }
+
+                    // Refill the head on the consumed iterator
+                    currents[i] = iterators[i].next();
+                } else {
+                    break;
+                }
+            }
+        }
+        Some(best_item)
+    });
+
+    SegmentedIndex::build_segment_files(&out, merged_iterator, true)
 }
