@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use minidex::{FilesystemEntry, Index, Kind};
+use minidex::{FilesystemEntry, Index, Kind, SearchOptions};
 
 struct Scanner<'a> {
     index: &'a Index,
@@ -42,7 +42,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
             let last_accessed = last_modified;
             let _ = self.index.insert(FilesystemEntry {
                 path: entry.path().to_path_buf(),
-                volume: "/".to_string(),
+                volume: "/".to_string(), // This should be properly extract of course
                 kind,
                 last_modified,
                 last_accessed,
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     .unwrap();
 
-    let mut builder = WalkBuilder::new(format!("{home_dir}"));
+    let mut builder = WalkBuilder::new(format!("{home_dir}/Documents"));
 
     let walk = builder.threads(2).build_parallel();
 
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let now = std::time::Instant::now();
     println!("Searching");
-    let results = index.search("jpg", 500, 0)?;
+    let results = index.search("jpg", 500, 0, SearchOptions::default())?;
     println!(
         "Found {} results in {} ms",
         results.len(),

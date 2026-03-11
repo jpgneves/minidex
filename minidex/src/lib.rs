@@ -21,8 +21,10 @@ use segmented_index::*;
 mod opstamp;
 use opstamp::*;
 use wal::Wal;
+mod search;
 mod tokenizer;
 mod wal;
+pub use search::{ScoringConfig, SearchOptions, SearchResult};
 
 /// A Minidex Index, managing both the in-memory and disk data.
 /// Insertions and deletions auto-commit to the Write-Ahead Log
@@ -168,6 +170,7 @@ impl Index {
         query: &str,
         limit: usize,
         offset: usize,
+        options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
         let mut tokens = crate::tokenizer::tokenize(query);
 
@@ -176,6 +179,10 @@ impl Index {
         }
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+        if let Some(volume_filter) = options.volume_filter {
+            tokens.insert(0, crate::tokenizer::synthesize_volume_token(volume_filter))
+        }
 
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
@@ -188,7 +195,12 @@ impl Index {
 
         for (path, (volume, entry)) in mem.iter() {
             let normalized = path.to_lowercase();
-            let matches_all = tokens.iter().all(|t| normalized.contains(t));
+            let matches_volume = if let Some(filter) = options.volume_filter {
+                volume == filter
+            } else {
+                true
+            };
+            let matches_all = matches_volume && tokens.iter().all(|t| normalized.contains(t));
             if matches_all {
                 candidates
                     .entry(normalized.clone())
@@ -271,12 +283,25 @@ impl Index {
         let mut results = Vec::new();
         for (_, (path, volume, entry)) in candidates {
             if !entry.opstamp.is_deletion() {
+                let config = if let Some(config) = options.scoring {
+                    config
+                } else {
+                    &ScoringConfig::default()
+                };
+                let score = crate::search::compute_score(
+                    config,
+                    &path,
+                    &tokens,
+                    entry.last_modified,
+                    entry.kind,
+                );
                 results.push(SearchResult {
                     path: PathBuf::from(path),
                     volume: volume,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
                     last_accessed: entry.last_accessed,
+                    score,
                 });
             }
         }
@@ -489,33 +514,6 @@ impl Drop for Index {
         {
             let _ = compactor.join();
         }
-    }
-}
-
-/// A Minidex search result, containing the found metadata for
-/// the given file
-#[derive(Debug, PartialEq, Eq)]
-pub struct SearchResult {
-    pub path: PathBuf,
-    pub volume: String,
-    pub kind: Kind,
-    pub last_modified: u64,
-    pub last_accessed: u64,
-}
-
-impl Ord for SearchResult {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .last_modified
-            .cmp(&self.last_modified)
-            .then_with(|| self.kind.cmp(&other.kind))
-            .then_with(|| self.path.cmp(&other.path))
-    }
-}
-
-impl PartialOrd for SearchResult {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
