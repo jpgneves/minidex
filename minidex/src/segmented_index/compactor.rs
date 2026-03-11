@@ -10,8 +10,8 @@ pub struct CompactorConfig {
     pub min_merge_count: usize,
     /// Minimum amount of data in memory required to flush
     pub flush_threshold: usize,
-    /// Minimum amount of deletions to trigger compaction
-    pub deletion_threshold: usize,
+    /// Minimum amount of tombstones written to trigger compaction
+    pub tombstone_threshold: usize,
 }
 
 impl Default for CompactorConfig {
@@ -24,15 +24,15 @@ impl Default for CompactorConfig {
 pub struct CompactorConfigBuilder {
     min_merge_count: usize,
     flush_threshold: usize,
-    deletion_threshold: usize,
+    tombstone_threshold: usize,
 }
 
 impl Default for CompactorConfigBuilder {
     fn default() -> Self {
         Self {
             min_merge_count: 4,
-            flush_threshold: 10_000,  // Default to 10k entries
-            deletion_threshold: 1000, // Trigger compaction on 1000 deletes
+            flush_threshold: 10_000, // Default to 10k entries
+            tombstone_threshold: 50,
         }
     }
 }
@@ -60,10 +60,10 @@ impl CompactorConfigBuilder {
         }
     }
 
-    /// Set the minimum number of deletions required to trigger compaction
-    pub fn deletion_threshold(self, deletion_threshold: usize) -> Self {
+    /// Set the minimum number of prefix tombstones required to trigger compaction
+    pub fn tombstone_threshold(self, tombstone_threshold: usize) -> Self {
         Self {
-            deletion_threshold,
+            tombstone_threshold,
             ..self
         }
     }
@@ -72,7 +72,7 @@ impl CompactorConfigBuilder {
         CompactorConfig {
             min_merge_count: self.min_merge_count,
             flush_threshold: self.flush_threshold,
-            deletion_threshold: self.deletion_threshold,
+            tombstone_threshold: self.tombstone_threshold,
         }
     }
 }

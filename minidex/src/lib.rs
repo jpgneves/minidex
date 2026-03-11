@@ -42,7 +42,6 @@ pub struct Index {
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
     prefix_tombstones: Arc<RwLock<Vec<(String, u64)>>>,
-    deletion_count: AtomicU64,
 }
 
 impl Index {
@@ -97,7 +96,6 @@ impl Index {
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
             prefix_tombstones: Arc::new(RwLock::new(Vec::new())),
-            deletion_count: AtomicU64::new(0),
         })
     }
 
@@ -184,8 +182,6 @@ impl Index {
 
             wal.write_prefix_tombstone(&prefix_lower, seq)?;
         }
-
-        self.deletion_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -493,6 +489,8 @@ impl Index {
 
     fn should_flush(&self) -> bool {
         self.mem_idx.read().unwrap().len() > self.compactor_config.flush_threshold
+            || self.prefix_tombstones.read().unwrap().len()
+                > self.compactor_config.tombstone_threshold
     }
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
