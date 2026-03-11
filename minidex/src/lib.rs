@@ -186,7 +186,7 @@ impl Index {
         let mut candidates: HashMap<String, (String, String, IndexEntry)> = HashMap::new();
 
         let required_matches = limit + offset;
-        let scoring_cap = std::cmp::max(500, required_matches * 10);
+        let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
 
         let short_circuit_threshold = std::cmp::max(5000, required_matches * 10);
 
