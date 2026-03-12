@@ -28,6 +28,7 @@ use opstamp::*;
 use wal::Wal;
 mod search;
 mod tokenizer;
+pub use tokenizer::tokenize;
 mod wal;
 pub use search::{ScoringConfig, SearchOptions, SearchResult};
 
@@ -283,15 +284,20 @@ impl Index {
                 }
             }
 
-            let matches_all = tokens.iter().all(|t| {
-                let token_bytes = t.as_bytes();
-                if path_bytes.len() < token_bytes.len() {
-                    return false;
-                }
-                path_bytes
-                    .windows(token_bytes.len())
-                    .any(|window| window.eq_ignore_ascii_case(token_bytes))
-            });
+            let matches_all = if path.is_ascii() {
+                tokens.iter().all(|t| {
+                    let token_bytes = t.as_bytes();
+                    if path_bytes.len() < token_bytes.len() {
+                        return false;
+                    }
+                    path_bytes
+                        .windows(token_bytes.len())
+                        .any(|window| window.eq_ignore_ascii_case(token_bytes))
+                })
+            } else {
+                let folded_path = crate::tokenizer::fold_path(path);
+                tokens.iter().all(|t| folded_path.contains(t))
+            };
 
             if matches_all {
                 collector.insert(path.to_string(), volume.clone(), *entry);
@@ -725,12 +731,11 @@ impl Index {
 
                 let _ = Segment::rename_files(&tmp_paths, &final_paths);
 
-                let new_segment = Arc::new(Segment::load(final_segment_path).expect("failed to load"));
+                let new_segment =
+                    Arc::new(Segment::load(final_segment_path).expect("failed to load"));
                 {
                     let mut base_guard = base.write().expect("failed to lock base");
-                    base_guard
-                        .add_segment(new_segment);
-
+                    base_guard.add_segment(new_segment);
                 }
 
                 if let Err(e) = std::fs::remove_file(&flushing_path) {

@@ -151,6 +151,22 @@ impl App {
         self.list_state.select(Some(i));
     }
 
+    fn delete_selected(&mut self) {
+        if let Some(i) = self.list_state.selected() {
+            if let Some(res) = self.results.get(i) {
+                let _ = self.index.delete(&res.path);
+                self.update_search();
+            }
+        }
+    }
+
+    fn compact(&self) {
+        let index = Arc::clone(&self.index);
+        std::thread::spawn(move || {
+            let _ = index.force_compact_all();
+        });
+    }
+
     fn start_indexing(&self, path: String) {
         if self.indexing.swap(true, Ordering::SeqCst) {
             return; // Already indexing
@@ -177,6 +193,25 @@ impl App {
             walk.visit(&mut scanner);
             indexing.store(false, Ordering::SeqCst);
         });
+    }
+}
+
+fn detect_category(path: &std::path::Path) -> u16 {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" => category::IMAGE,
+        "mp4" | "mkv" | "mov" | "avi" | "webm" => category::VIDEO,
+        "mp3" | "wav" | "ogg" | "flac" | "aac" => category::AUDIO,
+        "pdf" | "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "odt" => category::DOCUMENT,
+        "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" => category::ARCHIVE,
+        "txt" | "md" | "rs" | "js" | "ts" | "c" | "cpp" | "h" | "hpp" | "py" | "go" | "rb"
+        | "json" | "yaml" | "toml" | "html" | "css" => category::TEXT,
+        _ => category::OTHER,
     }
 }
 
@@ -214,13 +249,22 @@ impl<'a> ParallelVisitor for Scanner<'a> {
                 .unwrap_or_default()
                 .as_micros() as u64;
 
+            let last_accessed = metadata
+                .accessed()
+                .unwrap_or(std::time::SystemTime::now())
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+
+            let cat = detect_category(entry.path());
+
             let _ = self.index.insert(FilesystemEntry {
                 path: entry.path().to_path_buf(),
                 volume: "/".to_string(),
                 kind,
                 last_modified,
-                last_accessed: last_modified,
-                category: category::OTHER,
+                last_accessed,
+                category: cat,
             });
             self.file_count.fetch_add(1, Ordering::SeqCst);
             WalkState::Continue
@@ -231,7 +275,9 @@ impl<'a> ParallelVisitor for Scanner<'a> {
 }
 
 fn main() -> Result<()> {
-    let index_path = std::env::args().nth(1).unwrap_or_else(|| "index".to_string());
+    let index_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "index".to_string());
 
     let mut terminal = ratatui::init();
     let app_result = App::new(&index_path).map(|app| run_app(&mut terminal, app));
@@ -260,10 +306,16 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
                             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                             app.start_indexing(home);
                         }
+                        (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                            app.compact();
+                        }
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            app.delete_selected();
+                        }
                         (KeyCode::Enter, _) => {
                             if let Some(i) = app.list_state.selected() {
                                 if let Some(_res) = app.results.get(i) {
-                                    // Use a temporary variable to hold the output, 
+                                    // Use a temporary variable to hold the output,
                                     // as we can't easily print after restore() here without returning it.
                                     // For now just exit. In a real app we might want to return the path.
                                     return Ok(());
@@ -314,8 +366,35 @@ fn ui(f: &mut Frame, app: &mut App) {
                 minidex::Kind::Directory => "DIR ",
                 minidex::Kind::Symlink => "SYM ",
             };
+
+            let score_style = if res.score > 20.0 {
+                Style::default().fg(Color::Green)
+            } else if res.score > 10.0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let cat_str = match res.category {
+                category::IMAGE => "IMG ",
+                category::VIDEO => "VID ",
+                category::AUDIO => "AUD ",
+                category::DOCUMENT => "DOC ",
+                category::ARCHIVE => "ARC ",
+                category::TEXT => "TXT ",
+                _ => "OTH ",
+            };
+
             let content = Line::from(vec![
-                Span::styled(format!("{: <5} ", kind_str), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{: <5} ", kind_str),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("{: <4} ", cat_str),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled(format!("[{:>5.1}] ", res.score), score_style),
                 Span::raw(res.path.to_string_lossy()),
             ]);
             ListItem::new(content)
@@ -346,14 +425,24 @@ fn ui(f: &mut Frame, app: &mut App) {
     };
 
     let status_line = if app.indexing.load(Ordering::SeqCst) {
-        format!("INDEXING... {} files", app.indexed_count.load(Ordering::SeqCst))
+        format!(
+            "INDEXING... {} files",
+            app.indexed_count.load(Ordering::SeqCst)
+        )
     } else {
         "READY".to_string()
     };
 
     let help_message = Paragraph::new(Line::from(vec![
         Span::raw("Esc: quit | ↑/↓: navigate | Enter: select | "),
-        Span::styled("Tab/Ctrl+R: index $HOME | ", Style::default().fg(Color::Magenta)),
+        Span::styled(
+            "Tab/Ctrl+R: index $HOME | ",
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(
+            "Ctrl+K: compact | Ctrl+D: delete | ",
+            Style::default().fg(Color::Red),
+        ),
         Span::styled(status_line, Style::default().fg(Color::Yellow)),
         Span::raw(" | "),
         Span::styled(current_selection, Style::default().fg(Color::Green)),
