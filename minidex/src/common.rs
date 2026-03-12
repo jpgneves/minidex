@@ -40,3 +40,13 @@ pub(crate) fn is_tombstoned(
             && sequence < *stamp
     })
 }
+
+pub mod category {
+    pub const OTHER: u16 = 0;
+    pub const ARCHIVE: u16 = 1 << 0;
+    pub const DOCUMENT: u16 = 1 << 1;
+    pub const IMAGE: u16 = 1 << 2;
+    pub const VIDEO: u16 = 1 << 3;
+    pub const AUDIO: u16 = 1 << 4;
+    pub const TEXT: u16 = 1 << 5;
+}

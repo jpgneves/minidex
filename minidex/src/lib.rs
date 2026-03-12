@@ -16,7 +16,7 @@ use thiserror::Error;
 mod collector;
 mod common;
 use collector::*;
-pub use common::Kind;
+pub use common::{Kind, category};
 mod entry;
 pub use entry::FilesystemEntry;
 use entry::*;
@@ -143,6 +143,7 @@ impl Index {
             kind: item.kind,
             last_modified: item.last_modified,
             last_accessed: item.last_accessed,
+            category: item.category,
         };
 
         {
@@ -174,6 +175,7 @@ impl Index {
             kind: Kind::File,
             last_modified: 0,
             last_accessed: 0,
+            category: 0,
         };
 
         {
@@ -265,6 +267,12 @@ impl Index {
 
             if let Some(filter) = options.volume_filter {
                 if volume != filter {
+                    continue;
+                }
+            }
+
+            if let Some(category) = options.category {
+                if entry.category & category == 0 {
                     continue;
                 }
             }
@@ -362,13 +370,13 @@ impl Index {
                         .expect("failed to unpack");
                     let packed_val = u128::from_le_bytes(packed_bytes);
 
-                    // Filter categories - TODO
-                    /*if let Some(category) = options.category {
-                        let (_, _, _, _, doc_category) = SegmentedIndex::unpack_u128(packed_val);
+                    // Filter categories
+                    if let Some(category) = options.category {
+                        let (_, _, _, _, _, doc_category) = SegmentedIndex::unpack_u128(packed_val);
                         if doc_category != category as u16 {
                             continue;
                         }
-                    }*/
+                    }
 
                     enriched_docs.push(packed_val);
                 }
@@ -376,8 +384,10 @@ impl Index {
                 if enriched_docs.len() > scoring_cap {
                     // O(N) quickselect
                     enriched_docs.select_nth_unstable_by(scoring_cap, |&a, &b| {
-                        let (_, a_modified_at, _, a_depth, a_dir) = SegmentedIndex::unpack_u128(a);
-                        let (_, b_modified_at, _, b_depth, b_dir) = SegmentedIndex::unpack_u128(b);
+                        let (_, a_modified_at, _, a_depth, a_dir, _) =
+                            SegmentedIndex::unpack_u128(a);
+                        let (_, b_modified_at, _, b_depth, b_dir, _) =
+                            SegmentedIndex::unpack_u128(b);
 
                         b_dir
                             .cmp(&a_dir)
@@ -390,12 +400,12 @@ impl Index {
 
                 // Re-sort by dat_offset ascending to align with in-disk layout
                 enriched_docs.sort_unstable_by_key(|&packed| {
-                    let (dat_offset, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+                    let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
                     dat_offset
                 });
 
                 for packed_val in enriched_docs {
-                    let (dat_offset, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
+                    let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         collector.insert(path, volume, entry);
@@ -474,7 +484,7 @@ impl Index {
             // Let the CPU auto-vectorize this loop across the continuous byte slice
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (dat_offset, _, accessed, _, _) = SegmentedIndex::unpack_u128(packed);
+                let (dat_offset, _, accessed, _, _, _) = SegmentedIndex::unpack_u128(packed);
 
                 if accessed <= until {
                     // Only resolve the string if it actually passes the time threshold

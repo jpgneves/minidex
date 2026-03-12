@@ -27,6 +27,18 @@ impl Opstamp {
     pub(crate) fn sequence(&self) -> u64 {
         self.0 & Self::SEQ_MASK
     }
+
+    #[inline]
+    pub(crate) fn to_bytes(&self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    #[inline]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        Self(u64::from_le_bytes(
+            bytes.try_into().expect("bad binary format for opstamp"),
+        ))
+    }
 }
 
 impl From<u64> for Opstamp {

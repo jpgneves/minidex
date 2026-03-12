@@ -9,18 +9,30 @@ pub(crate) struct IndexEntry {
     pub(crate) kind: Kind,
     pub(crate) last_modified: u64,
     pub(crate) last_accessed: u64,
+    pub(crate) category: u16,
 }
 
 impl IndexEntry {
     pub(crate) const SIZE: usize = std::mem::size_of::<Self>();
 
-    pub(crate) fn to_bytes(self) -> [u8; Self::SIZE] {
-        unsafe { std::mem::transmute(self) }
+    pub(crate) fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..8].copy_from_slice(&self.opstamp.to_bytes());
+        buf[8] = self.kind as u8;
+        buf[9..17].copy_from_slice(&self.last_modified.to_le_bytes());
+        buf[17..25].copy_from_slice(&self.last_accessed.to_le_bytes());
+        buf[25..27].copy_from_slice(&self.category.to_le_bytes()); // Serialize
+        buf
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        let array: [u8; Self::SIZE] = bytes.try_into().expect("invalid entry size");
-        unsafe { std::mem::transmute(array) }
+        Self {
+            opstamp: Opstamp::from_bytes(&bytes[0..8]),
+            kind: Kind::from(bytes[8]),
+            last_modified: u64::from_le_bytes(bytes[9..17].try_into().unwrap()),
+            last_accessed: u64::from_le_bytes(bytes[17..25].try_into().unwrap()),
+            category: u16::from_le_bytes(bytes[25..27].try_into().unwrap()), // Deserialize
+        }
     }
 }
 
@@ -39,4 +51,6 @@ pub struct FilesystemEntry {
     pub last_modified: u64,
     /// Last accessed timestamp
     pub last_accessed: u64,
+    /// File category as a u16
+    pub category: u16,
 }

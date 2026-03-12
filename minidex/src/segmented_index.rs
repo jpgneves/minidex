@@ -383,8 +383,6 @@ impl SegmentedIndex {
                 .filter(|&c| c == std::path::MAIN_SEPARATOR)
                 .count() as u16;
             let is_dir = entry.kind == Kind::Directory;
-            // TODO - pack MIME category for instant filtering
-            // let mime_category = ...
 
             let packed_meta = Self::pack_u128(
                 current_dat_offset,
@@ -392,7 +390,7 @@ impl SegmentedIndex {
                 entry.last_accessed,
                 depth,
                 is_dir,
-                // mime_category
+                entry.category,
             );
 
             meta_writer.write_all(&packed_meta.to_le_bytes())?;
@@ -474,7 +472,7 @@ impl SegmentedIndex {
         Ok(doc_id_counter as u64)
     }
 
-    // Bits 117-127: Reserved (11 bits)
+    // Bits 117-127: File category (11 bits)
     // Bit 116: is_dir (1 bit)
     // Bits 108-115: Depth (8 bits)
     // Bits 74-107: Last Accessed Timestamp (Seconds) (34 bits)
@@ -487,6 +485,7 @@ impl SegmentedIndex {
         last_accessed: u64,
         depth: u16,
         is_dir: bool,
+        category: u16,
     ) -> u128 {
         let mut packed = (dat_offset as u128) & 0x0000_00FF_FFFF_FFFF;
         packed |= ((last_modified as u128) & 0x3_FFFF_FFFF) << 40;
@@ -495,17 +494,25 @@ impl SegmentedIndex {
         if is_dir {
             packed |= 1 << 116;
         }
+        packed |= ((category as u128) & 0x7FF) << 117;
         packed
     }
 
-    pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool) {
+    pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool, u16) {
         let offset = (packed & 0x0000_00FF_FFFF_FFFF) as u64;
         let last_modified = ((packed >> 40) & 0x3_FFFF_FFFF) as u64;
         let last_accessed = ((packed >> 74) & 0x3_FFFF_FFFF) as u64;
         let depth = ((packed >> 108) & 0xFF) as u16;
         let is_dir = ((packed >> 116) & 1) == 1;
-        //let category = ((packed >> 113) & 0x7FFF) as u16;
-        (offset, last_modified, last_accessed, depth, is_dir)
+        let category = ((packed >> 117) & 0x7FF) as u16;
+        (
+            offset,
+            last_modified,
+            last_accessed,
+            depth,
+            is_dir,
+            category,
+        )
     }
 }
 
