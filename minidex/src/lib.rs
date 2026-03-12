@@ -84,6 +84,8 @@ impl Index {
 
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
 
+        let mut flushing_wals = Vec::new();
+
         // Recover partial, flushing WAL files
         for entry in entries {
             if let Ok(e) = entry
@@ -91,10 +93,15 @@ impl Index {
                 && file_type.is_file()
                 && e.file_name().to_string_lossy().ends_with(".flushing.wal")
             {
-                let partial = Wal::replay(&e.path()).map_err(IndexError::Io)?;
-
-                apply_replay(partial);
+                flushing_wals.push(e.path());
             }
+        }
+        flushing_wals.sort_unstable();
+
+        for wal_path in flushing_wals {
+            let partial = Wal::replay(wal_path).map_err(IndexError::Io)?;
+
+            apply_replay(partial);
         }
 
         let wal_path = path.as_ref().join("journal.wal");

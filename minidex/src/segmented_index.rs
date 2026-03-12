@@ -199,6 +199,7 @@ impl Segment {
             return None;
         }
         let entry = IndexEntry::from_bytes(&data[cursor..cursor + IndexEntry::SIZE]);
+        cursor += IndexEntry::SIZE;
 
         Some((path_str, volume_str, entry, cursor))
     }
@@ -533,7 +534,9 @@ impl Iterator for DocumentIterator<'_> {
     type Item = (String, String, IndexEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        Segment::parse_document_at(self.data, self.cursor)
-            .and_then(|(path, volume, entry, _)| Some((path, volume, entry)))
+        let (path, volume, entry, new_cursor) = Segment::parse_document_at(self.data, self.cursor)?;
+        self.cursor = new_cursor;
+
+        Some((path, volume, entry))
     }
 }
