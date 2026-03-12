@@ -293,17 +293,9 @@ impl SegmentedIndex {
         self.segments.iter()
     }
 
-    /// Write a segment to disk
-    pub(crate) fn write_segment<I>(
-        &self,
-        segment_path: &Path,
-        it: I,
-    ) -> Result<(), SegmentedIndexError>
-    where
-        I: Iterator<Item = (String, String, IndexEntry)>,
-    {
-        Self::build_segment_files(segment_path, it, false)?;
-        Ok(())
+    /// Add segment to the index
+    pub(crate) fn add_segment(&mut self, segment: Arc<Segment>) {
+        self.segments.push(segment);
     }
 
     /// Atomically swaps out old segments for a newly compacted segment,

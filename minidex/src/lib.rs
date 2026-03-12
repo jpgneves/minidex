@@ -706,29 +706,31 @@ impl Index {
                 let final_segment_path = path.join(format!("{}", next_seq));
                 let tmp_segment_path = path.join(format!("{}.tmp", next_seq));
 
+                if let Err(e) = SegmentedIndex::build_segment_files(
+                    &tmp_segment_path,
+                    snapshot
+                        .into_iter()
+                        .map(|(path, (volume, entry))| (path, volume, entry)),
+                    false,
+                ) {
+                    log::error!("flush failed to write: {}", e);
+                    let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
+                    Segment::remove_files(&tmp_paths);
+                    return;
+                }
+
+                let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
+
+                let final_paths = Segment::paths_with_additional_extension(&final_segment_path);
+
+                let _ = Segment::rename_files(&tmp_paths, &final_paths);
+
+                let new_segment = Arc::new(Segment::load(final_segment_path).expect("failed to load"));
                 {
                     let mut base_guard = base.write().expect("failed to lock base");
-
-                    if let Err(e) = base_guard.write_segment(
-                        &tmp_segment_path,
-                        snapshot
-                            .into_iter()
-                            .map(|(path, (volume, entry))| (path, volume, entry)),
-                    ) {
-                        log::error!("flush failed to write: {}", e);
-                        let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
-                        Segment::remove_files(&tmp_paths);
-                        return;
-                    }
-
-                    let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
-
-                    let final_paths = Segment::paths_with_additional_extension(&final_segment_path);
-
-                    let _ = Segment::rename_files(&tmp_paths, &final_paths);
                     base_guard
-                        .load(&final_segment_path)
-                        .expect("failed to reload segment during flush");
+                        .add_segment(new_segment);
+
                 }
 
                 if let Err(e) = std::fs::remove_file(&flushing_path) {
