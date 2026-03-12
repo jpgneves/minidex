@@ -23,6 +23,7 @@ pub struct SearchResult {
     pub kind: Kind,
     pub last_modified: u64,
     pub last_accessed: u64,
+    pub category: u16,
     pub score: f64,
 }
 

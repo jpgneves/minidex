@@ -468,6 +468,7 @@ impl Index {
                     kind: entry.kind,
                     last_modified: entry.last_modified,
                     last_accessed: entry.last_accessed,
+                    category: entry.category,
                     score,
                 }
             })
@@ -481,7 +482,12 @@ impl Index {
     }
 
     /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
-    pub fn recent_files(&self, until: u64, limit: usize) -> Result<Vec<SearchResult>, IndexError> {
+    pub fn recent_files(
+        &self,
+        until: u64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchResult>, IndexError> {
         let segments = self.base.read().unwrap();
         let mem = self.mem_idx.read().unwrap();
         let active_tombstones = self.prefix_tombstones.read().unwrap().clone();
@@ -513,20 +519,34 @@ impl Index {
 
         let mut results: Vec<_> = collector.finish().collect();
 
-        results.sort_unstable_by(|a, b| b.2.last_accessed.cmp(&a.2.last_accessed));
-        results.truncate(limit);
+        let required_matches = offset + limit;
 
-        Ok(results
+        // O(N) Quickselect: Bring only the `offset + limit` most recent files to the front
+        if results.len() > required_matches {
+            results.select_nth_unstable_by(required_matches, |a, b| {
+                b.2.last_accessed.cmp(&a.2.last_accessed)
+            });
+            results.truncate(required_matches);
+        }
+
+        results.sort_unstable_by(|a, b| b.2.last_accessed.cmp(&a.2.last_accessed));
+
+        let paginated_results = results
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|(path, volume, entry)| SearchResult {
                 path: PathBuf::from(path),
                 volume,
                 kind: entry.kind,
                 last_modified: entry.last_modified,
                 last_accessed: entry.last_accessed,
+                category: entry.category,
                 score: 0.0,
             })
-            .collect())
+            .collect();
+
+        Ok(paginated_results)
     }
 
     /// Force index compaction, minimizing the amount of disk space
