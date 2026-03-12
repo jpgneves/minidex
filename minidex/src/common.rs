@@ -26,3 +26,17 @@ impl From<Kind> for u8 {
         }
     }
 }
+
+#[inline]
+pub(crate) fn is_tombstoned(
+    path_bytes: &[u8],
+    sequence: u64,
+    active_tombstones: &[(String, u64)],
+) -> bool {
+    active_tombstones.iter().any(|(prefix, stamp)| {
+        let prefix_bytes = prefix.as_bytes();
+        path_bytes.len() >= prefix_bytes.len()
+            && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+            && sequence < *stamp
+    })
+}

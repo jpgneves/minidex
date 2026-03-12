@@ -101,8 +101,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let now = std::time::Instant::now();
-    println!("Searching");
+    println!("Searching for jpg");
     let results = index.search("jpg", 500, 0, SearchOptions::default())?;
+    println!(
+        "Found {} results in {} ms",
+        results.len(),
+        now.elapsed().as_millis()
+    );
+
+    println!("Searching for txt");
+    let results = index.search("txt", 500, 0, SearchOptions::default())?;
     println!(
         "Found {} results in {} ms",
         results.len(),
