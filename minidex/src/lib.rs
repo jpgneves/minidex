@@ -277,6 +277,12 @@ impl Index {
                 }
             }
 
+            if let Some(kind) = options.kind {
+                if entry.kind != kind {
+                    continue;
+                }
+            }
+
             let matches_all = tokens.iter().all(|t| {
                 let token_bytes = t.as_bytes();
                 if path_bytes.len() < token_bytes.len() {
@@ -370,9 +376,19 @@ impl Index {
                         .expect("failed to unpack");
                     let packed_val = u128::from_le_bytes(packed_bytes);
 
+                    let (_, _, _, _, is_dir, doc_category) =
+                        SegmentedIndex::unpack_u128(packed_val);
+
+                    // Kind filter
+                    if let Some(kind) = options.kind {
+                        let is_target_dir = kind == Kind::Directory;
+                        if is_dir != is_target_dir {
+                            continue;
+                        }
+                    }
+
                     // Filter categories
                     if let Some(category) = options.category {
-                        let (_, _, _, _, _, doc_category) = SegmentedIndex::unpack_u128(packed_val);
                         if doc_category != category as u16 {
                             continue;
                         }
