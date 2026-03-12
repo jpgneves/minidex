@@ -46,6 +46,7 @@ impl Segment {
 
         let seg_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
         let seg = unsafe { Mmap::map(&seg_file).map_err(SegmentedIndexError::Io)? };
+        #[cfg(unix)]
         let _ = seg.advise(memmap2::Advice::WillNeed);
 
         let map = Map::new(seg).map_err(SegmentedIndexError::Fst)?;
