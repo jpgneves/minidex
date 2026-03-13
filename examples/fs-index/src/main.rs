@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use minidex::{FilesystemEntry, Index, Kind, SearchOptions, category};
+use minidex::{FilesystemEntry, Index, Kind, SearchOptions, VolumeType, category};
 
 struct Scanner<'a> {
     index: &'a Index,
@@ -47,6 +47,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
                 last_modified,
                 last_accessed,
                 category: category::OTHER, // This should also be properly extracted by a magic number
+                volume_type: VolumeType::Local,
             });
             self.file_count.fetch_add(1, Ordering::SeqCst);
             WalkState::Continue

@@ -337,13 +337,16 @@ impl Index {
         let mut token_docs = Vec::new();
         let mut current_matches = Vec::new();
 
+        let vol_token = options
+            .volume_name
+            .map(|vol| crate::tokenizer::synthesize_volume_token(&vol.to_lowercase()));
+
         for segment in segments.segments() {
             current_matches.clear();
             let mut first_token = true;
             let mut valid_matches = true;
 
-            if let Some(vol) = options.volume_name {
-                let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
+            if let Some(ref vol_token) = vol_token {
                 let map = segment.as_ref().as_ref();
                 if let Some(post_offset) = map.get(&vol_token) {
                     segment.append_posting_list(post_offset, &mut current_matches);
