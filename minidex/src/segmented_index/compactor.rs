@@ -174,6 +174,7 @@ pub(crate) fn merge_segments(
 mod tests {
     use super::*;
     use crate::Kind;
+    use crate::VolumeType;
     use crate::opstamp::Opstamp;
 
     #[test]
@@ -192,6 +193,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
             (
@@ -203,6 +205,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
         ];
@@ -219,6 +222,7 @@ mod tests {
                     last_modified: 200,
                     last_accessed: 200,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
             (
@@ -230,6 +234,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
         ];
@@ -277,6 +282,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
             (
@@ -288,6 +294,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 0,
+                    volume_type: VolumeType::Local,
                 },
             ),
         ];

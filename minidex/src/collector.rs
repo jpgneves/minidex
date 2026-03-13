@@ -50,6 +50,7 @@ impl<'a> LsmCollector<'a> {
 mod tests {
     use super::*;
     use crate::Kind;
+    use crate::common::VolumeType;
     use crate::opstamp::Opstamp;
 
     #[test]
@@ -61,6 +62,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         };
         collector.insert("/a".to_string(), "vol1".to_string(), entry);
 
@@ -80,6 +82,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         };
         let entry2 = IndexEntry {
             opstamp: Opstamp::insertion(20),
@@ -87,6 +90,7 @@ mod tests {
             last_modified: 200,
             last_accessed: 200,
             category: 0,
+            volume_type: VolumeType::Local,
         };
 
         // Out-of-order insertion
@@ -109,6 +113,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         };
         let entry_alive = IndexEntry {
             opstamp: Opstamp::insertion(100),
@@ -116,6 +121,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         };
 
         collector.insert("/foo/bar".to_string(), "vol1".to_string(), entry_dead);
@@ -138,6 +144,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         };
         let entry2 = IndexEntry {
             opstamp: Opstamp::deletion(20),
@@ -145,6 +152,7 @@ mod tests {
             last_modified: 0,
             last_accessed: 0,
             category: 0,
+            volume_type: VolumeType::Local,
         };
 
         collector.insert("/a".to_string(), "vol1".to_string(), entry1);

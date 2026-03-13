@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main, BenchmarkId, black_box};
-use minidex::{Index, FilesystemEntry, Kind, SearchOptions, category, tokenize, CompactorConfigBuilder};
+use minidex::{Index, FilesystemEntry, Kind, SearchOptions, category, tokenize, CompactorConfigBuilder, VolumeType};
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -34,6 +34,7 @@ fn bench_index_insert(c: &mut Criterion) {
                 last_modified: 1000,
                 last_accessed: 1000,
                 category: category::TEXT,
+                volume_type: VolumeType::Local,
             };
             index.insert(entry).expect("failed to insert");
             i += 1;
@@ -55,6 +56,7 @@ fn bench_index_search(c: &mut Criterion) {
             last_modified: 1000,
             last_accessed: 1000,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         }).expect("failed to insert");
     }
 
@@ -72,6 +74,7 @@ fn bench_index_search(c: &mut Criterion) {
             last_modified: 1000,
             last_accessed: 1000,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         }).expect("failed to insert");
 
         b.iter(|| {
@@ -108,6 +111,7 @@ fn bench_index_delete(c: &mut Criterion) {
             last_modified: 1000,
             last_accessed: 1000,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         }).expect("failed to insert");
     }
 

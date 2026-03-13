@@ -384,6 +384,7 @@ impl SegmentedIndex {
                 depth,
                 is_dir,
                 entry.category,
+                entry.volume_type as u8,
             );
 
             meta_writer.write_all(&packed_meta.to_le_bytes())?;
@@ -473,7 +474,9 @@ impl SegmentedIndex {
         Ok(doc_id_counter as u64)
     }
 
-    // Bits 117-127: File category (11 bits)
+    // Bits 127-128: Reserved
+    // Bits 125-126: Volume Type (2 bits)
+    // Bits 117-124: File category (8 bits)
     // Bit 116: is_dir (1 bit)
     // Bits 108-115: Depth (8 bits)
     // Bits 74-107: Last Accessed Timestamp (Seconds) (34 bits)
@@ -486,7 +489,8 @@ impl SegmentedIndex {
         last_accessed: u64,
         depth: u16,
         is_dir: bool,
-        category: u16,
+        category: u8,
+        volume_type: u8,
     ) -> u128 {
         let mut packed = (dat_offset as u128) & 0x0000_00FF_FFFF_FFFF;
         packed |= ((last_modified as u128) & 0x3_FFFF_FFFF) << 40;
@@ -495,17 +499,19 @@ impl SegmentedIndex {
         if is_dir {
             packed |= 1 << 116;
         }
-        packed |= ((category as u128) & 0x7FF) << 117;
+        packed |= ((category as u128) & 0xFF) << 117;
+        packed |= ((volume_type as u128) & 0b11) << 124;
         packed
     }
 
-    pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool, u16) {
+    pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool, u8, u8) {
         let offset = (packed & 0x0000_00FF_FFFF_FFFF) as u64;
         let last_modified = ((packed >> 40) & 0x3_FFFF_FFFF) as u64;
         let last_accessed = ((packed >> 74) & 0x3_FFFF_FFFF) as u64;
         let depth = ((packed >> 108) & 0xFF) as u16;
         let is_dir = ((packed >> 116) & 1) == 1;
-        let category = ((packed >> 117) & 0x7FF) as u16;
+        let category = ((packed >> 117) & 0xFF) as u8;
+        let volume_type = ((packed >> 124) & 0b11) as u8;
         (
             offset,
             last_modified,
@@ -513,6 +519,7 @@ impl SegmentedIndex {
             depth,
             is_dir,
             category,
+            volume_type,
         )
     }
 }
@@ -560,13 +567,14 @@ impl Iterator for DocumentIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VolumeType;
     use crate::opstamp::Opstamp;
 
     #[test]
     fn test_pack_unpack_u128() {
-        let original = (123456789, 456789, 789012, 10, true, 0x123);
+        let original = (123456789, 456789, 789012, 10, true, 0xAB, 1);
         let packed = SegmentedIndex::pack_u128(
-            original.0, original.1, original.2, original.3, original.4, original.5,
+            original.0, original.1, original.2, original.3, original.4, original.5, original.6,
         );
         let unpacked = SegmentedIndex::unpack_u128(packed);
         assert_eq!(original, unpacked);
@@ -588,6 +596,7 @@ mod tests {
                     last_modified: 100,
                     last_accessed: 100,
                     category: 1,
+                    volume_type: VolumeType::Local,
                 },
             ),
             (
@@ -599,6 +608,7 @@ mod tests {
                     last_modified: 200,
                     last_accessed: 200,
                     category: 2,
+                    volume_type: VolumeType::Local,
                 },
             ),
         ];
@@ -629,11 +639,11 @@ mod tests {
         let meta_map = segment.meta_map();
         assert_eq!(meta_map.len(), 2 * 16);
         let packed0 = u128::from_le_bytes(meta_map[0..16].try_into()?);
-        let (_, _, _, _, is_dir, _) = SegmentedIndex::unpack_u128(packed0);
+        let (_, _, _, _, is_dir, _, _) = SegmentedIndex::unpack_u128(packed0);
         assert!(!is_dir);
 
         let packed1 = u128::from_le_bytes(meta_map[16..32].try_into()?);
-        let (_, _, _, _, is_dir, _) = SegmentedIndex::unpack_u128(packed1);
+        let (_, _, _, _, is_dir, _, _) = SegmentedIndex::unpack_u128(packed1);
         assert!(is_dir);
 
         std::fs::remove_dir_all(temp_dir)?;

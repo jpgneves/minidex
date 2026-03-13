@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::{common::Kind, opstamp::Opstamp};
+use crate::{
+    common::{Kind, VolumeType},
+    opstamp::Opstamp,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -9,7 +12,8 @@ pub(crate) struct IndexEntry {
     pub(crate) kind: Kind,
     pub(crate) last_modified: u64,
     pub(crate) last_accessed: u64,
-    pub(crate) category: u16,
+    pub(crate) category: u8,
+    pub(crate) volume_type: VolumeType,
 }
 
 impl IndexEntry {
@@ -21,7 +25,8 @@ impl IndexEntry {
         buf[8] = self.kind as u8;
         buf[9..17].copy_from_slice(&self.last_modified.to_le_bytes());
         buf[17..25].copy_from_slice(&self.last_accessed.to_le_bytes());
-        buf[25..27].copy_from_slice(&self.category.to_le_bytes()); // Serialize
+        buf[25] = self.category;
+        buf[26] = self.volume_type as u8;
         buf
     }
 
@@ -31,7 +36,8 @@ impl IndexEntry {
             kind: Kind::from(bytes[8]),
             last_modified: u64::from_le_bytes(bytes[9..17].try_into().unwrap()),
             last_accessed: u64::from_le_bytes(bytes[17..25].try_into().unwrap()),
-            category: u16::from_le_bytes(bytes[25..27].try_into().unwrap()), // Deserialize
+            category: bytes[25],
+            volume_type: VolumeType::from(bytes[26]),
         }
     }
 }
@@ -51,8 +57,10 @@ pub struct FilesystemEntry {
     pub last_modified: u64,
     /// Last accessed timestamp
     pub last_accessed: u64,
-    /// File category as a u16
-    pub category: u16,
+    /// File category as a u8
+    pub category: u8,
+    /// Type of volume: Local, Network, Removable or Unknown
+    pub volume_type: VolumeType,
 }
 
 #[cfg(test)]
@@ -66,7 +74,8 @@ mod tests {
             kind: Kind::File,
             last_modified: 456,
             last_accessed: 789,
-            category: 0xABCD,
+            category: 0xAB,
+            volume_type: VolumeType::Local,
         };
 
         let bytes = entry.to_bytes();
@@ -77,6 +86,7 @@ mod tests {
         assert_eq!(entry.last_modified, entry2.last_modified);
         assert_eq!(entry.last_accessed, entry2.last_accessed);
         assert_eq!(entry.category, entry2.category);
+        assert_eq!(entry.volume_type, entry2.volume_type);
     }
 
     #[test]
@@ -87,6 +97,7 @@ mod tests {
             last_modified: 0,
             last_accessed: 0,
             category: 0,
+            volume_type: VolumeType::Unknown,
         };
 
         let bytes = entry.to_bytes();
@@ -94,5 +105,6 @@ mod tests {
 
         assert!(entry2.opstamp.is_deletion());
         assert_eq!(entry2.opstamp.sequence(), 123);
+        assert_eq!(entry2.volume_type, VolumeType::Unknown);
     }
 }

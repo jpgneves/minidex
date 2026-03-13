@@ -16,7 +16,7 @@ use thiserror::Error;
 mod collector;
 mod common;
 use collector::*;
-pub use common::{Kind, category};
+pub use common::{Kind, VolumeType, category};
 mod entry;
 pub use entry::FilesystemEntry;
 use entry::*;
@@ -145,6 +145,7 @@ impl Index {
             last_modified: item.last_modified,
             last_accessed: item.last_accessed,
             category: item.category,
+            volume_type: item.volume_type,
         };
 
         {
@@ -177,6 +178,7 @@ impl Index {
             last_modified: 0,
             last_accessed: 0,
             category: 0,
+            volume_type: common::VolumeType::Local,
         };
 
         {
@@ -283,20 +285,13 @@ impl Index {
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
+        let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
+
         // In-memory searches
         for (path, (volume, entry)) in mem.iter() {
             let path_bytes = path.as_bytes();
 
-            if is_tombstoned(
-                volume,
-                path_bytes,
-                entry.opstamp.sequence(),
-                &active_tombstones,
-            ) {
-                continue;
-            }
-
-            if let Some(filter) = options.volume_filter {
+            if let Some(filter) = options.volume_name {
                 if volume != filter {
                     continue;
                 }
@@ -312,6 +307,10 @@ impl Index {
                 if entry.kind != kind {
                     continue;
                 }
+            }
+
+            if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
+                continue;
             }
 
             let matches_all = if path.is_ascii() {
@@ -343,7 +342,7 @@ impl Index {
             let mut first_token = true;
             let mut valid_matches = true;
 
-            if let Some(vol) = options.volume_filter {
+            if let Some(vol) = options.volume_name {
                 let vol_token = crate::tokenizer::synthesize_volume_token(&vol.to_lowercase());
                 let map = segment.as_ref().as_ref();
                 if let Some(post_offset) = map.get(&vol_token) {
@@ -412,7 +411,7 @@ impl Index {
                         .expect("failed to unpack");
                     let packed_val = u128::from_le_bytes(packed_bytes);
 
-                    let (_, _, _, _, is_dir, doc_category) =
+                    let (_, _, _, _, is_dir, doc_category, vol_type) =
                         SegmentedIndex::unpack_u128(packed_val);
 
                     // Kind filter
@@ -425,9 +424,14 @@ impl Index {
 
                     // Filter categories
                     if let Some(category) = options.category {
-                        if doc_category != category as u16 {
+                        if doc_category & category == 0 {
                             continue;
                         }
+                    }
+
+                    // Filter volume type
+                    if (volume_type_mask & (1 << vol_type)) == 0 {
+                        continue;
                     }
 
                     enriched_docs.push(packed_val);
@@ -436,9 +440,9 @@ impl Index {
                 if enriched_docs.len() > scoring_cap {
                     // O(N) quickselect
                     enriched_docs.select_nth_unstable_by(scoring_cap, |&a, &b| {
-                        let (_, a_modified_at, _, a_depth, a_dir, _) =
+                        let (_, a_modified_at, _, a_depth, a_dir, _, _) =
                             SegmentedIndex::unpack_u128(a);
-                        let (_, b_modified_at, _, b_depth, b_dir, _) =
+                        let (_, b_modified_at, _, b_depth, b_dir, _, _) =
                             SegmentedIndex::unpack_u128(b);
 
                         b_dir
@@ -452,12 +456,12 @@ impl Index {
 
                 // Re-sort by dat_offset ascending to align with in-disk layout
                 enriched_docs.sort_unstable_by_key(|&packed| {
-                    let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+                    let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
                     dat_offset
                 });
 
                 for packed_val in enriched_docs {
-                    let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
+                    let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         collector.insert(path, volume, entry);
@@ -502,6 +506,7 @@ impl Index {
                 SearchResult {
                     path: PathBuf::from(path),
                     volume: volume,
+                    volume_type: entry.volume_type,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
                     last_accessed: entry.last_accessed,
@@ -532,11 +537,11 @@ impl Index {
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
-        // 1. MemTable Scan (Fast, eager load is fine here)
+        let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
+
         for (path, (volume, entry)) in mem.iter() {
-            // FIX: >= instead of <= to get files from the last 5 days
             if entry.last_accessed >= since {
-                if let Some(filter) = options.volume_filter {
+                if let Some(filter) = options.volume_name {
                     if volume != filter {
                         continue;
                     }
@@ -550,6 +555,9 @@ impl Index {
                     if entry.kind != kind {
                         continue;
                     }
+                }
+                if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
+                    continue;
                 }
                 collector.insert(path.clone(), volume.clone(), *entry);
             }
@@ -566,7 +574,8 @@ impl Index {
 
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (_, _, accessed, _, is_dir, doc_category) = SegmentedIndex::unpack_u128(packed);
+                let (_, _, accessed, _, is_dir, doc_category, doc_vol_type) =
+                    SegmentedIndex::unpack_u128(packed);
 
                 if accessed >= since {
                     if let Some(target_kind) = options.kind {
@@ -582,6 +591,10 @@ impl Index {
                         }
                     }
 
+                    if (volume_type_mask & (1 << doc_vol_type)) == 0 {
+                        continue;
+                    }
+
                     // DO NOT read the document yet! Just save the integer.
                     disk_candidates.push((segment, packed));
                 }
@@ -590,18 +603,18 @@ impl Index {
 
         if disk_candidates.len() > disk_cap {
             disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                let (_, _, a_acc, _, _, _) = SegmentedIndex::unpack_u128(a.1);
-                let (_, _, b_acc, _, _, _) = SegmentedIndex::unpack_u128(b.1);
+                let (_, _, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
+                let (_, _, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
                 b_acc.cmp(&a_acc) // Sort descending by access time
             });
             disk_candidates.truncate(disk_cap);
         }
 
         for (segment, packed) in disk_candidates {
-            let (dat_offset, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+            let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
 
             if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                if let Some(filter) = options.volume_filter {
+                if let Some(filter) = options.volume_name {
                     if volume != filter {
                         continue;
                     }
@@ -628,6 +641,7 @@ impl Index {
             .map(|(path, volume, entry)| SearchResult {
                 path: PathBuf::from(path),
                 volume,
+                volume_type: entry.volume_type,
                 kind: entry.kind,
                 last_modified: entry.last_modified,
                 last_accessed: entry.last_accessed,
@@ -835,6 +849,13 @@ impl Index {
             })
             .ok()
     }
+
+    fn compile_allowed_volume_mask(allowed_volume_types: Option<&[VolumeType]>) -> u8 {
+        match allowed_volume_types {
+            Some(allowed) => allowed.iter().fold(0, |acc, &vt| acc | (1 << (vt as u8))),
+            None => 0b0000_1111,
+        }
+    }
 }
 
 impl Drop for Index {
@@ -874,7 +895,7 @@ pub enum IndexError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::category;
+    use crate::common::{VolumeType, category};
 
     #[test]
     fn test_index_basic_lifecycle() -> Result<(), IndexError> {
@@ -890,6 +911,7 @@ mod tests {
                 last_modified: 100,
                 last_accessed: 100,
                 category: category::TEXT,
+                volume_type: VolumeType::Local,
             })?;
 
             let results = index.search("bar", 10, 0, SearchOptions::default())?;
@@ -927,6 +949,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         })?;
 
         // This insert should trigger a flush in the background
@@ -937,6 +960,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         })?;
 
         // Wait a bit for background flush
@@ -962,6 +986,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
             path: PathBuf::from("/other/b.txt"),
@@ -970,6 +995,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
 
         // Delete everything under /foo
@@ -996,6 +1022,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
             path: PathBuf::from("/foo/bar/b.txt"),
@@ -1004,6 +1031,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
 
         // Delete /foo on vol1 only
@@ -1036,6 +1064,7 @@ mod tests {
                 last_modified: 100,
                 last_accessed: 100,
                 category: 0,
+                volume_type: VolumeType::Local,
             })?;
             // Force wait for each flush
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1084,6 +1113,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100, // Very old
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
             path: PathBuf::from("/foo/new.txt"),
@@ -1092,6 +1122,7 @@ mod tests {
             last_modified: 1000,
             last_accessed: 1000, // Newer
             category: 0,
+            volume_type: VolumeType::Local,
         })?;
 
         let results = index.recent_files(500, 10, 0, SearchOptions::default())?;
@@ -1115,6 +1146,7 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: category::TEXT,
+            volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
             path: PathBuf::from("/vol2/b.txt"),
@@ -1123,11 +1155,12 @@ mod tests {
             last_modified: 100,
             last_accessed: 100,
             category: category::IMAGE,
+            volume_type: VolumeType::Local,
         })?;
 
         // Filter by volume
         let opts_vol1 = SearchOptions {
-            volume_filter: Some("vol1"),
+            volume_name: Some("vol1"),
             ..Default::default()
         };
         let res_vol1 = index.search("txt", 10, 0, opts_vol1)?;

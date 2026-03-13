@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
-use minidex::{FilesystemEntry, Index, Kind, SearchOptions, SearchResult, category};
+use minidex::{FilesystemEntry, Index, Kind, SearchOptions, SearchResult, VolumeType, category};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
@@ -196,7 +196,7 @@ impl App {
     }
 }
 
-fn detect_category(path: &std::path::Path) -> u16 {
+fn detect_category(path: &std::path::Path) -> u8 {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -261,6 +261,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
             let _ = self.index.insert(FilesystemEntry {
                 path: entry.path().to_path_buf(),
                 volume: "/".to_string(),
+                volume_type: VolumeType::Local,
                 kind,
                 last_modified,
                 last_accessed,

@@ -48,13 +48,35 @@ pub(crate) fn is_tombstoned(
 }
 
 pub mod category {
-    pub const OTHER: u16 = 0;
-    pub const ARCHIVE: u16 = 1 << 0;
-    pub const DOCUMENT: u16 = 1 << 1;
-    pub const IMAGE: u16 = 1 << 2;
-    pub const VIDEO: u16 = 1 << 3;
-    pub const AUDIO: u16 = 1 << 4;
-    pub const TEXT: u16 = 1 << 5;
+    pub const OTHER: u8 = 0;
+    pub const ARCHIVE: u8 = 1 << 0;
+    pub const DOCUMENT: u8 = 1 << 1;
+    pub const IMAGE: u8 = 1 << 2;
+    pub const VIDEO: u8 = 1 << 3;
+    pub const AUDIO: u8 = 1 << 4;
+    pub const TEXT: u8 = 1 << 5;
+}
+
+/// Volume type, used to distinguish local volumes
+/// from remote and network volumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VolumeType {
+    Local = 0,
+    Network = 1,
+    Removable = 2,
+    Unknown = 3,
+}
+
+impl From<u8> for VolumeType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Local,
+            1 => Self::Network,
+            2 => Self::Removable,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -80,24 +102,54 @@ mod tests {
         ];
 
         // Match prefix (None volume), sequence < stamp, has separator
-        assert!(is_tombstoned("volX", format!("/foo{}abc", sep).as_bytes(), 50, &active_tombstones));
-        
+        assert!(is_tombstoned(
+            "volX",
+            format!("/foo{}abc", sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
+
         // Match exact prefix (None volume), sequence < stamp
         assert!(is_tombstoned("volX", b"/foo", 50, &active_tombstones));
 
         // Match prefix (vol1 volume), sequence < stamp, has separator
-        assert!(is_tombstoned("vol1", format!("/bar{}abc", sep).as_bytes(), 50, &active_tombstones));
+        assert!(is_tombstoned(
+            "vol1",
+            format!("/bar{}abc", sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
 
         // Volume mismatch
-        assert!(!is_tombstoned("vol2", format!("/bar{}abc", sep).as_bytes(), 50, &active_tombstones));
+        assert!(!is_tombstoned(
+            "vol2",
+            format!("/bar{}abc", sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
 
         // Sequence >= stamp
-        assert!(!is_tombstoned("vol1", format!("/bar{}abc", sep).as_bytes(), 200, &active_tombstones));
+        assert!(!is_tombstoned(
+            "vol1",
+            format!("/bar{}abc", sep).as_bytes(),
+            200,
+            &active_tombstones
+        ));
 
         // No match prefix (different word)
-        assert!(!is_tombstoned("vol1", b"/foobar/abc", 50, &active_tombstones));
+        assert!(!is_tombstoned(
+            "vol1",
+            b"/foobar/abc",
+            50,
+            &active_tombstones
+        ));
 
         // Case-insensitive match on prefix (as per implementation)
-        assert!(is_tombstoned("volX", format!("/FOO{}abc", sep).as_bytes(), 50, &active_tombstones));
+        assert!(is_tombstoned(
+            "volX",
+            format!("/FOO{}abc", sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
     }
 }

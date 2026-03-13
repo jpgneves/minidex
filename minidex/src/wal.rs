@@ -271,6 +271,7 @@ mod tests {
                 last_modified: 100,
                 last_accessed: 100,
                 category: 0,
+                volume_type: crate::common::VolumeType::Local,
             };
             wal.append("/foo", "vol1", &entry)?;
             wal.write_prefix_tombstone(None, "/bar", 20)?;
@@ -312,6 +313,7 @@ mod tests {
                 last_modified: 100,
                 last_accessed: 100,
                 category: 0,
+                volume_type: crate::common::VolumeType::Local,
             };
             wal.append("/foo", "vol1", &entry)?;
             wal.rotate(&rot_path)?;
@@ -322,6 +324,7 @@ mod tests {
                 last_modified: 200,
                 last_accessed: 200,
                 category: 0,
+                volume_type: crate::common::VolumeType::Local,
             };
             wal.append("/bar", "vol1", &entry2)?;
             wal.flush()?;
