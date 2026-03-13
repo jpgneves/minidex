@@ -14,6 +14,10 @@ pub struct ScoringConfig {
     pub depth_penalty: f64,
     /// Maximum recency boost (decays logarithmically)
     pub recency_boost: f64,
+    /// Recency decay rate
+    pub recency_decay: f64,
+    /// File boost (vs directories).
+    pub kind_file_boost: f64,
     /// Directory boost (vs files).
     pub kind_dir_boost: f64,
     /// Boost by proximity scoring
@@ -30,6 +34,8 @@ impl Default for ScoringConfig {
             filename_match: 15.0,
             depth_penalty: 2.0,
             recency_boost: 10.0,
+            recency_decay: 2.0,
+            kind_file_boost: 2.0,
             kind_dir_boost: 2.0,
             proximity_bonus: 20.0,
             ordering_bonus: 15.0,
@@ -43,6 +49,7 @@ pub(crate) fn compute_score(
     query_tokens: &[String],
     raw_query_tokens: &[&str],
     last_modified: u64,
+    last_accessed: u64,
     kind: Kind,
     now_micros: f64,
 ) -> f64 {
@@ -100,19 +107,16 @@ pub(crate) fn compute_score(
         score -= config.depth_penalty * (depth as f64).ln();
     }
 
-    // Recency boost
-    let age_days = (now_micros - last_modified as f64) / (1_000_000.0 * 86_400.0);
-    if age_days > 0.0 {
-        score += config.recency_boost / (1.0 + age_days.ln());
-    } else {
-        score += config.recency_boost
-    }
+    // Recency boost - use both last_modified and last_accessed
+    let recent_date = last_modified.max(last_accessed);
+    let age_days = (now_micros - recent_date as f64) / (1_000_000.0 * 86_400.0);
+    score += config.recency_boost - config.recency_decay * (1.0 + age_days).ln();
 
     // Kind preference
     score += match kind {
         Kind::Directory => config.kind_dir_boost,
-        Kind::File => config.kind_dir_boost * 0.5,
-        Kind::Symlink => config.kind_dir_boost * 0.1,
+        Kind::File => config.kind_file_boost,
+        Kind::Symlink => config.kind_file_boost * 0.5,
     };
 
     // Continuous Position Proximity Scoring/Span Density
@@ -186,6 +190,7 @@ mod tests {
             &query_tokens,
             &raw_query_tokens,
             1_000_000,
+            1_000_000,
             Kind::File,
             now,
         );
@@ -194,6 +199,7 @@ mod tests {
             "other.txt",
             &query_tokens,
             &raw_query_tokens,
+            1_000_000,
             1_000_000,
             Kind::File,
             now,
@@ -216,6 +222,7 @@ mod tests {
             &query_tokens,
             &raw_query_tokens,
             1_000_000,
+            1_000_000,
             Kind::File,
             now,
         );
@@ -224,6 +231,7 @@ mod tests {
             "/foo/bar/abc.txt",
             &query_tokens,
             &raw_query_tokens,
+            1_000_000,
             1_000_000,
             Kind::File,
             now,
@@ -247,6 +255,7 @@ mod tests {
             &query_tokens,
             &raw_query_tokens,
             1_000_000,
+            1_000_000,
             Kind::File,
             now,
         );
@@ -255,6 +264,7 @@ mod tests {
             &format!("{}foo{}bar{}baz{}abc.txt", sep, sep, sep, sep),
             &query_tokens,
             &raw_query_tokens,
+            1_000_000,
             1_000_000,
             Kind::File,
             now,
@@ -276,6 +286,7 @@ mod tests {
             &query_tokens,
             &raw_query_tokens,
             1_900_000_000_000,
+            1_900_000_000_000,
             Kind::File,
             now,
         );
@@ -284,6 +295,7 @@ mod tests {
             "abc.txt",
             &query_tokens,
             &raw_query_tokens,
+            1_000_000_000_000,
             1_000_000_000_000,
             Kind::File,
             now,
@@ -305,6 +317,7 @@ mod tests {
             &query_tokens,
             &raw_query_tokens,
             1_000_000,
+            1_000_000,
             Kind::File,
             now,
         );
@@ -313,6 +326,7 @@ mod tests {
             "bar_foo.txt",
             &query_tokens,
             &raw_query_tokens,
+            1_000_000,
             1_000_000,
             Kind::File,
             now,

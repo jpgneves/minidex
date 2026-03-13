@@ -536,6 +536,7 @@ impl Index {
                     &tokens,
                     &raw_query_tokens,
                     entry.last_modified,
+                    entry.last_accessed,
                     entry.kind,
                     now_micros,
                 );
