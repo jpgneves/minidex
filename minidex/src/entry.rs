@@ -19,9 +19,9 @@ pub(crate) struct IndexEntry {
 impl IndexEntry {
     pub(crate) const SIZE: usize = std::mem::size_of::<Self>();
 
-    pub(crate) fn to_bytes(&self) -> [u8; Self::SIZE] {
+    pub(crate) fn as_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
-        buf[0..8].copy_from_slice(&self.opstamp.to_bytes());
+        buf[0..8].copy_from_slice(&self.opstamp.as_bytes());
         buf[8] = self.kind as u8;
         buf[9..17].copy_from_slice(&self.last_modified.to_le_bytes());
         buf[17..25].copy_from_slice(&self.last_accessed.to_le_bytes());
@@ -78,7 +78,7 @@ mod tests {
             volume_type: VolumeType::Local,
         };
 
-        let bytes = entry.to_bytes();
+        let bytes = entry.as_bytes();
         let entry2 = IndexEntry::from_bytes(&bytes);
 
         assert_eq!(entry.opstamp.sequence(), entry2.opstamp.sequence());
@@ -100,7 +100,7 @@ mod tests {
             volume_type: VolumeType::Unknown,
         };
 
-        let bytes = entry.to_bytes();
+        let bytes = entry.as_bytes();
         let entry2 = IndexEntry::from_bytes(&bytes);
 
         assert!(entry2.opstamp.is_deletion());

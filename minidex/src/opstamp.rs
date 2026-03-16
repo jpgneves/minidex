@@ -29,7 +29,7 @@ impl Opstamp {
     }
 
     #[inline]
-    pub(crate) fn to_bytes(&self) -> [u8; 8] {
+    pub(crate) fn as_bytes(&self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
 
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn test_opstamp_serialization() {
         let op = Opstamp::deletion(12345);
-        let bytes = op.to_bytes();
+        let bytes = op.as_bytes();
         let op2 = Opstamp::from_bytes(&bytes);
         assert_eq!(op, op2);
         assert!(op2.is_deletion());

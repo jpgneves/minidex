@@ -44,7 +44,7 @@ impl Wal {
         writer.write_all(path_bytes)?;
         writer.write_all(&volume_len.to_le_bytes())?;
         writer.write_all(volume_bytes)?;
-        writer.write_all(&entry.to_bytes())?;
+        writer.write_all(&entry.as_bytes())?;
         Ok(())
     }
 

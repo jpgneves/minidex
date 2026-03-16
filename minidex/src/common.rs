@@ -39,7 +39,7 @@ pub(crate) fn is_tombstoned(
         .any(|(tombstone_volume, prefix, stamp)| {
             let prefix_bytes = prefix.as_bytes();
             path_bytes.len() >= prefix_bytes.len()
-                && tombstone_volume.as_ref().map_or(true, |v| v == volume)
+                && tombstone_volume.as_ref().is_none_or(|v| v == volume)
                 && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
                 && (path_bytes.len() == prefix_bytes.len()
                     || path_bytes[prefix_bytes.len()] == std::path::MAIN_SEPARATOR as u8)

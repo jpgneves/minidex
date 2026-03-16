@@ -43,6 +43,7 @@ impl Default for ScoringConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor the inputs to take less arguments
 pub(crate) fn compute_score(
     config: &ScoringConfig,
     path: &str,

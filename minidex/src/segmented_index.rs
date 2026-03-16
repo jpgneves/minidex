@@ -368,7 +368,7 @@ impl SegmentedIndex {
             let volume_ref = volume.as_ref();
             let volume_bytes = volume_ref.as_bytes();
 
-            let entry_bytes = entry.to_bytes();
+            let entry_bytes = entry.as_bytes();
 
             dat_writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
             dat_writer.write_all(path_bytes)?;

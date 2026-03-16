@@ -86,10 +86,7 @@ pub(crate) fn merge_segments(
     prefix_tombstones: Arc<Vec<(Option<String>, String, u64)>>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
-    let mut iterators: Vec<_> = segments
-        .iter()
-        .map(|seg| seg.documents().into_iter())
-        .collect();
+    let mut iterators: Vec<_> = segments.iter().map(|seg| seg.documents()).collect();
 
     let mut currents: Vec<Option<(String, String, IndexEntry)>> =
         iterators.iter_mut().map(|iter| iter.next()).collect();

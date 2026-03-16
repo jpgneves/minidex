@@ -33,6 +33,8 @@ pub use tokenizer::tokenize;
 mod wal;
 pub use search::{ScoringConfig, SearchOptions, SearchResult};
 
+pub type Tombstone = (Option<String>, String, u64);
+
 /// A Minidex Index, managing both the in-memory and disk data.
 /// Insertions and deletions auto-commit to the Write-Ahead Log
 /// and may trigger compaction.
@@ -45,7 +47,7 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
-    prefix_tombstones: Arc<RwLock<Arc<Vec<(Option<String>, String, u64)>>>>,
+    prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
 }
 
 impl Index {
@@ -235,8 +237,7 @@ impl Index {
     ) -> Result<(), IndexError> {
         let seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
         let normalized_prefix = prefix
-            .replace('/', &std::path::MAIN_SEPARATOR.to_string())
-            .replace('\\', &std::path::MAIN_SEPARATOR.to_string())
+            .replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR)
             .to_lowercase();
         {
             let mut tombstones = self
@@ -312,22 +313,22 @@ impl Index {
         for (path, (volume, entry)) in mem.iter() {
             let path_bytes = path.as_bytes();
 
-            if let Some(filter) = options.volume_name {
-                if volume != filter {
-                    continue;
-                }
+            if let Some(filter) = options.volume_name
+                && volume != filter
+            {
+                continue;
             }
 
-            if let Some(category) = options.category {
-                if entry.category & category == 0 {
-                    continue;
-                }
+            if let Some(category) = options.category
+                && entry.category & category == 0
+            {
+                continue;
             }
 
-            if let Some(kind) = options.kind {
-                if entry.kind != kind {
-                    continue;
-                }
+            if let Some(kind) = options.kind
+                && entry.kind != kind
+            {
+                continue;
             }
 
             if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
@@ -370,7 +371,7 @@ impl Index {
 
             if let Some(ref vol_token) = vol_token {
                 let map = segment.as_ref().as_ref();
-                if let Some(post_offset) = map.get(&vol_token) {
+                if let Some(post_offset) = map.get(vol_token) {
                     segment.append_posting_list(post_offset, &mut current_matches);
                     current_matches.sort_unstable();
                     current_matches.dedup();
@@ -460,10 +461,10 @@ impl Index {
                     }
 
                     // Filter categories
-                    if let Some(category) = options.category {
-                        if doc_category & category == 0 {
-                            continue;
-                        }
+                    if let Some(category) = options.category
+                        && doc_category & category == 0
+                    {
+                        continue;
                     }
 
                     // Filter volume type
@@ -543,7 +544,7 @@ impl Index {
                 );
                 SearchResult {
                     path: PathBuf::from(path),
-                    volume: volume,
+                    volume,
                     volume_type: entry.volume_type,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
@@ -584,20 +585,20 @@ impl Index {
 
         for (path, (volume, entry)) in mem.iter() {
             if entry.last_accessed >= since {
-                if let Some(filter) = options.volume_name {
-                    if volume != filter {
-                        continue;
-                    }
+                if let Some(filter) = options.volume_name
+                    && volume != filter
+                {
+                    continue;
                 }
-                if let Some(category) = options.category {
-                    if entry.category & category == 0 {
-                        continue;
-                    }
+                if let Some(category) = options.category
+                    && entry.category & category == 0
+                {
+                    continue;
                 }
-                if let Some(kind) = options.kind {
-                    if entry.kind != kind {
-                        continue;
-                    }
+                if let Some(kind) = options.kind
+                    && entry.kind != kind
+                {
+                    continue;
                 }
                 if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
                     continue;
@@ -628,10 +629,10 @@ impl Index {
                         }
                     }
 
-                    if let Some(category) = options.category {
-                        if doc_category & category == 0 {
-                            continue;
-                        }
+                    if let Some(category) = options.category
+                        && doc_category & category == 0
+                    {
+                        continue;
                     }
 
                     if (volume_type_mask & (1 << doc_vol_type)) == 0 {
@@ -657,10 +658,10 @@ impl Index {
             let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
 
             if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                if let Some(filter) = options.volume_name {
-                    if volume != filter {
-                        continue;
-                    }
+                if let Some(filter) = options.volume_name
+                    && volume != filter
+                {
+                    continue;
                 }
                 collector.insert(path, volume, entry);
             }
@@ -870,7 +871,7 @@ impl Index {
         base: Arc<RwLock<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        prefix_tombstones: Arc<RwLock<Arc<Vec<(Option<String>, String, u64)>>>>,
+        prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {

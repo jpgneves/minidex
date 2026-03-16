@@ -152,11 +152,11 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
-        if let Some(i) = self.list_state.selected() {
-            if let Some(res) = self.results.get(i) {
-                let _ = self.index.delete(&res.path);
-                self.update_search();
-            }
+        if let Some(i) = self.list_state.selected()
+            && let Some(res) = self.results.get(i)
+        {
+            let _ = self.index.delete(&res.path);
+            self.update_search();
         }
     }
 
@@ -295,43 +295,42 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Esc, _) => return Ok(()),
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                        (KeyCode::Char('i'), KeyModifiers::CONTROL)
-                        | (KeyCode::Char('r'), KeyModifiers::CONTROL)
-                        | (KeyCode::Tab, _) => {
-                            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                            app.start_indexing(home);
-                        }
-                        (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                            app.compact();
-                        }
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            app.delete_selected();
-                        }
-                        (KeyCode::Enter, _) => {
-                            if let Some(i) = app.list_state.selected() {
-                                if let Some(_res) = app.results.get(i) {
-                                    // Use a temporary variable to hold the output,
-                                    // as we can't easily print after restore() here without returning it.
-                                    // For now just exit. In a real app we might want to return the path.
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        (KeyCode::Char(c), _) => app.enter_char(c),
-                        (KeyCode::Backspace, _) => app.delete_char(),
-                        (KeyCode::Left, _) => app.move_cursor_left(),
-                        (KeyCode::Right, _) => app.move_cursor_right(),
-                        (KeyCode::Up, _) => app.previous_result(),
-                        (KeyCode::Down, _) => app.next_result(),
-                        _ => {}
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => return Ok(()),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
+                (KeyCode::Char('i'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('r'), KeyModifiers::CONTROL)
+                | (KeyCode::Tab, _) => {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    app.start_indexing(home);
+                }
+                (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                    app.compact();
+                }
+                (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                    app.delete_selected();
+                }
+                (KeyCode::Enter, _) => {
+                    if let Some(i) = app.list_state.selected()
+                        && let Some(_res) = app.results.get(i)
+                    {
+                        // Use a temporary variable to hold the output,
+                        // as we can't easily print after restore() here without returning it.
+                        // For now just exit. In a real app we might want to return the path.
+                        return Ok(());
                     }
                 }
+                (KeyCode::Char(c), _) => app.enter_char(c),
+                (KeyCode::Backspace, _) => app.delete_char(),
+                (KeyCode::Left, _) => app.move_cursor_left(),
+                (KeyCode::Right, _) => app.move_cursor_right(),
+                (KeyCode::Up, _) => app.previous_result(),
+                (KeyCode::Down, _) => app.next_result(),
+                _ => {}
             }
         }
     }
