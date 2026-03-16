@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use crate::{Kind, Path, PathBuf, entry::IndexEntry};
+use crate::{Kind, Path, PathBuf, entry::IndexEntry, leb128::DeltaLeb128Iterator};
 use fs4::fs_std::FileExt;
 use fst::Map;
 use memmap2::Mmap;
@@ -109,8 +109,14 @@ impl Segment {
         let count =
             u32::from_le_bytes(post[start..start + size_of::<u32>()].try_into().unwrap()) as usize;
 
-        let cursor = start + size_of::<u32>();
-        let end = cursor + (count * size_of::<u32>());
+        let byte_len = u32::from_le_bytes(
+            post[start + size_of::<u32>()..start + (2 * size_of::<u32>())]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        let cursor = start + (2 * size_of::<u32>());
+        let end = cursor + byte_len;
 
         if end > post.len() {
             return;
@@ -118,9 +124,10 @@ impl Segment {
 
         out.reserve(count);
 
-        for chunk in post[cursor..end].chunks_exact(size_of::<u32>()) {
-            out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-        }
+        let compressed_slice = &post[cursor..end];
+        let iter = DeltaLeb128Iterator::new(compressed_slice);
+
+        out.extend(iter);
     }
 
     /// Iterator over the documents in this segment
@@ -442,19 +449,41 @@ impl SegmentedIndex {
 
         let mut seg_builder =
             fst::MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
+
         let mut current_post_offset = 0u64;
+        let mut compressed_buffer = Vec::new();
 
         for (token, doc_offsets) in inverted_index {
-            post_writer.write_all(&(doc_offsets.len() as u32).to_le_bytes())?;
-            for offset in &doc_offsets {
-                post_writer.write_all(&offset.to_le_bytes())?;
+            compressed_buffer.clear();
+            let mut last_id = 0u32;
+
+            for &offset in &doc_offsets {
+                let delta = offset - last_id;
+                last_id = offset;
+                let mut val = delta;
+
+                loop {
+                    let mut byte = (val & 0x7F) as u8;
+                    val >>= 7;
+                    if val != 0 {
+                        byte |= 0x80;
+                        compressed_buffer.push(byte);
+                    } else {
+                        compressed_buffer.push(byte);
+                        break;
+                    }
+                }
             }
+
+            post_writer.write_all(&(doc_offsets.len() as u32).to_le_bytes())?;
+            post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
+            post_writer.write_all(&compressed_buffer)?;
 
             seg_builder
                 .insert(token, current_post_offset)
                 .map_err(SegmentedIndexError::Fst)?;
 
-            current_post_offset += (size_of::<u32>() + doc_offsets.len() * size_of::<u32>()) as u64;
+            current_post_offset += (2 * size_of::<u32>() as u64) + compressed_buffer.len() as u64;
         }
 
         meta_writer

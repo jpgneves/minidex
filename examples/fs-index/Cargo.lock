@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "bstr",
  "fs4",

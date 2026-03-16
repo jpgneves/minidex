@@ -15,6 +15,7 @@ use thiserror::Error;
 
 mod collector;
 mod common;
+mod leb128;
 use collector::*;
 pub use common::{Kind, VolumeType, category};
 mod entry;
