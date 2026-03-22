@@ -980,10 +980,13 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let path1 = format!("{}foo{}bar.txt", sep, sep);
+
         {
             let index = Index::open(&temp_dir)?;
             index.insert(FilesystemEntry {
-                path: PathBuf::from("/foo/bar.txt"),
+                path: PathBuf::from(&path1),
                 volume: "vol1".to_string(),
                 kind: Kind::File,
                 last_modified: 100,
@@ -994,7 +997,7 @@ mod tests {
 
             let results = index.search("bar", 10, 0, SearchOptions::default())?;
             assert_eq!(results.len(), 1);
-            assert_eq!(results[0].path, PathBuf::from("/foo/bar.txt"));
+            assert_eq!(results[0].path, PathBuf::from(&path1));
 
             index.sync()?;
         }
@@ -1004,7 +1007,7 @@ mod tests {
             let index = Index::open(&temp_dir)?;
             let results = index.search("bar", 10, 0, SearchOptions::default())?;
             assert_eq!(results.len(), 1);
-            assert_eq!(results[0].path, PathBuf::from("/foo/bar.txt"));
+            assert_eq!(results[0].path, PathBuf::from(&path1));
         }
 
         std::fs::remove_dir_all(temp_dir)?;
@@ -1021,9 +1024,11 @@ mod tests {
             ..Default::default()
         };
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open_with_config(&temp_dir, config)?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/a.txt"),
+            path: PathBuf::from(format!("{}foo{}a.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1034,7 +1039,7 @@ mod tests {
 
         // This insert should trigger a flush in the background
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/b.txt"),
+            path: PathBuf::from(format!("{}foo{}b.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1058,9 +1063,11 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_del_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open(&temp_dir)?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/bar/a.txt"),
+            path: PathBuf::from(format!("{}foo{}bar{}a.txt", sep, sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1068,8 +1075,9 @@ mod tests {
             category: 0,
             volume_type: VolumeType::Local,
         })?;
+        let other_path = format!("{}other{}b.txt", sep, sep);
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/other/b.txt"),
+            path: PathBuf::from(&other_path),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1079,11 +1087,11 @@ mod tests {
         })?;
 
         // Delete everything under /foo
-        index.delete_prefix("/foo")?;
+        index.delete_prefix(&format!("{}foo", sep))?;
 
         let results = index.search("txt", 10, 0, SearchOptions::default())?;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].path, PathBuf::from("/other/b.txt"));
+        assert_eq!(results[0].path, PathBuf::from(&other_path));
 
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
@@ -1094,9 +1102,11 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_vol_del_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open(&temp_dir)?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/bar/a.txt"),
+            path: PathBuf::from(format!("{}foo{}bar{}a.txt", sep, sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1105,7 +1115,7 @@ mod tests {
             volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/bar/b.txt"),
+            path: PathBuf::from(format!("{}foo{}bar{}b.txt", sep, sep, sep)),
             volume: "vol2".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1115,7 +1125,7 @@ mod tests {
         })?;
 
         // Delete /foo on vol1 only
-        index.delete_by_volume_name(Some("vol1"), "/foo")?;
+        index.delete_by_volume_name(Some("vol1"), &format!("{}foo", sep))?;
 
         let results = index.search("txt", 10, 0, SearchOptions::default())?;
         assert_eq!(results.len(), 1);
@@ -1135,12 +1145,14 @@ mod tests {
             ..Default::default()
         };
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open_with_config(&temp_dir, config)?;
 
         // Create 4 items to trigger 2 flushes (with flush_threshold=1)
         for i in 0..4 {
             index.insert(FilesystemEntry {
-                path: PathBuf::from(format!("/foo/{}.txt", i)),
+                path: PathBuf::from(format!("{}foo{}{}.txt", sep, sep, i)),
                 volume: "vol1".to_string(),
                 kind: Kind::File,
                 last_modified: 100,
@@ -1187,9 +1199,11 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_recent_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open(&temp_dir)?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/old.txt"),
+            path: PathBuf::from(format!("{}foo{}old.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1197,8 +1211,9 @@ mod tests {
             category: 0,
             volume_type: VolumeType::Local,
         })?;
+        let new_path = format!("{}foo{}new.txt", sep, sep);
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/foo/new.txt"),
+            path: PathBuf::from(&new_path),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 1000,
@@ -1209,7 +1224,7 @@ mod tests {
 
         let results = index.recent_files(500, 10, 0, SearchOptions::default())?;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].path, PathBuf::from("/foo/new.txt"));
+        assert_eq!(results[0].path, PathBuf::from(&new_path));
 
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
@@ -1220,9 +1235,11 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_filter_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         let index = Index::open(&temp_dir)?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/vol1/a.txt"),
+            path: PathBuf::from(format!("{}vol1{}a.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
             last_modified: 100,
@@ -1231,7 +1248,7 @@ mod tests {
             volume_type: VolumeType::Local,
         })?;
         index.insert(FilesystemEntry {
-            path: PathBuf::from("/vol2/b.txt"),
+            path: PathBuf::from(format!("{}vol2{}b.txt", sep, sep)),
             volume: "vol2".to_string(),
             kind: Kind::File,
             last_modified: 100,
