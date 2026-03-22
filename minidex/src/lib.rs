@@ -11,6 +11,7 @@ use std::{
 use common::is_tombstoned;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
+use search::ScoringConfig;
 use thiserror::Error;
 
 mod collector;
@@ -31,7 +32,7 @@ mod search;
 mod tokenizer;
 pub use tokenizer::tokenize;
 mod wal;
-pub use search::{ScoringConfig, SearchOptions, SearchResult};
+pub use search::{ScoringInputs, ScoringWeights, SearchOptions, SearchResult};
 
 pub type Tombstone = (Option<String>, String, u64);
 
@@ -343,11 +344,30 @@ impl Index {
                     }
                     path_bytes
                         .windows(token_bytes.len())
-                        .any(|window| window.eq_ignore_ascii_case(token_bytes))
+                        .enumerate()
+                        .any(|(idx, window)| {
+                            if window.eq_ignore_ascii_case(token_bytes) {
+                                if idx == 0 {
+                                    true
+                                } else {
+                                    !path_bytes[idx - 1].is_ascii_alphanumeric()
+                                }
+                            } else {
+                                false
+                            }
+                        })
                 })
             } else {
                 let folded_path = crate::tokenizer::fold_path(path);
-                tokens.iter().all(|t| folded_path.contains(t))
+                tokens.iter().all(|t| {
+                    folded_path.match_indices(t.as_str()).any(|(idx, _)| {
+                        if idx == 0 {
+                            true
+                        } else {
+                            !folded_path[..idx].chars().last().unwrap().is_alphanumeric()
+                        }
+                    })
+                })
             };
 
             if matches_all {
@@ -529,19 +549,22 @@ impl Index {
             &ScoringConfig::default()
         };
 
+        let weights = config.weights.unwrap_or_default();
         let mut scored: Vec<_> = results
             .into_iter()
             .map(|(path, volume, entry)| {
-                let score = crate::search::compute_score(
-                    config,
-                    &path,
-                    &tokens,
-                    &raw_query_tokens,
-                    entry.last_modified,
-                    entry.last_accessed,
-                    entry.kind,
+                let inputs = ScoringInputs {
+                    path: &path,
+                    query_tokens: &tokens,
+                    raw_query_tokens: &raw_query_tokens,
+                    last_modified: entry.last_modified,
+                    last_accessed: entry.last_accessed,
+                    kind: entry.kind,
                     now_micros,
-                );
+                };
+
+                let score = (config.scoring_fn)(&weights, &inputs);
+
                 SearchResult {
                     path: PathBuf::from(path),
                     volume,
@@ -993,8 +1016,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_flush_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
-        let mut config = CompactorConfig::default();
-        config.flush_threshold = 1; // Flush after 1 insert
+        let config = CompactorConfig {
+            flush_threshold: 1,
+            ..Default::default()
+        };
 
         let index = Index::open_with_config(&temp_dir, config)?;
         index.insert(FilesystemEntry {
@@ -1105,8 +1130,10 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_comp_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
 
-        let mut config = CompactorConfig::default();
-        config.flush_threshold = 1;
+        let config = CompactorConfig {
+            flush_threshold: 1,
+            ..Default::default()
+        };
 
         let index = Index::open_with_config(&temp_dir, config)?;
 

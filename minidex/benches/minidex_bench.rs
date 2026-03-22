@@ -1,8 +1,9 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use minidex::{
     CompactorConfigBuilder, FilesystemEntry, Index, Kind, SearchOptions, VolumeType, category,
     tokenize,
 };
+use std::hint::black_box;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -78,7 +79,7 @@ fn bench_index_search(c: &mut Criterion) {
 
     group.bench_function("mem_search_hit", |b| {
         // These will be in mem table (the last ones)
-        let _ = index
+        index
             .insert(FilesystemEntry {
                 path: PathBuf::from("/foo/mem_only_entry.txt"),
                 volume: "vol1".to_string(),

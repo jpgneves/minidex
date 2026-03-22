@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g., v0.14.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to Crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Publish minidex (library)
+        run: cargo publish -p minidex
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          
+      # Wait a few seconds for crates.io to index the library
+      - name: Wait for indexing
+        run: sleep 20
+        
+      - name: Publish minidex-cli
+        run: cargo publish -p minidex-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
