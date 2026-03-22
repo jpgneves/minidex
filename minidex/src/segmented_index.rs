@@ -377,10 +377,9 @@ impl SegmentedIndex {
             dat_writer.write_all(&entry_bytes)?;
 
             // Pack u128 metadata
-            let depth = path
-                .as_ref()
-                .chars()
-                .filter(|&c| c == std::path::MAIN_SEPARATOR)
+            let depth = path_bytes
+                .iter()
+                .filter(|&&b| b == std::path::MAIN_SEPARATOR as u8)
                 .count() as u16;
             let is_dir = entry.kind == Kind::Directory;
 

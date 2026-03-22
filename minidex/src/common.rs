@@ -34,17 +34,35 @@ pub(crate) fn is_tombstoned(
     sequence: u64,
     active_tombstones: &[(Option<String>, String, u64)],
 ) -> bool {
-    active_tombstones
-        .iter()
-        .any(|(tombstone_volume, prefix, stamp)| {
-            let prefix_bytes = prefix.as_bytes();
-            path_bytes.len() >= prefix_bytes.len()
-                && tombstone_volume.as_ref().is_none_or(|v| v == volume)
-                && path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
-                && (path_bytes.len() == prefix_bytes.len()
-                    || path_bytes[prefix_bytes.len()] == std::path::MAIN_SEPARATOR as u8)
-                && sequence < *stamp
-        })
+    if active_tombstones.is_empty() {
+        return false;
+    }
+
+    let sep = std::path::MAIN_SEPARATOR as u8;
+
+    for (tombstone_volume, prefix, stamp) in active_tombstones {
+        if sequence >= *stamp {
+            continue;
+        }
+
+        let prefix_bytes = prefix.as_bytes();
+        if path_bytes.len() < prefix_bytes.len() {
+            continue;
+        }
+
+        if let Some(v) = tombstone_volume
+            && v != volume
+        {
+            continue;
+        }
+
+        if path_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+            && (path_bytes.len() == prefix_bytes.len() || path_bytes[prefix_bytes.len()] == sep)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub mod category {
@@ -95,27 +113,32 @@ mod tests {
 
     #[test]
     fn test_is_tombstoned() {
-        let sep = std::path::MAIN_SEPARATOR;
+        let sep = std::path::MAIN_SEPARATOR_STR;
         let active_tombstones = vec![
-            (None, "/foo".to_string(), 100),
-            (Some("vol1".to_string()), "/bar".to_string(), 200),
+            (None, format!("{}foo", sep), 100),
+            (Some("vol1".to_string()), format!("{}bar", sep), 200),
         ];
 
         // Match prefix (None volume), sequence < stamp, has separator
         assert!(is_tombstoned(
             "volX",
-            format!("/foo{}abc", sep).as_bytes(),
+            format!("{}foo{}abc", sep, sep).as_bytes(),
             50,
             &active_tombstones
         ));
 
         // Match exact prefix (None volume), sequence < stamp
-        assert!(is_tombstoned("volX", b"/foo", 50, &active_tombstones));
+        assert!(is_tombstoned(
+            "volX",
+            format!("{}foo", sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
 
         // Match prefix (vol1 volume), sequence < stamp, has separator
         assert!(is_tombstoned(
             "vol1",
-            format!("/bar{}abc", sep).as_bytes(),
+            format!("{}bar{}abc", sep, sep).as_bytes(),
             50,
             &active_tombstones
         ));
@@ -123,7 +146,7 @@ mod tests {
         // Volume mismatch
         assert!(!is_tombstoned(
             "vol2",
-            format!("/bar{}abc", sep).as_bytes(),
+            format!("{}bar{}abc", sep, sep).as_bytes(),
             50,
             &active_tombstones
         ));
@@ -131,7 +154,7 @@ mod tests {
         // Sequence >= stamp
         assert!(!is_tombstoned(
             "vol1",
-            format!("/bar{}abc", sep).as_bytes(),
+            format!("{}bar{}abc", sep, sep).as_bytes(),
             200,
             &active_tombstones
         ));
@@ -139,7 +162,7 @@ mod tests {
         // No match prefix (different word)
         assert!(!is_tombstoned(
             "vol1",
-            b"/foobar/abc",
+            format!("{}foobar{}abc", sep, sep).as_bytes(),
             50,
             &active_tombstones
         ));
@@ -147,7 +170,61 @@ mod tests {
         // Case-insensitive match on prefix (as per implementation)
         assert!(is_tombstoned(
             "volX",
-            format!("/FOO{}abc", sep).as_bytes(),
+            format!("{}FOO{}abc", sep, sep).as_bytes(),
+            50,
+            &active_tombstones
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_is_tombstoned_windows_paths() {
+        let active_tombstones = vec![
+            (None, "c:\\users\\joao".to_string(), 100),
+            (None, "\\\\?\\c:\\windows".to_string(), 200),
+            (None, "\\\\server\\share\\docs".to_string(), 300),
+        ];
+
+        // Drive letter match
+        assert!(is_tombstoned(
+            "vol",
+            b"C:\\Users\\joao\\file.txt",
+            50,
+            &active_tombstones
+        ));
+        assert!(is_tombstoned(
+            "vol",
+            b"c:\\users\\joao",
+            50,
+            &active_tombstones
+        ));
+
+        // UNC path match (long path prefix)
+        assert!(is_tombstoned(
+            "vol",
+            b"\\\\?\\C:\\Windows\\System32",
+            50,
+            &active_tombstones
+        ));
+
+        // UNC server/share match
+        assert!(is_tombstoned(
+            "vol",
+            b"\\\\server\\share\\docs\\report.pdf",
+            50,
+            &active_tombstones
+        ));
+
+        // No match (different drive or share)
+        assert!(!is_tombstoned(
+            "vol",
+            b"D:\\Users\\joao",
+            50,
+            &active_tombstones
+        ));
+        assert!(!is_tombstoned(
+            "vol",
+            b"\\\\other\\share\\docs",
             50,
             &active_tombstones
         ));

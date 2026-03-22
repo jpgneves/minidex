@@ -55,6 +55,7 @@ mod tests {
 
     #[test]
     fn test_collector_basic_insertion() {
+        let sep = std::path::MAIN_SEPARATOR_STR;
         let mut collector = LsmCollector::new(&[]);
         let entry = IndexEntry {
             opstamp: Opstamp::insertion(10),
@@ -64,17 +65,18 @@ mod tests {
             category: 0,
             volume_type: VolumeType::Local,
         };
-        collector.insert("/a".to_string(), "vol1".to_string(), entry);
+        collector.insert(format!("{}a", sep), "vol1".to_string(), entry);
 
         let results: Vec<_> = collector.finish().collect();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "/a");
+        assert_eq!(results[0].0, format!("{}a", sep));
         assert_eq!(results[0].1, "vol1");
         assert_eq!(results[0].2.opstamp.sequence(), 10);
     }
 
     #[test]
     fn test_collector_version_resolution() {
+        let sep = std::path::MAIN_SEPARATOR_STR;
         let mut collector = LsmCollector::new(&[]);
         let entry1 = IndexEntry {
             opstamp: Opstamp::insertion(10),
@@ -94,8 +96,8 @@ mod tests {
         };
 
         // Out-of-order insertion
-        collector.insert("/a".to_string(), "vol1".to_string(), entry2);
-        collector.insert("/a".to_string(), "vol1".to_string(), entry1);
+        collector.insert(format!("{}a", sep), "vol1".to_string(), entry2);
+        collector.insert(format!("{}a", sep), "vol1".to_string(), entry1);
 
         let results: Vec<_> = collector.finish().collect();
         assert_eq!(results.len(), 1);
@@ -104,7 +106,8 @@ mod tests {
 
     #[test]
     fn test_collector_prefix_tombstone() {
-        let tombstones = vec![(None, "/foo".to_string(), 50)];
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let tombstones = vec![(None, format!("{}foo", sep), 50)];
         let mut collector = LsmCollector::new(&tombstones);
 
         let entry_dead = IndexEntry {
@@ -124,19 +127,31 @@ mod tests {
             volume_type: VolumeType::Local,
         };
 
-        collector.insert("/foo/bar".to_string(), "vol1".to_string(), entry_dead);
-        collector.insert("/foo/baz".to_string(), "vol1".to_string(), entry_alive);
-        collector.insert("/other".to_string(), "vol1".to_string(), entry_dead);
+        collector.insert(
+            format!("{}foo{}bar", sep, sep),
+            "vol1".to_string(),
+            entry_dead,
+        );
+        collector.insert(
+            format!("{}foo{}baz", sep, sep),
+            "vol1".to_string(),
+            entry_alive,
+        );
+        collector.insert(format!("{}other", sep), "vol1".to_string(), entry_dead);
 
         let results: Vec<_> = collector.finish().collect();
         assert_eq!(results.len(), 2);
         let mut paths: Vec<_> = results.iter().map(|(p, _, _)| p.as_str()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["/foo/baz", "/other"]);
+
+        let mut expected = vec![format!("{}foo{}baz", sep, sep), format!("{}other", sep)];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     #[test]
     fn test_collector_deletion_resolution() {
+        let sep = std::path::MAIN_SEPARATOR_STR;
         let mut collector = LsmCollector::new(&[]);
         let entry1 = IndexEntry {
             opstamp: Opstamp::insertion(10),
@@ -155,8 +170,8 @@ mod tests {
             volume_type: VolumeType::Local,
         };
 
-        collector.insert("/a".to_string(), "vol1".to_string(), entry1);
-        collector.insert("/a".to_string(), "vol1".to_string(), entry2);
+        collector.insert(format!("{}a", sep), "vol1".to_string(), entry1);
+        collector.insert(format!("{}a", sep), "vol1".to_string(), entry2);
 
         let results: Vec<_> = collector.finish().collect();
         assert_eq!(results.len(), 0); // Deletion (version 20) should win and be filtered by finish()

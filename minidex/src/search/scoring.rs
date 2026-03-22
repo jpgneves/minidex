@@ -266,12 +266,13 @@ mod tests {
         let query_tokens = vec!["abc".to_string()];
         let raw_query_tokens = vec!["abc"];
         let now = 1_000_000.0;
+        let sep = std::path::MAIN_SEPARATOR_STR;
 
         // "abc" is in the filename vs in the directory path
         let score1 = compute_score(
             &config,
             &ScoringInputs {
-                path: "/foo/abc/file.txt",
+                path: &format!("{}foo{}abc{}file.txt", sep, sep, sep),
                 query_tokens: &query_tokens,
                 raw_query_tokens: &raw_query_tokens,
                 last_modified: 1_000_000,
@@ -283,7 +284,7 @@ mod tests {
         let score2 = compute_score(
             &config,
             &ScoringInputs {
-                path: "/foo/bar/abc.txt",
+                path: &format!("{}foo{}bar{}abc.txt", sep, sep, sep),
                 query_tokens: &query_tokens,
                 raw_query_tokens: &raw_query_tokens,
                 last_modified: 1_000_000,
@@ -404,5 +405,61 @@ mod tests {
         );
 
         assert!(score_ordered > score_unordered);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_compute_score_windows_paths() {
+        let weights = ScoringWeights::default();
+        let query_tokens = vec!["report".to_string()];
+        let raw_query_tokens = vec!["report"];
+        let now = 1_000_000.0;
+
+        // Drive letter filename match
+        let score1 = compute_score(
+            &weights,
+            &ScoringInputs {
+                path: "C:\\Users\\joao\\report.pdf",
+                query_tokens: &query_tokens,
+                raw_query_tokens: &raw_query_tokens,
+                last_modified: 1_000_000,
+                last_accessed: 1_000_000,
+                kind: Kind::File,
+                now_micros: now,
+            },
+        );
+
+        // UNC path filename match
+        let score2 = compute_score(
+            &weights,
+            &ScoringInputs {
+                path: "\\\\?\\D:\\Backup\\report.pdf",
+                query_tokens: &query_tokens,
+                raw_query_tokens: &raw_query_tokens,
+                last_modified: 1_000_000,
+                last_accessed: 1_000_000,
+                kind: Kind::File,
+                now_micros: now,
+            },
+        );
+
+        // Server share filename match
+        let score3 = compute_score(
+            &weights,
+            &ScoringInputs {
+                path: "\\\\server\\share\\finance\\report.pdf",
+                query_tokens: &query_tokens,
+                raw_query_tokens: &raw_query_tokens,
+                last_modified: 1_000_000,
+                last_accessed: 1_000_000,
+                kind: Kind::File,
+                now_micros: now,
+            },
+        );
+
+        // All should have a boost for "report" being the filename
+        assert!(score1 > 50.0);
+        assert!(score2 > 50.0);
+        assert!(score3 > 50.0);
     }
 }
