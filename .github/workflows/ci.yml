@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'cli/**'
+      - 'examples/**'
+      - '**.md'
+      - 'LICENSE'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - 'cli/**'
+      - 'examples/**'
+      - '**.md'
+      - 'LICENSE'
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +32,7 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy -p minidex --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -35,7 +45,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test -p minidex
 
   bench:
     name: Verify Benchmarks
@@ -45,4 +55,4 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Check benchmarks
-        run: cargo bench --workspace --no-run
+        run: cargo bench -p minidex --no-run
