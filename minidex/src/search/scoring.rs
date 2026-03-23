@@ -3,7 +3,9 @@ use crate::Kind;
 /// Scoring configuration
 #[derive(Debug)]
 pub struct ScoringConfig {
+    /// Weights available for tweaking scoring
     pub weights: Option<ScoringWeights>,
+    /// Scoring function
     pub scoring_fn: fn(&ScoringWeights, &ScoringInputs) -> f64,
 }
 

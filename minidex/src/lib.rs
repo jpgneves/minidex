@@ -11,7 +11,6 @@ use std::{
 use common::is_tombstoned;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
-use search::ScoringConfig;
 use thiserror::Error;
 
 mod collector;
@@ -32,7 +31,7 @@ mod search;
 mod tokenizer;
 pub use tokenizer::tokenize;
 mod wal;
-pub use search::{ScoringInputs, ScoringWeights, SearchOptions, SearchResult};
+pub use search::{ScoringConfig, ScoringInputs, ScoringWeights, SearchOptions, SearchResult};
 
 pub type Tombstone = (Option<String>, String, u64);
 
