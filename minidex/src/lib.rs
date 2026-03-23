@@ -497,15 +497,19 @@ impl Index {
                 if enriched_docs.len() > scoring_cap {
                     // O(N) quickselect
                     enriched_docs.select_nth_unstable_by(scoring_cap, |&a, &b| {
-                        let (_, a_modified_at, _, a_depth, a_dir, _, _) =
+                        let (a_off, a_modified_at, a_accessed_at, a_depth, a_dir, _, _) =
                             SegmentedIndex::unpack_u128(a);
-                        let (_, b_modified_at, _, b_depth, b_dir, _, _) =
+                        let (b_off, b_modified_at, b_accessed_at, b_depth, b_dir, _, _) =
                             SegmentedIndex::unpack_u128(b);
+
+                        let a_recent = a_modified_at.max(a_accessed_at);
+                        let b_recent = b_modified_at.max(b_accessed_at);
 
                         b_dir
                             .cmp(&a_dir)
                             .then_with(|| a_depth.cmp(&b_depth))
-                            .then_with(|| b_modified_at.cmp(&a_modified_at))
+                            .then_with(|| b_recent.cmp(&a_recent))
+                            .then_with(|| a_off.cmp(&b_off))
                     });
 
                     enriched_docs.truncate(scoring_cap);
@@ -532,7 +536,10 @@ impl Index {
         // Rough top-k
         if results.len() > scoring_cap {
             results.select_nth_unstable_by(scoring_cap, |a, b| {
-                b.2.last_modified.cmp(&a.2.last_modified)
+                let a_recent = a.2.last_modified.max(a.2.last_accessed);
+                let b_recent = b.2.last_modified.max(b.2.last_accessed);
+
+                b_recent.cmp(&a_recent).then_with(|| a.0.cmp(&b.0))
             });
             results.truncate(scoring_cap);
         }
@@ -669,9 +676,12 @@ impl Index {
 
         if disk_candidates.len() > disk_cap {
             disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                let (_, _, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
-                let (_, _, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
-                b_acc.cmp(&a_acc) // Sort descending by access time
+                let (a_off, a_mod, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
+                let (b_off, b_mod, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
+                b_acc
+                    .cmp(&a_acc) // Sort descending by access time
+                    .then_with(|| b_mod.cmp(&a_mod)) // Then by modified time
+                    .then_with(|| a_off.cmp(&b_off)) // Then by on-disk offset (ascending)
             });
             disk_candidates.truncate(disk_cap);
         }
@@ -693,12 +703,20 @@ impl Index {
 
         if results.len() > required_matches {
             results.select_nth_unstable_by(required_matches, |a, b| {
-                b.2.last_accessed.cmp(&a.2.last_accessed)
+                b.2.last_accessed
+                    .cmp(&a.2.last_accessed)
+                    .then_with(|| b.2.last_modified.cmp(&a.2.last_modified))
+                    .then_with(|| a.0.cmp(&b.0))
             });
             results.truncate(required_matches);
         }
 
-        results.sort_unstable_by(|a, b| b.2.last_accessed.cmp(&a.2.last_accessed));
+        results.sort_unstable_by(|a, b| {
+            b.2.last_accessed
+                .cmp(&a.2.last_accessed)
+                .then_with(|| b.2.last_modified.cmp(&a.2.last_modified))
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let paginated_results = results
             .into_iter()
