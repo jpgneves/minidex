@@ -25,6 +25,10 @@ pub struct ScoringWeights {
     pub token_coverage: f64,
     /// Exact token match (not just prefix match)
     pub exact_match: f64,
+    /// Token is the entire file or directory name
+    pub exact_filename_match: f64,
+    /// Token is the exact stem
+    pub exact_stem_match: f64,
     /// Query token matching in file name
     pub filename_match: f64,
     /// Filename prefix match
@@ -52,6 +56,8 @@ impl Default for ScoringWeights {
         Self {
             token_coverage: 30.0,
             exact_match: 10.0,
+            exact_filename_match: 100.0,
+            exact_stem_match: 70.0,
             filename_match: 15.0,
             filename_prefix_match: 50.0,
             path_prefix_match: 20.0,
@@ -98,6 +104,8 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
     for token in inputs.query_tokens {
         let t_str = token.as_str();
 
+        let mut is_exact_filename = false;
+        let mut is_exact_stem = false;
         let mut is_filename_start = false;
         let mut is_in_filename = false;
         let mut is_in_path = false;
@@ -119,7 +127,17 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
 
             if start_boundary {
                 if idx == file_name_start_idx {
-                    is_filename_start = true;
+                    let end_idx = idx + t_str.len();
+                    if end_idx <= trimmed_path.len() {
+                        let remainder = &trimmed_path[end_idx..];
+                        if remainder.is_empty() {
+                            is_exact_filename = true;
+                        } else if remainder.starts_with('.') {
+                            is_exact_stem = true;
+                        } else {
+                            is_filename_start = true;
+                        }
+                    }
                 } else if idx >= file_name_start_idx {
                     is_in_filename = true;
                 } else {
@@ -132,7 +150,11 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
             }
         }
 
-        if is_filename_start {
+        if is_exact_filename {
+            score += weights.exact_filename_match;
+        } else if is_exact_stem {
+            score += weights.exact_stem_match;
+        } else if is_filename_start {
             score += weights.filename_prefix_match;
         } else if is_in_filename {
             score += weights.filename_match;
