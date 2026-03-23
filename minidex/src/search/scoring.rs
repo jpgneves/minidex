@@ -84,18 +84,12 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         crate::tokenizer::fold_path(inputs.path)
     };
 
-    let file_name = std::path::Path::new(inputs.path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(inputs.path);
+    let trimmed_path = normalized.trim_end_matches(|c| c == std::path::MAIN_SEPARATOR);
 
-    let file_name_folded = if file_name.is_ascii() {
-        file_name.to_lowercase()
-    } else {
-        crate::tokenizer::fold_path(file_name)
-    };
-
-    let file_name_start_idx = normalized.len().saturating_sub(file_name_folded.len());
+    let file_name_start_idx = trimmed_path
+        .rfind(|c| c == std::path::MAIN_SEPARATOR)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let mut score = 0.0;
 
     let mut unique_matched_indices = Vec::new();
@@ -160,14 +154,15 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
     // Token coverage
     unique_matched_indices.sort_unstable();
     unique_matched_indices.dedup();
-    let path_word_count = normalized
+
+    let path_word_count = trimmed_path
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
         .count();
 
     if path_word_count > 0 {
-        let coverage_ratio =
-            (unique_matched_indices.len() as f64 / path_word_count as f64).min(1.0);
+        let effective_length = (path_word_count as f64).min(8.0);
+        let coverage_ratio = (unique_matched_indices.len() as f64 / effective_length).min(1.0);
         score += weights.token_coverage * coverage_ratio;
     }
 
