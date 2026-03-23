@@ -84,10 +84,10 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         crate::tokenizer::fold_path(inputs.path)
     };
 
-    let trimmed_path = normalized.trim_end_matches(|c| c == std::path::MAIN_SEPARATOR);
+    let trimmed_path = normalized.trim_end_matches(std::path::MAIN_SEPARATOR);
 
     let file_name_start_idx = trimmed_path
-        .rfind(|c| c == std::path::MAIN_SEPARATOR)
+        .rfind(std::path::MAIN_SEPARATOR)
         .map(|i| i + 1)
         .unwrap_or(0);
     let mut score = 0.0;
