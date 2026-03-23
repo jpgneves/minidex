@@ -18,6 +18,12 @@ use std::{
     time::Duration,
 };
 
+#[derive(PartialEq)]
+enum InputMode {
+    Search,
+    Target,
+}
+
 struct App {
     index: Arc<Index>,
     input: String,
@@ -26,11 +32,15 @@ struct App {
     list_state: ListState,
     indexing: Arc<AtomicBool>,
     indexed_count: Arc<AtomicU64>,
+    index_target: String,
+    target_cursor_position: usize,
+    input_mode: InputMode,
 }
 
 impl App {
-    fn new(index_path: &str) -> Result<Self> {
+    fn new(index_path: &str, index_target: String) -> Result<Self> {
         let index = Arc::new(Index::open(index_path)?);
+        let target_len = index_target.len();
         let mut app = App {
             index,
             input: String::new(),
@@ -39,39 +49,84 @@ impl App {
             list_state: ListState::default(),
             indexing: Arc::new(AtomicBool::new(false)),
             indexed_count: Arc::new(AtomicU64::new(0)),
+            index_target,
+            target_cursor_position: target_len,
+            input_mode: InputMode::Search,
         };
         app.update_search();
         Ok(app)
     }
 
     fn move_cursor_left(&mut self) {
-        let cursor_moved_left = self.cursor_position.saturating_sub(1);
-        self.cursor_position = self.clamp_cursor(cursor_moved_left);
-    }
-
-    fn move_cursor_right(&mut self) {
-        let cursor_moved_right = self.cursor_position.saturating_add(1);
-        self.cursor_position = self.clamp_cursor(cursor_moved_right);
-    }
-
-    fn enter_char(&mut self, new_char: char) {
-        self.input.insert(self.cursor_position, new_char);
-        self.move_cursor_right();
-        self.update_search();
-    }
-
-    fn delete_char(&mut self) {
-        if self.cursor_position != 0 {
-            let left_to_left = self.input.chars().take(self.cursor_position - 1);
-            let right_to_left = self.input.chars().skip(self.cursor_position);
-            self.input = left_to_left.chain(right_to_left).collect();
-            self.move_cursor_left();
-            self.update_search();
+        match self.input_mode {
+            InputMode::Search => {
+                let cursor_moved_left = self.cursor_position.saturating_sub(1);
+                self.cursor_position = self.clamp_cursor(cursor_moved_left, self.input.len());
+            }
+            InputMode::Target => {
+                let cursor_moved_left = self.target_cursor_position.saturating_sub(1);
+                self.target_cursor_position =
+                    self.clamp_cursor(cursor_moved_left, self.index_target.len());
+            }
         }
     }
 
-    fn clamp_cursor(&self, new_cursor_pos: usize) -> usize {
-        new_cursor_pos.clamp(0, self.input.len())
+    fn move_cursor_right(&mut self) {
+        match self.input_mode {
+            InputMode::Search => {
+                let cursor_moved_right = self.cursor_position.saturating_add(1);
+                self.cursor_position = self.clamp_cursor(cursor_moved_right, self.input.len());
+            }
+            InputMode::Target => {
+                let cursor_moved_right = self.target_cursor_position.saturating_add(1);
+                self.target_cursor_position =
+                    self.clamp_cursor(cursor_moved_right, self.index_target.len());
+            }
+        }
+    }
+
+    fn enter_char(&mut self, new_char: char) {
+        match self.input_mode {
+            InputMode::Search => {
+                self.input.insert(self.cursor_position, new_char);
+                self.move_cursor_right();
+                self.update_search();
+            }
+            InputMode::Target => {
+                self.index_target
+                    .insert(self.target_cursor_position, new_char);
+                self.move_cursor_right();
+            }
+        }
+    }
+
+    fn delete_char(&mut self) {
+        match self.input_mode {
+            InputMode::Search => {
+                if self.cursor_position != 0 {
+                    let left_to_left = self.input.chars().take(self.cursor_position - 1);
+                    let right_to_left = self.input.chars().skip(self.cursor_position);
+                    self.input = left_to_left.chain(right_to_left).collect();
+                    self.move_cursor_left();
+                    self.update_search();
+                }
+            }
+            InputMode::Target => {
+                if self.target_cursor_position != 0 {
+                    let left_to_left = self
+                        .index_target
+                        .chars()
+                        .take(self.target_cursor_position - 1);
+                    let right_to_left = self.index_target.chars().skip(self.target_cursor_position);
+                    self.index_target = left_to_left.chain(right_to_left).collect();
+                    self.move_cursor_left();
+                }
+            }
+        }
+    }
+
+    fn clamp_cursor(&self, new_cursor_pos: usize, max_len: usize) -> usize {
+        new_cursor_pos.clamp(0, max_len)
     }
 
     fn update_search(&mut self) {
@@ -280,8 +335,12 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "index".to_string());
 
+    let target_dir = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+
     let mut terminal = ratatui::init();
-    let app_result = App::new(&index_path).map(|app| run_app(&mut terminal, app));
+    let app_result = App::new(&index_path, target_dir).map(|app| run_app(&mut terminal, app));
     ratatui::restore();
 
     match app_result {
@@ -302,11 +361,16 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) => return Ok(()),
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
+                (KeyCode::Tab, _) => {
+                    app.input_mode = match app.input_mode {
+                        InputMode::Search => InputMode::Target,
+                        InputMode::Target => InputMode::Search,
+                    };
+                }
                 (KeyCode::Char('i'), KeyModifiers::CONTROL)
-                | (KeyCode::Char('r'), KeyModifiers::CONTROL)
-                | (KeyCode::Tab, _) => {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    app.start_indexing(home);
+                | (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    let target = app.index_target.clone();
+                    app.start_indexing(target);
                 }
                 (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
                     app.compact();
@@ -341,20 +405,52 @@ fn ui(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(f.area());
 
+    let (search_color, target_color) = match app.input_mode {
+        InputMode::Search => (Color::Yellow, Color::DarkGray),
+        InputMode::Target => (Color::DarkGray, Color::Yellow),
+    };
+
+    let search_title = match app.input_mode {
+        InputMode::Search => "Search (Active)",
+        InputMode::Target => "Search",
+    };
+
+    let target_title = match app.input_mode {
+        InputMode::Search => "Target Directory",
+        InputMode::Target => "Target Directory (Active)",
+    };
+
     let input = Paragraph::new(app.input.as_str())
-        .style(Style::default().fg(Color::Yellow))
-        .block(Block::default().borders(Borders::ALL).title("Search"));
+        .style(Style::default().fg(search_color))
+        .block(Block::default().borders(Borders::ALL).title(search_title));
     f.render_widget(input, chunks[0]);
 
-    let cursor_x = chunks[0].x + app.cursor_position as u16 + 1;
-    let cursor_y = chunks[0].y + 1;
-    if cursor_x < chunks[0].x + chunks[0].width - 1 {
-        f.set_cursor_position((cursor_x, cursor_y));
+    let target = Paragraph::new(app.index_target.as_str())
+        .style(Style::default().fg(target_color))
+        .block(Block::default().borders(Borders::ALL).title(target_title));
+    f.render_widget(target, chunks[1]);
+
+    match app.input_mode {
+        InputMode::Search => {
+            let cursor_x = chunks[0].x + app.cursor_position as u16 + 1;
+            let cursor_y = chunks[0].y + 1;
+            if cursor_x < chunks[0].x + chunks[0].width - 1 {
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
+        InputMode::Target => {
+            let cursor_x = chunks[1].x + app.target_cursor_position as u16 + 1;
+            let cursor_y = chunks[1].y + 1;
+            if cursor_x < chunks[1].x + chunks[1].width - 1 {
+                f.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
     }
 
     let results: Vec<ListItem> = app
@@ -385,6 +481,15 @@ fn ui(f: &mut Frame, app: &mut App) {
                 _ => "OTH ",
             };
 
+            let modified =
+                chrono::DateTime::from_timestamp((res.last_modified / 1_000_000) as i64, 0)
+                    .map(|dt| dt.format("%y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+            let accessed =
+                chrono::DateTime::from_timestamp((res.last_accessed / 1_000_000) as i64, 0)
+                    .map(|dt| dt.format("%y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+
             let content = Line::from(vec![
                 Span::styled(
                     format!("{: <5} ", kind_str),
@@ -395,6 +500,10 @@ fn ui(f: &mut Frame, app: &mut App) {
                     Style::default().fg(Color::Magenta),
                 ),
                 Span::styled(format!("[{:>5.1}] ", res.score), score_style),
+                Span::styled(
+                    format!("M:{} A:{} ", modified, accessed),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(res.path.to_string_lossy()),
             ]);
             ListItem::new(content)
@@ -416,7 +525,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         )
         .highlight_symbol(">> ");
 
-    f.render_stateful_widget(results_list, chunks[1], &mut app.list_state);
+    f.render_stateful_widget(results_list, chunks[2], &mut app.list_state);
 
     let current_selection = if let Some(i) = app.list_state.selected() {
         format!("{} / {}", i + 1, app.results.len())
@@ -434,9 +543,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     };
 
     let help_message = Paragraph::new(Line::from(vec![
-        Span::raw("Esc: quit | ↑/↓: navigate | Enter: select | "),
+        Span::raw("Esc: quit | ↑/↓: navigate | Enter: select | Tab: switch focus | "),
         Span::styled(
-            "Tab/Ctrl+R: index $HOME | ",
+            "Ctrl+R/I: index target | ",
             Style::default().fg(Color::Magenta),
         ),
         Span::styled(
@@ -447,5 +556,5 @@ fn ui(f: &mut Frame, app: &mut App) {
         Span::raw(" | "),
         Span::styled(current_selection, Style::default().fg(Color::Green)),
     ]));
-    f.render_widget(help_message, chunks[2]);
+    f.render_widget(help_message, chunks[3]);
 }
