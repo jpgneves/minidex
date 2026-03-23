@@ -683,9 +683,15 @@ impl Index {
                     .then_with(|| b_mod.cmp(&a_mod)) // Then by modified time
                     .then_with(|| {
                         // Then we compare path strings to keep sorting stable
-                        let a_path = a.0.read_document(a_off).map(|(p, _, _)| p).unwrap_or("");
-                        let b_path = b.0.read_document(b_off).map(|(p, _, _)| p).unwrap_or("");
-                        a_path.cmp(b_path);
+                        let a_path =
+                            a.0.read_document(a_off)
+                                .map(|(p, _, _)| p)
+                                .unwrap_or("".to_owned());
+                        let b_path =
+                            b.0.read_document(b_off)
+                                .map(|(p, _, _)| p)
+                                .unwrap_or("".to_owned());
+                        a_path.cmp(&b_path)
                     })
             });
             disk_candidates.truncate(disk_cap);
