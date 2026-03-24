@@ -62,7 +62,7 @@ pub fn tokenize(input: &str) -> Vec<String> {
     };
 
     // Extract the filename as a token if it contains an extension
-    if file_name.contains('.') {
+    if file_name.contains('.') && file_name.starts_with(char::is_alphanumeric) {
         if file_name.is_ascii() {
             tokens.push(file_name.to_ascii_lowercase());
         } else {

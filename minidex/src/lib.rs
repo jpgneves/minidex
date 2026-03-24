@@ -286,10 +286,7 @@ impl Index {
         }
 
         let query_lower = query.to_lowercase();
-        let raw_query_tokens: Vec<&str> = query_lower
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let raw_query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 

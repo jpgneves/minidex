@@ -152,8 +152,20 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         }
 
         // Extension Penalty
-        if inputs.query_tokens.len() == 1 && normalized.ends_with(&format!(".{}", t_str)) {
-            token_best *= weights.penalty_extension;
+        let ext_str = format!(".{}", t_str);
+        if normalized.ends_with(&ext_str) {
+            // Did the user explicitly type the dot? (e.g. ".pdf" or "*.pdf")
+            let explicit_ext = inputs
+                .raw_query_tokens
+                .iter()
+                .any(|&r| r.ends_with(&ext_str));
+
+            if explicit_ext {
+                token_best = token_best.max(weights.base_exact_stem);
+                exact_filename_hit = true; // We bypass the Token Coverage Depth
+            } else if inputs.query_tokens.len() == 1 {
+                token_best *= weights.penalty_extension;
+            }
         }
 
         best_match_quality += token_best;
