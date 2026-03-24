@@ -52,6 +52,28 @@ pub fn tokenize(input: &str) -> Vec<String> {
 
     push_token(&mut tokens, &mut current);
 
+    // Pre-process the (potential) path
+    let trimmed = input.trim_end_matches(std::path::MAIN_SEPARATOR);
+
+    // Find the last slash
+    let file_name = match trimmed.rfind(std::path::MAIN_SEPARATOR) {
+        Some(idx) => &trimmed[idx + 1..],
+        None => trimmed,
+    };
+
+    // Extract the filename as a token if it contains an extension
+    if file_name.contains('.') {
+        if file_name.is_ascii() {
+            tokens.push(file_name.to_ascii_lowercase());
+        } else {
+            let folded: String = file_name
+                .nfd()
+                .filter(|ch| !is_combining_mark(*ch))
+                .collect();
+            tokens.push(folded.to_lowercase());
+        }
+    }
+
     tokens.sort_unstable();
     tokens.dedup();
 

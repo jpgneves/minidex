@@ -35,6 +35,8 @@ pub struct ScoringWeights {
     pub filename_prefix_match: f64,
     /// Boost token appearing before in path
     pub path_prefix_match: f64,
+    /// Penalty for single-word tokens that match an extension
+    pub extension_penalty: f64,
     /// Penalty for token appearing in middle of word rather than prefix
     pub midword_penalty: f64,
     /// Maximum recency boost (decays logarithmically)
@@ -61,6 +63,7 @@ impl Default for ScoringWeights {
             filename_match: 15.0,
             filename_prefix_match: 50.0,
             path_prefix_match: 20.0,
+            extension_penalty: 30.0,
             midword_penalty: 30.0,
             recency_boost: 10.0,
             recency_decay: 2.0,
@@ -156,10 +159,10 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
             score += weights.exact_stem_match;
         } else if is_filename_start {
             score += weights.filename_prefix_match;
-        } else if is_in_filename {
-            score += weights.filename_match;
         } else if is_in_path {
             score += weights.path_prefix_match;
+        } else if is_in_filename {
+            score += weights.filename_match;
         } else if has_any_match {
             score -= weights.midword_penalty;
         }
@@ -168,9 +171,27 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
             score += weights.exact_match;
         }
 
-        if normalized.ends_with(&format!(".{}", t_str)) {
-            score -= 30.0;
+        if inputs.query_tokens.len() == 1 && normalized.ends_with(&format!(".{}", t_str)) {
+            score -= weights.extension_penalty;
         }
+    }
+
+    let filename_str = &trimmed_path[file_name_start_idx..];
+
+    // Create zero-allocation iterators over just the alphanumeric characters
+    let mut query_chars = inputs.query_tokens.iter().flat_map(|t| t.chars());
+    let mut file_name_chars = filename_str.chars().filter(|c| c.is_alphanumeric());
+
+    // Zip them together to see if the tokens perfectly construct the filename!
+    let is_exact_full_match = query_chars
+        .by_ref()
+        .zip(file_name_chars.by_ref())
+        .all(|(a, b)| a == b)
+        && query_chars.next().is_none()
+        && file_name_chars.next().is_none();
+
+    if is_exact_full_match {
+        score += weights.exact_filename_match;
     }
 
     // Token coverage

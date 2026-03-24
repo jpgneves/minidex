@@ -748,11 +748,8 @@ impl Index {
         Ok(paginated_results)
     }
 
-    /// Force index compaction, minimizing the amount of disk space
-    /// utilized by the index.
-    /// NOTE: this operation is very IO intensive and can take some time
-    pub fn force_compact_all(&self) -> Result<(), IndexError> {
-        // Force all data to be flushed before proceeding
+    /// Flush the index to disk without performing any additional compaction
+    pub fn flush(&self) -> Result<(), IndexError> {
         loop {
             if let Ok(mut flusher) = self.flusher.write()
                 && let Some(handle) = flusher.take()
@@ -767,11 +764,19 @@ impl Index {
                 .map_err(|_| IndexError::ReadLock)?
                 .is_empty()
             {
-                break;
+                break Ok(());
             }
 
             self.trigger_flush()?;
         }
+    }
+
+    /// Force index compaction, minimizing the amount of disk space
+    /// utilized by the index.
+    /// NOTE: this operation is very IO intensive and can take some time
+    pub fn force_compact_all(&self) -> Result<(), IndexError> {
+        // Force all data to be flushed before proceeding
+        self.flush()?;
 
         if let Ok(mut compactor) = self.compactor.write()
             && let Some(handle) = compactor.take()
