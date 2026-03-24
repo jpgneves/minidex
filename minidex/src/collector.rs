@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use crate::{common::is_tombstoned, entry::IndexEntry};
 
 pub(crate) struct LsmCollector<'a> {
-    candidates: HashMap<String, (String, IndexEntry)>,
+    candidates: HashMap<Cow<'a, str>, (Cow<'a, str>, IndexEntry)>,
     active_tombstones: &'a [(Option<String>, String, u64)],
 }
 
@@ -16,10 +16,16 @@ impl<'a> LsmCollector<'a> {
     }
 
     #[inline]
-    pub(crate) fn insert(&mut self, path: String, volume: String, entry: IndexEntry) {
+    pub(crate) fn insert<P, V>(&mut self, path: P, volume: V, entry: IndexEntry)
+    where
+        P: Into<Cow<'a, str>>,
+        V: Into<Cow<'a, str>>,
+    {
+        let path_cow = path.into();
+        let volume_cow = volume.into();
         if is_tombstoned(
-            &volume,
-            path.as_bytes(),
+            &volume_cow,
+            path_cow.as_bytes(),
             entry.opstamp.sequence(),
             self.active_tombstones,
         ) {
@@ -27,18 +33,18 @@ impl<'a> LsmCollector<'a> {
         }
 
         self.candidates
-            .entry(path)
+            .entry(path_cow)
             .and_modify(|(current_volume, current_entry)| {
                 if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
                     *current_entry = entry;
-                    *current_volume = volume.clone();
+                    *current_volume = volume_cow.clone();
                 }
             })
-            .or_insert((volume, entry));
+            .or_insert((volume_cow, entry));
     }
 
     #[inline]
-    pub(crate) fn finish(self) -> impl Iterator<Item = (String, String, IndexEntry)> {
+    pub(crate) fn finish(self) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>, IndexEntry)> {
         self.candidates
             .into_iter()
             .filter(|(_, (_, entry))| !entry.opstamp.is_deletion())
@@ -141,7 +147,7 @@ mod tests {
 
         let results: Vec<_> = collector.finish().collect();
         assert_eq!(results.len(), 2);
-        let mut paths: Vec<_> = results.iter().map(|(p, _, _)| p.as_str()).collect();
+        let mut paths: Vec<_> = results.iter().map(|(p, _, _)| p.as_ref()).collect();
         paths.sort();
 
         let mut expected = vec![format!("{}foo{}baz", sep, sep), format!("{}other", sep)];

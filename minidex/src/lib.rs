@@ -370,7 +370,7 @@ impl Index {
             };
 
             if matches_all {
-                collector.insert(path.to_string(), volume.clone(), *entry);
+                collector.insert(path.as_str(), volume.as_str(), *entry);
             }
         }
 
@@ -572,8 +572,8 @@ impl Index {
                 let score = (config.scoring_fn)(&weights, &inputs);
 
                 SearchResult {
-                    path: PathBuf::from(path),
-                    volume,
+                    path: PathBuf::from(path.as_ref()),
+                    volume: volume.into_owned(),
                     volume_type: entry.volume_type,
                     kind: entry.kind,
                     last_modified: entry.last_modified,
@@ -632,7 +632,7 @@ impl Index {
                 if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
                     continue;
                 }
-                collector.insert(path.clone(), volume.clone(), *entry);
+                collector.insert(path.as_str(), volume.as_str(), *entry);
             }
         }
 
@@ -734,8 +734,8 @@ impl Index {
             .skip(offset)
             .take(limit)
             .map(|(path, volume, entry)| SearchResult {
-                path: PathBuf::from(path),
-                volume,
+                path: PathBuf::from(path.as_ref()),
+                volume: volume.into_owned(),
                 volume_type: entry.volume_type,
                 kind: entry.kind,
                 last_modified: entry.last_modified,
