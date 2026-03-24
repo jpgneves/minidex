@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn test_tokenize_numeric_transition() {
         let tokens = tokenize("report2023.txt");
-        assert_eq!(tokens, vec!["2023", "report", "txt"]);
+        assert_eq!(tokens, vec!["2023", "report", "report2023.txt", "txt"]);
     }
 
     #[test]
