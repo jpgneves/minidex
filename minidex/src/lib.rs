@@ -8,7 +8,6 @@ use std::{
     thread::JoinHandle,
 };
 
-use common::is_tombstoned;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
 use memtable::MemTable;
@@ -16,6 +15,7 @@ use thiserror::Error;
 
 mod collector;
 mod common;
+use common::is_tombstoned;
 mod leb128;
 use collector::*;
 pub use common::{Kind, VolumeType, category};
@@ -370,6 +370,8 @@ impl Index {
         }
 
         if let Some(candidates) = mem_candidates {
+            let mut mem_sortable = Vec::with_capacity(candidates.len());
+
             for id in candidates {
                 if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
                     if let Some(filter) = options.volume_name
@@ -394,8 +396,30 @@ impl Index {
                         continue;
                     }
 
-                    collector.insert(path.as_str(), volume.as_str(), *entry);
+                    let depth = path
+                        .bytes()
+                        .filter(|&b| b == std::path::MAIN_SEPARATOR as u8)
+                        .count() as u64;
+                    let is_dir = if entry.kind == Kind::Directory { 1 } else { 0 };
+                    let recent = if entry.last_modified > entry.last_accessed {
+                        entry.last_modified
+                    } else {
+                        entry.last_accessed
+                    };
+
+                    let sort_key = (is_dir << 63) | (((!depth) & 0xFF) << 55) | (recent << 21);
+                    mem_sortable.push((sort_key, path, volume, entry));
                 }
+            }
+
+            // Top-K truncation in memory
+            if mem_sortable.len() > scoring_cap {
+                mem_sortable.select_nth_unstable_by(scoring_cap, |a, b| b.0.cmp(&a.0));
+                mem_sortable.truncate(scoring_cap);
+            }
+
+            for (_, path, volume, entry) in mem_sortable {
+                collector.insert(path.as_str(), volume.as_str(), *entry);
             }
         }
 

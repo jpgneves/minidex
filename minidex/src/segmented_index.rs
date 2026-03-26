@@ -136,10 +136,11 @@ impl Segment {
     }
 
     /// Reads document data for the given offset.
-    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
+    pub(crate) fn read_document(&self, offset: u64) -> Option<(&str, &str, IndexEntry)> {
         let cursor = offset as usize;
         let data = self.data.as_ref().expect("expected data to be loaded");
-        Self::parse_document_at(data, cursor).map(|(path, volume, entry, _)| (path, volume, entry))
+        Self::parse_document_borrowed(data, cursor)
+            .map(|(path, volume, entry, _)| (path, volume, entry))
     }
 
     pub(crate) fn meta_map(&self) -> &Mmap {
@@ -164,10 +165,10 @@ impl Segment {
         Ok(())
     }
 
-    fn parse_document_at(
+    fn parse_document_borrowed(
         data: &[u8],
         mut cursor: usize,
-    ) -> Option<(String, String, IndexEntry, usize)> {
+    ) -> Option<(&str, &str, IndexEntry, usize)> {
         let data_len = data.len();
 
         if cursor + size_of::<u32>() > data_len {
@@ -181,9 +182,7 @@ impl Segment {
         if cursor + path_len > data_len {
             return None;
         }
-        let path_str = std::str::from_utf8(&data[cursor..cursor + path_len])
-            .ok()?
-            .to_string();
+        let path_str = std::str::from_utf8(&data[cursor..cursor + path_len]).ok()?;
         cursor += path_len;
 
         if cursor + size_of::<u32>() > data_len {
@@ -197,9 +196,8 @@ impl Segment {
         if cursor + volume_len > data_len {
             return None;
         }
-        let volume_str = std::str::from_utf8(&data[cursor..cursor + volume_len])
-            .ok()?
-            .to_string();
+        let volume_str = std::str::from_utf8(&data[cursor..cursor + volume_len]).ok()?;
+
         cursor += volume_len;
 
         if cursor + IndexEntry::SIZE > data_len {
@@ -209,6 +207,15 @@ impl Segment {
         cursor += IndexEntry::SIZE;
 
         Some((path_str, volume_str, entry, cursor))
+    }
+
+    fn parse_document_owned(
+        data: &[u8],
+        cursor: usize,
+    ) -> Option<(String, String, IndexEntry, usize)> {
+        Self::parse_document_borrowed(data, cursor).map(|(path, volume, entry, cursor)| {
+            (path.to_owned(), volume.to_owned(), entry, cursor)
+        })
     }
 }
 
@@ -585,7 +592,8 @@ impl Iterator for DocumentIterator<'_> {
     type Item = (String, String, IndexEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (path, volume, entry, new_cursor) = Segment::parse_document_at(self.data, self.cursor)?;
+        let (path, volume, entry, new_cursor) =
+            Segment::parse_document_owned(self.data, self.cursor)?;
         self.cursor = new_cursor;
 
         Some((path, volume, entry))
