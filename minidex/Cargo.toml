@@ -6,6 +6,9 @@ edition = "2024"
 license.workspace = true
 authors.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 fst = "0.4.7"
 fs4 = "0.13"
