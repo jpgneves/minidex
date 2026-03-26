@@ -688,8 +688,8 @@ impl Index {
 
         if disk_candidates.len() > disk_cap {
             disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                let (a_off, a_mod, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
-                let (b_off, b_mod, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
+                let (_, a_mod, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
+                let (_, b_mod, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
                 b_acc
                     .cmp(&a_acc) // Sort descending by access time
                     .then_with(|| b_mod.cmp(&a_mod)) // Then by modified time

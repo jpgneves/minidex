@@ -89,19 +89,23 @@ pub struct ScoringInputs<'a> {
 }
 
 pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) -> f64 {
-    let normalized = if inputs.path.is_ascii() {
-        inputs.path.to_lowercase()
+    let is_ascii = inputs.path.is_ascii();
+
+    // We only allocate a String if the path contains Unicode.
+    let unicode_fallback = if !is_ascii {
+        Some(crate::tokenizer::fold_path(inputs.path))
     } else {
-        crate::tokenizer::fold_path(inputs.path)
+        None
     };
 
-    let trimmed_path = normalized.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let search_target = unicode_fallback.as_deref().unwrap_or(inputs.path);
+    let trimmed_path = search_target.trim_end_matches(std::path::MAIN_SEPARATOR);
+
     let file_name_start_idx = trimmed_path
         .rfind(std::path::MAIN_SEPARATOR)
         .map(|i| i + 1)
         .unwrap_or(0);
 
-    // base scoring
     let mut best_match_quality = 0.0;
     let mut exact_filename_hit = false;
     let mut unique_matched_indices = Vec::new();
@@ -110,59 +114,97 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         let t_str = token.as_str();
         let mut token_best: f64 = 0.0;
 
-        for (idx, _) in normalized.match_indices(t_str) {
-            unique_matched_indices.push(idx);
+        let n_len = t_str.len();
+        let h_bytes = trimmed_path.as_bytes();
+        let n_bytes = t_str.as_bytes();
 
-            let start_boundary =
-                idx == 0 || !normalized[..idx].chars().last().unwrap().is_alphanumeric();
-            let match_val;
-
-            if start_boundary {
-                if idx == file_name_start_idx {
-                    let end_idx = idx + t_str.len();
-                    if end_idx <= trimmed_path.len() {
-                        let remainder = &trimmed_path[end_idx..];
-                        if remainder.is_empty() {
-                            match_val = weights.base_exact_filename;
-                            exact_filename_hit = true;
-                        } else if remainder.starts_with('.') {
-                            match_val = weights.base_exact_stem;
-                        } else {
-                            match_val = weights.base_filename_prefix;
-                        }
-                    } else {
-                        match_val = weights.base_in_filename;
-                    }
-                } else if idx >= file_name_start_idx {
-                    match_val = weights.base_in_filename;
-                } else {
-                    match_val = weights.base_in_path;
-                }
+        let mut current_idx = 0;
+        while current_idx + n_len <= h_bytes.len() {
+            let matches = if is_ascii {
+                h_bytes[current_idx..current_idx + n_len].eq_ignore_ascii_case(n_bytes)
             } else {
-                // Midword match penalty
-                let base = if idx >= file_name_start_idx {
-                    weights.base_in_filename
-                } else {
-                    weights.base_in_path
-                };
-                match_val = base * weights.penalty_midword;
-            }
+                search_target[current_idx..].starts_with(t_str)
+            };
 
-            token_best = token_best.max(match_val);
+            if matches {
+                let idx = current_idx;
+                unique_matched_indices.push(idx);
+
+                let start_boundary = if idx == 0 {
+                    true
+                } else if is_ascii {
+                    !h_bytes[idx - 1].is_ascii_alphanumeric()
+                } else {
+                    !search_target[..idx]
+                        .chars()
+                        .last()
+                        .unwrap()
+                        .is_alphanumeric()
+                };
+
+                let match_val;
+                if start_boundary {
+                    if idx == file_name_start_idx {
+                        let end_idx = idx + n_len;
+                        if end_idx <= trimmed_path.len() {
+                            let remainder = &trimmed_path[end_idx..];
+                            if remainder.is_empty() {
+                                match_val = weights.base_exact_filename;
+                                exact_filename_hit = true;
+                            } else if remainder.starts_with('.') {
+                                match_val = weights.base_exact_stem;
+                            } else {
+                                match_val = weights.base_filename_prefix;
+                            }
+                        } else {
+                            match_val = weights.base_in_filename;
+                        }
+                    } else if idx >= file_name_start_idx {
+                        match_val = weights.base_in_filename;
+                    } else {
+                        match_val = weights.base_in_path;
+                    }
+                } else {
+                    let base = if idx >= file_name_start_idx {
+                        weights.base_in_filename
+                    } else {
+                        weights.base_in_path
+                    };
+                    match_val = base * weights.penalty_midword;
+                }
+
+                token_best = token_best.max(match_val);
+                current_idx += 1;
+            } else {
+                if is_ascii {
+                    current_idx += 1;
+                } else {
+                    current_idx += search_target[current_idx..]
+                        .chars()
+                        .next()
+                        .unwrap()
+                        .len_utf8();
+                }
+            }
         }
 
         // Extension Penalty
-        let ext_str = format!(".{}", t_str);
-        if normalized.ends_with(&ext_str) {
-            // Did the user explicitly type the dot? (e.g. ".pdf" or "*.pdf")
-            let explicit_ext = inputs
-                .raw_query_tokens
-                .iter()
-                .any(|&r| r.ends_with(&ext_str));
+        let ends_with_ext = if is_ascii {
+            h_bytes.len() > n_len
+                && h_bytes[h_bytes.len() - n_len - 1] == b'.'
+                && h_bytes[h_bytes.len() - n_len..].eq_ignore_ascii_case(n_bytes)
+        } else {
+            let ext_str = format!(".{}", t_str);
+            search_target.ends_with(&ext_str)
+        };
 
+        if ends_with_ext {
+            let explicit_ext = inputs.raw_query_tokens.iter().any(|&r| {
+                r.len() > n_len && r.ends_with(t_str) && r.as_bytes()[r.len() - n_len - 1] == b'.'
+            });
             if explicit_ext {
                 token_best = token_best.max(weights.base_exact_stem);
-                exact_filename_hit = true; // We bypass the Token Coverage Depth
+                exact_filename_hit = true;
             } else if inputs.query_tokens.len() == 1 {
                 token_best *= weights.penalty_extension;
             }
@@ -177,10 +219,12 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         best_match_quality / inputs.query_tokens.len() as f64
     };
 
-    // exact multi-token overrides
     let filename_str = &trimmed_path[file_name_start_idx..];
     let mut query_chars = inputs.query_tokens.iter().flat_map(|t| t.chars());
-    let mut file_name_chars = filename_str.chars().filter(|c| c.is_alphanumeric());
+    let mut file_name_chars = filename_str
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase());
 
     if query_chars
         .by_ref()
@@ -193,10 +237,8 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         exact_filename_hit = true;
     }
 
-    // Apply multipliers
     let mut final_score = base_text_score * 100.0;
 
-    // Token Coverage Multiplier
     if !exact_filename_hit {
         unique_matched_indices.sort_unstable();
         unique_matched_indices.dedup();
@@ -213,24 +255,39 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         }
     }
 
-    // Recency Multiplier
     let recent_date = inputs.last_modified.max(inputs.last_accessed);
     let age_days = (inputs.now_micros - recent_date as f64) / (1_000_000.0 * 86_400.0);
     let recency_bonus = weights.mult_recency_max - 1.0;
     let recency_multiplier = 1.0
         + (recency_bonus
             * std::f64::consts::E.powf(-weights.recency_decay_rate * age_days.max(0.0)));
-
     final_score *= recency_multiplier;
 
-    // Kind Multiplier
     final_score *= match inputs.kind {
-        Kind::Directory => weights.mult_dir,
-        Kind::File => weights.mult_file,
-        Kind::Symlink => weights.mult_file * 0.9,
+        crate::Kind::Directory => weights.mult_dir,
+        crate::Kind::File => weights.mult_file,
+        crate::Kind::Symlink => weights.mult_file * 0.9,
     };
 
-    // Proximity & Ordering
+    // Fast proximity closure
+    let find_ignore_case = |haystack: &str, needle: &str| -> Option<usize> {
+        if is_ascii {
+            let h = haystack.as_bytes();
+            let n = needle.as_bytes();
+            if n.is_empty() || h.len() < n.len() {
+                return None;
+            }
+            for i in 0..=(h.len() - n.len()) {
+                if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                    return Some(i);
+                }
+            }
+            None
+        } else {
+            haystack.find(needle)
+        }
+    };
+
     if inputs.query_tokens.len() > 1 {
         let mut min_pos = usize::MAX;
         let mut max_pos = 0;
@@ -238,7 +295,7 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         let mut matched_count = 0;
 
         for q in inputs.query_tokens {
-            if let Some(pos) = normalized.find(q.as_str()) {
+            if let Some(pos) = find_ignore_case(search_target, q.as_str()) {
                 min_pos = min_pos.min(pos);
                 max_pos = max_pos.max(pos + q.len());
                 total_token_len += q.len();
@@ -258,7 +315,7 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
         let mut last_pos = 0;
         let mut is_ordered = true;
         for raw_token in inputs.raw_query_tokens {
-            if let Some(pos) = normalized[last_pos..].find(raw_token) {
+            if let Some(pos) = find_ignore_case(&search_target[last_pos..], raw_token) {
                 last_pos += pos + raw_token.len();
             } else {
                 is_ordered = false;
