@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     ops::Bound,
     path::{Path, PathBuf},
     sync::{
@@ -309,24 +308,55 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        let mut mem_candidates: Option<HashSet<u32>> = None;
+        let mut mem_candidates: Option<Vec<u32>> = None;
 
         // In-memory searches
         if !tokens.is_empty() {
             for token in &tokens {
-                let mut current_token_ids = HashSet::new();
-                let end_bound = format!("{}\u{FFFF}", token);
+                let mut end_bound = String::with_capacity(token.len() + 4);
+                end_bound.push_str(token);
+                end_bound.push('\u{FFFF}');
 
-                for (_, ids) in mem.inverted_index.range::<str, _>((
-                    Bound::Included(token.as_str()),
-                    Bound::Included(end_bound.as_str()),
-                )) {
-                    current_token_ids.extend(ids);
+                let matching_arrays: Vec<&Vec<u32>> = mem
+                    .inverted_index
+                    .range::<str, _>((
+                        Bound::Included(token.as_str()),
+                        Bound::Included(end_bound.as_str()),
+                    ))
+                    .map(|(_, ids)| ids)
+                    .collect();
+
+                if matching_arrays.is_empty() {
+                    mem_candidates = Some(Vec::new());
+                    break;
                 }
 
+                let current_token_ids = if matching_arrays.len() == 1 {
+                    std::borrow::Cow::Borrowed(matching_arrays[0])
+                } else {
+                    let mut merged = Vec::new();
+                    for ids in matching_arrays {
+                        merged.extend_from_slice(ids);
+                    }
+                    merged.sort_unstable();
+                    merged.dedup();
+                    std::borrow::Cow::Owned(merged)
+                };
+
                 match mem_candidates.as_mut() {
-                    Some(existing) => existing.retain(|id| current_token_ids.contains(id)),
-                    None => mem_candidates = Some(current_token_ids),
+                    // Two point merge in the RAM path
+                    Some(existing) => {
+                        let mut j = 0;
+                        let t_len = current_token_ids.len();
+
+                        existing.retain(|&id| {
+                            while j < t_len && current_token_ids[j] < id {
+                                j += 1;
+                            }
+                            j < t_len && current_token_ids[j] == id
+                        });
+                    }
+                    None => mem_candidates = Some(current_token_ids.into_owned()),
                 }
 
                 if let Some(c) = &mem_candidates
@@ -372,7 +402,6 @@ impl Index {
         // Disk searches
         let mut token_docs = Vec::new();
         let mut current_matches = Vec::new();
-        let mut swap_buffer = Vec::new();
 
         let vol_token = options
             .volume_name
@@ -419,40 +448,21 @@ impl Index {
                     std::mem::swap(&mut current_matches, &mut token_docs);
                     first_token = false;
                 } else {
+                    // O(N+M) Two-Pointer traversal
+                    let mut j = 0;
                     let t_len = token_docs.len();
-                    let c_len = current_matches.len();
-
-                    if c_len * 10 < t_len || t_len * 10 < c_len {
-                        if c_len > t_len {
-                            // current_matches is massive, so we iterate on token docs isnstead
-                            swap_buffer.clear();
-
-                            for &doc_id in &token_docs {
-                                if current_matches.binary_search(&doc_id).is_ok() {
-                                    swap_buffer.push(doc_id);
-                                }
-                            }
-                            std::mem::swap(&mut current_matches, &mut swap_buffer);
-                        } else {
-                            current_matches
-                                .retain(|doc_id| token_docs.binary_search(doc_id).is_ok());
+                    current_matches.retain(|&doc_id| {
+                        while j < t_len && token_docs[j] < doc_id {
+                            j += 1;
                         }
-                    } else {
-                        // O(N+M) Two-Pointer traversal otherwise
-                        let mut j = 0;
-                        current_matches.retain(|&doc_id| {
-                            while j < t_len && token_docs[j] < doc_id {
-                                j += 1;
-                            }
-                            j < t_len && token_docs[j] == doc_id
-                        })
-                    }
+                        j < t_len && token_docs[j] == doc_id
+                    })
                 }
             }
 
             if valid_matches && !current_matches.is_empty() {
                 let valid_docs = &current_matches;
-                let mut enriched_docs: Vec<u128> = Vec::with_capacity(valid_docs.len());
+                let mut sortable_docs: Vec<(u64, u128)> = Vec::with_capacity(valid_docs.len());
                 let meta_mmap = segment.meta_map();
 
                 for &doc_id in valid_docs {
@@ -463,7 +473,7 @@ impl Index {
                         .expect("failed to unpack");
                     let packed_val = u128::from_le_bytes(packed_bytes);
 
-                    let (_, _, _, _, is_dir, doc_category, vol_type) =
+                    let (_, modified_at, accessed_at, depth, is_dir, doc_category, vol_type) =
                         SegmentedIndex::unpack_u128(packed_val);
 
                     // Kind filter
@@ -486,37 +496,36 @@ impl Index {
                         continue;
                     }
 
-                    enriched_docs.push(packed_val);
+                    // 64-bit hardware sort key to optimize the quickselect
+                    // below - avoids all the u128 unpacking and other math
+                    // in the sorting closure
+                    // Bit 63: is_dir (prioritize directories)
+                    // Bits 55-62: inverted depth (prioritize shallow paths)
+                    // Bits 21-54: recent timestamp (prioritize newer files)
+                    let recent = modified_at.max(accessed_at);
+                    let mut sort_key = 0u64;
+                    if is_dir {
+                        sort_key |= 1 << 63;
+                    };
+                    let inverted_depth = (!depth as u64) & 0xFF;
+                    sort_key |= inverted_depth << 55;
+                    sort_key |= (recent & 0x3_FFFF_FFFF) << 21;
+
+                    sortable_docs.push((sort_key, packed_val));
                 }
 
-                if enriched_docs.len() > scoring_cap {
+                if sortable_docs.len() > scoring_cap {
                     // O(N) quickselect
-                    enriched_docs.select_nth_unstable_by(scoring_cap, |&a, &b| {
-                        let (a_off, a_modified_at, a_accessed_at, a_depth, a_dir, _, _) =
-                            SegmentedIndex::unpack_u128(a);
-                        let (b_off, b_modified_at, b_accessed_at, b_depth, b_dir, _, _) =
-                            SegmentedIndex::unpack_u128(b);
+                    sortable_docs.select_nth_unstable_by(scoring_cap, |&a, &b| b.0.cmp(&a.0));
 
-                        let a_recent = a_modified_at.max(a_accessed_at);
-                        let b_recent = b_modified_at.max(b_accessed_at);
-
-                        b_dir
-                            .cmp(&a_dir)
-                            .then_with(|| a_depth.cmp(&b_depth))
-                            .then_with(|| b_recent.cmp(&a_recent))
-                            .then_with(|| a_off.cmp(&b_off))
-                    });
-
-                    enriched_docs.truncate(scoring_cap);
+                    sortable_docs.truncate(scoring_cap);
                 }
 
                 // Re-sort by dat_offset ascending to align with in-disk layout
-                enriched_docs.sort_unstable_by_key(|&packed| {
-                    let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
-                    dat_offset
-                });
+                sortable_docs
+                    .sort_unstable_by_key(|&(_, packed)| (packed & 0x0000_00FF_FFFF_FFFF) as u64);
 
-                for packed_val in enriched_docs {
+                for (_, packed_val) in sortable_docs {
                     let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
