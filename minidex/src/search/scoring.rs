@@ -175,16 +175,14 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
 
                 token_best = token_best.max(match_val);
                 current_idx += 1;
+            } else if is_ascii {
+                current_idx += 1;
             } else {
-                if is_ascii {
-                    current_idx += 1;
-                } else {
-                    current_idx += search_target[current_idx..]
-                        .chars()
-                        .next()
-                        .unwrap()
-                        .len_utf8();
-                }
+                current_idx += search_target[current_idx..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
             }
         }
 
