@@ -30,134 +30,129 @@ fn bench_tokenizer(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_index_insert(c: &mut Criterion) {
-    let dir = tempdir().expect("failed to create temp dir");
-    let index = Index::open(dir.path()).expect("failed to open index");
+fn create_entry(i: usize) -> FilesystemEntry {
+    FilesystemEntry {
+        path: PathBuf::from(format!("/foo/bar_{}.txt", i)),
+        volume: "vol1".to_string(),
+        kind: Kind::File,
+        last_modified: 1000,
+        last_accessed: 1000,
+        category: category::TEXT,
+        volume_type: VolumeType::Local,
+    }
+}
 
-    c.bench_function("index_insert", |b| {
-        let mut i = 0;
-        b.iter(|| {
-            let entry = FilesystemEntry {
-                path: PathBuf::from(format!("/foo/bar_{}.txt", i)),
-                volume: "vol1".to_string(),
-                kind: Kind::File,
-                last_modified: 1000,
-                last_accessed: 1000,
-                category: category::TEXT,
-                volume_type: VolumeType::Local,
-            };
-            index.insert(entry).expect("failed to insert");
-            i += 1;
-        })
-    });
+fn populate_index(index: &Index, count: usize) {
+    for i in 0..count {
+        index.insert(create_entry(i)).expect("failed to insert");
+    }
+}
+
+fn bench_index_insert(c: &mut Criterion) {
+    let sizes = [500, 1000, 10000, 50000, 100000];
+    let mut group = c.benchmark_group("index_insert");
+
+    for size in sizes {
+        let dir = tempdir().expect("failed to create temp dir");
+        let index = Index::open(dir.path()).expect("failed to open index");
+        populate_index(&index, size);
+
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            let mut i = size;
+            b.iter(|| {
+                index.insert(create_entry(i)).expect("failed to insert");
+                i += 1;
+            })
+        });
+    }
+    group.finish();
 }
 
 fn bench_index_search(c: &mut Criterion) {
-    let dir = tempdir().expect("failed to create temp dir");
-    let config = CompactorConfigBuilder::new().flush_threshold(100).build();
-    let index = Index::open_with_config(dir.path(), config).expect("failed to open index");
-
-    // Populate index with 500 items to trigger multiple flushes
-    for i in 0..500 {
-        index
-            .insert(FilesystemEntry {
-                path: PathBuf::from(format!("/foo/bar_{}.txt", i)),
-                volume: "vol1".to_string(),
-                kind: Kind::File,
-                last_modified: 1000,
-                last_accessed: 1000,
-                category: category::TEXT,
-                volume_type: VolumeType::Local,
-            })
-            .expect("failed to insert");
-    }
-
-    // Wait for background flushes to finish
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
+    let sizes = [500, 1000, 10000, 50000, 100000];
     let mut group = c.benchmark_group("index_search");
 
-    group.bench_function("mem_search_hit", |b| {
-        // These will be in mem table (the last ones)
-        index
-            .insert(FilesystemEntry {
-                path: PathBuf::from("/foo/mem_only_entry.txt"),
-                volume: "vol1".to_string(),
-                kind: Kind::File,
-                last_modified: 1000,
-                last_accessed: 1000,
-                category: category::TEXT,
-                volume_type: VolumeType::Local,
+    for size in sizes {
+        let dir = tempdir().expect("failed to create temp dir");
+        let config = CompactorConfigBuilder::new().flush_threshold(2000).build();
+        let index = Index::open_with_config(dir.path(), config).expect("failed to open index");
+
+        populate_index(&index, size);
+
+        // Wait for background flushes to finish
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        group.bench_with_input(BenchmarkId::new("disk_search_hit", size), &size, |b, _| {
+            b.iter(|| {
+                let _ = index
+                    .search(black_box("bar_50"), 10, 0, SearchOptions::default())
+                    .expect("search failed");
             })
-            .expect("failed to insert");
+        });
 
-        b.iter(|| {
-            let _ = index
-                .search(black_box("mem_only_entry"), 10, 0, SearchOptions::default())
-                .expect("search failed");
-        })
-    });
+        group.bench_with_input(BenchmarkId::new("disk_search_prefix", size), &size, |b, _| {
+            b.iter(|| {
+                let _ = index
+                    .search(black_box("bar"), 10, 0, SearchOptions::default())
+                    .expect("search failed");
+            })
+        });
 
-    group.bench_function("disk_search_hit", |b| {
-        // "bar_50" is definitely in a segment because we inserted 500 with threshold 100
-        b.iter(|| {
-            let _ = index
-                .search(black_box("bar_50"), 10, 0, SearchOptions::default())
-                .expect("search failed");
-        })
-    });
+        group.bench_with_input(BenchmarkId::new("mem_search_hit", size), &size, |b, _| {
+            let path = format!("/foo/mem_only_entry_{}.txt", size);
+            index
+                .insert(FilesystemEntry {
+                    path: PathBuf::from(&path),
+                    volume: "vol1".to_string(),
+                    kind: Kind::File,
+                    last_modified: 1000,
+                    last_accessed: 1000,
+                    category: category::TEXT,
+                    volume_type: VolumeType::Local,
+                })
+                .expect("failed to insert");
 
-    group.bench_function("disk_search_prefix", |b| {
-        b.iter(|| {
-            let _ = index
-                .search(black_box("bar"), 10, 0, SearchOptions::default())
-                .expect("search failed");
-        })
-    });
+            let search_term = format!("mem_only_entry_{}", size);
+            b.iter(|| {
+                let _ = index
+                    .search(black_box(&search_term), 10, 0, SearchOptions::default())
+                    .expect("search failed");
+            })
+        });
+    }
 
     group.finish();
 }
 
 fn bench_index_delete(c: &mut Criterion) {
-    let dir = tempdir().expect("failed to create temp dir");
-    let index = Index::open(dir.path()).expect("failed to open index");
-
-    // Populate index with some data to delete
-    for i in 0..1000 {
-        index
-            .insert(FilesystemEntry {
-                path: PathBuf::from(format!("/foo/bar_{}.txt", i)),
-                volume: "vol1".to_string(),
-                kind: Kind::File,
-                last_modified: 1000,
-                last_accessed: 1000,
-                category: category::TEXT,
-                volume_type: VolumeType::Local,
-            })
-            .expect("failed to insert");
-    }
-
+    let sizes = [500, 1000, 10000, 50000, 100000];
     let mut group = c.benchmark_group("index_delete");
 
-    group.bench_function("delete_path", |b| {
-        let mut i = 0;
-        b.iter(|| {
-            let path = PathBuf::from(format!("/foo/bar_{}.txt", i));
-            index.delete(black_box(&path)).expect("delete failed");
-            i += 1;
-        })
-    });
+    for size in sizes {
+        let dir = tempdir().expect("failed to create temp dir");
+        let index = Index::open(dir.path()).expect("failed to open index");
+        populate_index(&index, size);
 
-    group.bench_function("delete_prefix", |b| {
-        let mut i = 0;
-        b.iter(|| {
-            let prefix = format!("/prefix_{}", i);
-            index
-                .delete_prefix(black_box(&prefix))
-                .expect("delete_prefix failed");
-            i += 1;
-        })
-    });
+        group.bench_with_input(BenchmarkId::new("delete_path", size), &size, |b, _| {
+            let mut i = 0;
+            b.iter(|| {
+                let path = PathBuf::from(format!("/foo/bar_{}.txt", i));
+                index.delete(black_box(&path)).expect("delete failed");
+                i = (i + 1) % size;
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("delete_prefix", size), &size, |b, _| {
+            let mut i = 0;
+            b.iter(|| {
+                let prefix = format!("/foo/bar_{}", i);
+                index
+                    .delete_prefix(black_box(&prefix))
+                    .expect("delete_prefix failed");
+                i = (i + 1) % size;
+            })
+        });
+    }
 
     group.finish();
 }
