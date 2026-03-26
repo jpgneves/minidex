@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::entry::IndexEntry;
+use crate::{Kind, entry::IndexEntry, segmented_index::SegmentedIndex};
 
 /// The in-memory data structures, containing
 /// an inverted index for fast lookups
@@ -16,6 +16,9 @@ pub(crate) struct MemTable {
 
     // FST staging area (sorted for flusher to work)
     pub entries: BTreeMap<String, (String, IndexEntry)>,
+
+    // Mapping to u128 metadata for pre-filtering
+    pub metadata: Vec<u128>,
 }
 
 impl MemTable {
@@ -33,6 +36,21 @@ impl MemTable {
         self.path_to_id.insert(path.clone(), id);
         self.id_to_data
             .insert(id, (path.clone(), volume.clone(), entry));
+        let depth = path
+            .bytes()
+            .filter(|&b| b == std::path::MAIN_SEPARATOR as u8)
+            .count() as u16;
+        let meta = SegmentedIndex::pack_u128(
+            id as u64, // This is okay, because it's only used for tie-breaking
+            entry.last_modified,
+            entry.last_accessed,
+            depth,
+            entry.kind == Kind::Directory,
+            entry.category,
+            entry.volume_type as u8,
+        );
+
+        self.metadata.push(meta);
 
         let tokens = crate::tokenizer::tokenize(&path);
         for token in tokens {

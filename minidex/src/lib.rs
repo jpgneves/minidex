@@ -11,6 +11,7 @@ use std::{
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
 use memtable::MemTable;
+use search::evaluate_candidate;
 use thiserror::Error;
 
 mod collector;
@@ -373,53 +374,20 @@ impl Index {
             let mut mem_sortable = Vec::with_capacity(candidates.len());
 
             for id in candidates {
-                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
-                    if let Some(filter) = options.volume_name
-                        && volume != filter
-                    {
-                        continue;
-                    }
+                let metadata = mem.metadata[id as usize];
 
-                    if let Some(category) = options.category
-                        && entry.category & category == 0
-                    {
-                        continue;
-                    }
-
-                    if let Some(kind) = options.kind
-                        && entry.kind != kind
-                    {
-                        continue;
-                    }
-
-                    if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
-                        continue;
-                    }
-
-                    let depth = path
-                        .bytes()
-                        .filter(|&b| b == std::path::MAIN_SEPARATOR as u8)
-                        .count() as u64;
-                    let is_dir = if entry.kind == Kind::Directory { 1 } else { 0 };
-                    let recent = if entry.last_modified > entry.last_accessed {
-                        entry.last_modified
-                    } else {
-                        entry.last_accessed
-                    };
-
-                    let sort_key = (is_dir << 63) | (((!depth) & 0xFF) << 55) | (recent << 21);
-                    mem_sortable.push((sort_key, path, volume, entry));
+                if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask) {
+                    mem_sortable.push((sort_key, id));
                 }
             }
 
             // Top-K truncation in memory
-            if mem_sortable.len() > scoring_cap {
-                mem_sortable.select_nth_unstable_by(scoring_cap, |a, b| b.0.cmp(&a.0));
-                mem_sortable.truncate(scoring_cap);
-            }
+            crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
 
-            for (_, path, volume, entry) in mem_sortable {
-                collector.insert(path.as_str(), volume.as_str(), *entry);
+            for (_, id) in mem_sortable {
+                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
+                    collector.insert(path.as_str(), volume.as_str(), *entry);
+                }
             }
         }
 
@@ -502,63 +470,21 @@ impl Index {
                     }
                     .to_le();
 
-                    // Inline bitwise extraction to avoid incurring type conversion penalties
-                    let modified = ((packed_val >> 40) & 0x3_FFFF_FFFF) as u64;
-                    let accessed = ((packed_val >> 74) & 0x3_FFFF_FFFF) as u64;
-                    let depth = ((packed_val >> 108) & 0xFF) as u64;
-                    let is_dir = ((packed_val >> 116) & 1) as u64; // Yields exactly 1 or 0
-                    let doc_category = ((packed_val >> 117) & 0xFF) as u8;
-                    let vol_type = ((packed_val >> 124) & 0b11) as u8;
-
-                    // Kind filter
-                    if let Some(kind) = options.kind {
-                        let is_target_dir = if kind == Kind::Directory { 1 } else { 0 };
-                        if is_dir != is_target_dir {
-                            continue;
-                        }
-                    }
-
-                    // Filter categories
-                    if let Some(category) = options.category
-                        && doc_category & category == 0
+                    if let Some(sort_key) =
+                        evaluate_candidate(packed_val, &options, volume_type_mask)
                     {
-                        continue;
+                        sortable_docs.push((sort_key, packed_val));
                     }
-
-                    // Filter volume type
-                    if (volume_type_mask & (1 << vol_type)) == 0 {
-                        continue;
-                    }
-
-                    // 64-bit hardware sort key to optimize the quickselect
-                    // below - avoids all the u128 unpacking and other math
-                    // in the sorting closure
-                    // Bit 63: is_dir (prioritize directories)
-                    // Bits 55-62: inverted depth (prioritize shallow paths)
-                    // Bits 21-54: recent timestamp (prioritize newer files)
-                    let recent = if modified > accessed {
-                        modified
-                    } else {
-                        accessed
-                    }; // Avoid modified.max(accessed) to opitmize to a single instruction
-                    let sort_key = (is_dir << 63) | (((!depth) & 0xFF) << 55) | (recent << 21);
-
-                    sortable_docs.push((sort_key, packed_val));
                 }
 
-                if sortable_docs.len() > scoring_cap {
-                    // O(N) quickselect
-                    sortable_docs.select_nth_unstable_by(scoring_cap, |&a, &b| b.0.cmp(&a.0));
-
-                    sortable_docs.truncate(scoring_cap);
-                }
+                crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
 
                 // Re-sort by dat_offset ascending to align with in-disk layout
                 sortable_docs
                     .sort_unstable_by_key(|&(_, packed)| (packed & 0x0000_00FF_FFFF_FFFF) as u64);
 
                 for (_, packed_val) in sortable_docs {
-                    let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed_val);
+                    let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
                         collector.insert(path, volume, entry);
@@ -648,27 +574,37 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        for (path, (volume, entry)) in mem.entries.iter() {
-            if entry.last_accessed >= since {
-                if let Some(filter) = options.volume_name
-                    && volume != filter
-                {
-                    continue;
+        for (id, &metadata) in mem.metadata.iter().enumerate() {
+            let (_, _, last_accessed, _, is_dir, doc_category, doc_volume_type) =
+                SegmentedIndex::unpack_u128(metadata);
+
+            if last_accessed >= since {
+                if let Some(kind) = options.kind {
+                    let is_target_dir = kind == Kind::Directory;
+                    let is_entry_dir = is_dir;
+                    if is_entry_dir != is_target_dir {
+                        continue;
+                    };
                 }
+
                 if let Some(category) = options.category
-                    && entry.category & category == 0
+                    && doc_category & category == 0
                 {
                     continue;
                 }
-                if let Some(kind) = options.kind
-                    && entry.kind != kind
-                {
+
+                if (volume_type_mask & (1 << doc_volume_type)) == 0 {
                     continue;
                 }
-                if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
-                    continue;
+
+                if let Some((path, volume, entry)) = mem.id_to_data.get(&(id as u32)) {
+                    if let Some(filter) = options.volume_name
+                        && volume != filter
+                    {
+                        continue;
+                    }
+                    collector.insert(path.as_str(), volume.as_str(), *entry);
                 }
-                collector.insert(path.as_str(), volume.as_str(), *entry);
             }
         }
 
