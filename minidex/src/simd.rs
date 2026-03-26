@@ -1,9 +1,6 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
 /// Intersects two sorted u32 arrays, pushes matches to `out`
 pub fn intersect_arrays(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     #[cfg(target_arch = "aarch64")]
@@ -41,10 +38,10 @@ unsafe fn intersect_avx2(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
     while i + 8 <= len_a && j + 8 <= len_b {
         // Because the arrays are sorted, we can check the boundaries of the
         // 8-item chunks without using vector instructions
-        let a_min = *a.get_unchecked(i);
-        let a_max = *a.get_unchecked(i + 7);
-        let b_min = *b.get_unchecked(j);
-        let b_max = *b.get_unchecked(j + 7);
+        let a_min = unsafe { *a.get_unchecked(i) };
+        let a_max = unsafe { *a.get_unchecked(i + 7) };
+        let b_min = unsafe { *b.get_unchecked(j) };
+        let b_max = unsafe { *b.get_unchecked(j + 7) };
 
         // Skip an entire 256-bit chunk in A if less than B
         if a_max < b_min {
