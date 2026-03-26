@@ -30,6 +30,7 @@ mod opstamp;
 use opstamp::*;
 use wal::Wal;
 mod search;
+mod simd;
 mod tokenizer;
 pub use tokenizer::tokenize;
 mod wal;
@@ -309,6 +310,7 @@ impl Index {
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
         let mut mem_candidates: Option<Vec<u32>> = None;
+        let mut mem_intersect_buf = Vec::new();
 
         // In-memory searches
         if !tokens.is_empty() {
@@ -346,15 +348,13 @@ impl Index {
                 match mem_candidates.as_mut() {
                     // Two point merge in the RAM path
                     Some(existing) => {
-                        let mut j = 0;
-                        let t_len = current_token_ids.len();
-
-                        existing.retain(|&id| {
-                            while j < t_len && current_token_ids[j] < id {
-                                j += 1;
-                            }
-                            j < t_len && current_token_ids[j] == id
-                        });
+                        mem_intersect_buf.clear();
+                        crate::simd::intersect_arrays(
+                            existing,
+                            &current_token_ids,
+                            &mut mem_intersect_buf,
+                        );
+                        std::mem::swap(existing, &mut mem_intersect_buf);
                     }
                     None => mem_candidates = Some(current_token_ids.into_owned()),
                 }
@@ -402,6 +402,7 @@ impl Index {
         // Disk searches
         let mut token_docs = Vec::new();
         let mut current_matches = Vec::new();
+        let mut disk_intersect_buf = Vec::new();
 
         let vol_token = options
             .volume_name
@@ -448,18 +449,13 @@ impl Index {
                     std::mem::swap(&mut current_matches, &mut token_docs);
                     first_token = false;
                 } else {
-                    // O(N+M) Two-Pointer traversal
-                    if token_docs.len() < current_matches.len() {
-                        std::mem::swap(&mut current_matches, &mut token_docs);
-                    }
-                    let mut j = 0;
-                    let t_len = token_docs.len();
-                    current_matches.retain(|&doc_id| {
-                        while j < t_len && token_docs[j] < doc_id {
-                            j += 1;
-                        }
-                        j < t_len && token_docs[j] == doc_id
-                    })
+                    disk_intersect_buf.clear();
+                    crate::simd::intersect_arrays(
+                        &current_matches,
+                        &token_docs,
+                        &mut disk_intersect_buf,
+                    );
+                    std::mem::swap(&mut current_matches, &mut disk_intersect_buf);
                 }
             }
 
@@ -697,18 +693,7 @@ impl Index {
                 b_acc
                     .cmp(&a_acc) // Sort descending by access time
                     .then_with(|| b_mod.cmp(&a_mod)) // Then by modified time
-                    .then_with(|| {
-                        // Then we compare path strings to keep sorting stable
-                        let a_path =
-                            a.0.read_document(a_off)
-                                .map(|(p, _, _)| p)
-                                .unwrap_or("".to_owned());
-                        let b_path =
-                            b.0.read_document(b_off)
-                                .map(|(p, _, _)| p)
-                                .unwrap_or("".to_owned());
-                        a_path.cmp(&b_path)
-                    })
+                    .then_with(|| a.1.cmp(&b.1))
             });
             disk_candidates.truncate(disk_cap);
         }
