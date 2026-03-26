@@ -386,6 +386,11 @@ impl Index {
 
             for (_, id) in mem_sortable {
                 if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
+                    if let Some(filter) = options.volume_name
+                        && volume != filter
+                    {
+                        continue;
+                    }
                     collector.insert(path.as_str(), volume.as_str(), *entry);
                 }
             }
@@ -487,6 +492,11 @@ impl Index {
                     let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
+                        if let Some(filter) = options.volume_name
+                            && volume != filter
+                        {
+                            continue;
+                        }
                         collector.insert(path, volume, entry);
                     }
                 }
