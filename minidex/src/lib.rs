@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    collections::HashSet,
+    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -11,6 +12,7 @@ use std::{
 use common::is_tombstoned;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
+use memtable::MemTable;
 use thiserror::Error;
 
 mod collector;
@@ -21,6 +23,7 @@ pub use common::{Kind, VolumeType, category};
 mod entry;
 pub use entry::FilesystemEntry;
 use entry::*;
+mod memtable;
 mod segmented_index;
 pub use segmented_index::compactor::*;
 use segmented_index::*;
@@ -42,7 +45,7 @@ pub struct Index {
     path: PathBuf,
     base: Arc<RwLock<SegmentedIndex>>,
     next_op_seq: Arc<AtomicU64>,
-    mem_idx: RwLock<BTreeMap<String, (String, IndexEntry)>>,
+    mem_idx: RwLock<MemTable>,
     wal: RwLock<Wal>,
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -73,14 +76,14 @@ impl Index {
 
         let base = Arc::new(RwLock::new(base));
         let mut max_seq = 0u64;
-        let mut mem_idx = BTreeMap::new();
+        let mut mem_idx = MemTable::default();
 
         let mut prefix_tombstones = Vec::new();
 
         let mut apply_replay = |replay_data: crate::wal::ReplayData| {
             for (path, volume, entry) in replay_data.inserts {
                 max_seq = max_seq.max(entry.opstamp.sequence());
-                mem_idx.insert(path, (volume, entry));
+                mem_idx.insert(path, volume, entry);
             }
             for (volume, prefix, seq) in replay_data.tombstones {
                 max_seq = max_seq.max(seq);
@@ -180,7 +183,7 @@ impl Index {
             self.mem_idx
                 .write()
                 .map_err(|_| IndexError::WriteLock)?
-                .insert(path_str, (volume, entry));
+                .insert(path_str, volume, entry);
         }
 
         if self.should_flush() {
@@ -212,7 +215,7 @@ impl Index {
             self.mem_idx
                 .write()
                 .map_err(|_| IndexError::WriteLock)?
-                .insert(path_str, ("".to_owned(), entry));
+                .insert(path_str, "".to_owned(), entry);
         }
 
         if self.should_flush() {
@@ -306,68 +309,63 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
+        let mut mem_candidates: Option<HashSet<u32>> = None;
+
         // In-memory searches
-        for (path, (volume, entry)) in mem.iter() {
-            let path_bytes = path.as_bytes();
+        if !tokens.is_empty() {
+            for token in &tokens {
+                let mut current_token_ids = HashSet::new();
+                let end_bound = format!("{}\u{FFFF}", token);
 
-            if let Some(filter) = options.volume_name
-                && volume != filter
-            {
-                continue;
-            }
+                for (_, ids) in mem.inverted_index.range::<str, _>((
+                    Bound::Included(token.as_str()),
+                    Bound::Included(end_bound.as_str()),
+                )) {
+                    current_token_ids.extend(ids);
+                }
 
-            if let Some(category) = options.category
-                && entry.category & category == 0
-            {
-                continue;
-            }
+                match mem_candidates.as_mut() {
+                    Some(existing) => existing.retain(|id| current_token_ids.contains(id)),
+                    None => mem_candidates = Some(current_token_ids),
+                }
 
-            if let Some(kind) = options.kind
-                && entry.kind != kind
-            {
-                continue;
-            }
-
-            if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
-                continue;
-            }
-
-            let matches_all = if path.is_ascii() {
-                tokens.iter().all(|t| {
-                    let token_bytes = t.as_bytes();
-                    if path_bytes.len() < token_bytes.len() {
-                        return false;
+                if let Some(c) = &mem_candidates {
+                    if c.is_empty() {
+                        break;
                     }
-                    path_bytes
-                        .windows(token_bytes.len())
-                        .enumerate()
-                        .any(|(idx, window)| {
-                            if window.eq_ignore_ascii_case(token_bytes) {
-                                if idx == 0 {
-                                    true
-                                } else {
-                                    !path_bytes[idx - 1].is_ascii_alphanumeric()
-                                }
-                            } else {
-                                false
-                            }
-                        })
-                })
-            } else {
-                let folded_path = crate::tokenizer::fold_path(path);
-                tokens.iter().all(|t| {
-                    folded_path.match_indices(t.as_str()).any(|(idx, _)| {
-                        if idx == 0 {
-                            true
-                        } else {
-                            !folded_path[..idx].chars().last().unwrap().is_alphanumeric()
-                        }
-                    })
-                })
-            };
+                }
+            }
+        } else {
+            mem_candidates = Some(mem.id_to_data.keys().copied().collect());
+        }
 
-            if matches_all {
-                collector.insert(path.as_str(), volume.as_str(), *entry);
+        if let Some(candidates) = mem_candidates {
+            for id in candidates {
+                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
+                    if let Some(filter) = options.volume_name
+                        && volume != filter
+                    {
+                        continue;
+                    }
+
+                    if let Some(category) = options.category
+                        && entry.category & category == 0
+                    {
+                        continue;
+                    }
+
+                    if let Some(kind) = options.kind
+                        && entry.kind != kind
+                    {
+                        continue;
+                    }
+
+                    if (volume_type_mask & (1 << entry.volume_type as u8)) == 0 {
+                        continue;
+                    }
+
+                    collector.insert(path.as_str(), volume.as_str(), *entry);
+                }
             }
         }
 
@@ -609,7 +607,7 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        for (path, (volume, entry)) in mem.iter() {
+        for (path, (volume, entry)) in mem.entries.iter() {
             if entry.last_accessed >= since {
                 if let Some(filter) = options.volume_name
                     && volume != filter
@@ -867,6 +865,7 @@ impl Index {
                 if let Err(e) = SegmentedIndex::build_segment_files(
                     &tmp_segment_path,
                     snapshot
+                        .entries
                         .into_iter()
                         .map(|(path, (volume, entry))| (path, volume, entry)),
                     false,
