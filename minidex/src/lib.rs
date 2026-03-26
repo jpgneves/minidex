@@ -449,6 +449,9 @@ impl Index {
                     first_token = false;
                 } else {
                     // O(N+M) Two-Pointer traversal
+                    if token_docs.len() < current_matches.len() {
+                        std::mem::swap(&mut current_matches, &mut token_docs);
+                    }
                     let mut j = 0;
                     let t_len = token_docs.len();
                     current_matches.retain(|&doc_id| {
@@ -464,21 +467,32 @@ impl Index {
                 let valid_docs = &current_matches;
                 let mut sortable_docs: Vec<(u64, u128)> = Vec::with_capacity(valid_docs.len());
                 let meta_mmap = segment.meta_map();
+                let meta_ptr = meta_mmap.as_ptr();
+                let meta_len = meta_mmap.len();
 
                 for &doc_id in valid_docs {
                     let byte_offset = (doc_id as usize) * size_of::<u128>();
-                    let packed_bytes: [u8; 16] = meta_mmap
-                        [byte_offset..byte_offset + size_of::<u128>()]
-                        .try_into()
-                        .expect("failed to unpack");
-                    let packed_val = u128::from_le_bytes(packed_bytes);
 
-                    let (_, modified_at, accessed_at, depth, is_dir, doc_category, vol_type) =
-                        SegmentedIndex::unpack_u128(packed_val);
+                    if byte_offset + size_of::<u128>() > meta_len {
+                        continue;
+                    }
+
+                    let packed_val = unsafe {
+                        std::ptr::read_unaligned(meta_ptr.add(byte_offset) as *const u128)
+                    }
+                    .to_le();
+
+                    // Inline bitwise extraction to avoid incurring type conversion penalties
+                    let modified = ((packed_val >> 40) & 0x3_FFFF_FFFF) as u64;
+                    let accessed = ((packed_val >> 74) & 0x3_FFFF_FFFF) as u64;
+                    let depth = ((packed_val >> 108) & 0xFF) as u64;
+                    let is_dir = ((packed_val >> 116) & 1) as u64; // Yields exactly 1 or 0
+                    let doc_category = ((packed_val >> 117) & 0xFF) as u8;
+                    let vol_type = ((packed_val >> 124) & 0b11) as u8;
 
                     // Kind filter
                     if let Some(kind) = options.kind {
-                        let is_target_dir = kind == Kind::Directory;
+                        let is_target_dir = if kind == Kind::Directory { 1 } else { 0 };
                         if is_dir != is_target_dir {
                             continue;
                         }
@@ -502,14 +516,12 @@ impl Index {
                     // Bit 63: is_dir (prioritize directories)
                     // Bits 55-62: inverted depth (prioritize shallow paths)
                     // Bits 21-54: recent timestamp (prioritize newer files)
-                    let recent = modified_at.max(accessed_at);
-                    let mut sort_key = 0u64;
-                    if is_dir {
-                        sort_key |= 1 << 63;
-                    };
-                    let inverted_depth = (!depth as u64) & 0xFF;
-                    sort_key |= inverted_depth << 55;
-                    sort_key |= (recent & 0x3_FFFF_FFFF) << 21;
+                    let recent = if modified > accessed {
+                        modified
+                    } else {
+                        accessed
+                    }; // Avoid modified.max(accessed) to opitmize to a single instruction
+                    let sort_key = (is_dir << 63) | (((!depth) & 0xFF) << 55) | (recent << 21);
 
                     sortable_docs.push((sort_key, packed_val));
                 }
