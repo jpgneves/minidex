@@ -329,10 +329,10 @@ impl Index {
                     None => mem_candidates = Some(current_token_ids),
                 }
 
-                if let Some(c) = &mem_candidates {
-                    if c.is_empty() {
-                        break;
-                    }
+                if let Some(c) = &mem_candidates
+                    && c.is_empty()
+                {
+                    break;
                 }
             }
         } else {

@@ -90,13 +90,17 @@ fn bench_index_search(c: &mut Criterion) {
             })
         });
 
-        group.bench_with_input(BenchmarkId::new("disk_search_prefix", size), &size, |b, _| {
-            b.iter(|| {
-                let _ = index
-                    .search(black_box("bar"), 10, 0, SearchOptions::default())
-                    .expect("search failed");
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("disk_search_prefix", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let _ = index
+                        .search(black_box("bar"), 10, 0, SearchOptions::default())
+                        .expect("search failed");
+                })
+            },
+        );
 
         group.bench_with_input(BenchmarkId::new("mem_search_hit", size), &size, |b, _| {
             let path = format!("/foo/mem_only_entry_{}.txt", size);
