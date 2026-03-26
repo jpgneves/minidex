@@ -32,9 +32,12 @@ struct App {
     list_state: ListState,
     indexing: Arc<AtomicBool>,
     indexed_count: Arc<AtomicU64>,
+    indexing_duration_ms: Arc<AtomicU64>,
+    last_indexing_files: Arc<AtomicU64>,
     index_target: String,
     target_cursor_position: usize,
     input_mode: InputMode,
+    search_latencies_us: Vec<u128>,
 }
 
 impl App {
@@ -49,9 +52,12 @@ impl App {
             list_state: ListState::default(),
             indexing: Arc::new(AtomicBool::new(false)),
             indexed_count: Arc::new(AtomicU64::new(0)),
+            indexing_duration_ms: Arc::new(AtomicU64::new(0)),
+            last_indexing_files: Arc::new(AtomicU64::new(0)),
             index_target,
             target_cursor_position: target_len,
             input_mode: InputMode::Search,
+            search_latencies_us: Vec::new(),
         };
         app.update_search();
         Ok(app)
@@ -130,6 +136,7 @@ impl App {
     }
 
     fn update_search(&mut self) {
+        let start = std::time::Instant::now();
         let options = SearchOptions::default();
         if self.input.is_empty() {
             let five_days_ago = std::time::SystemTime::now()
@@ -153,6 +160,8 @@ impl App {
                     self.list_state.select(None);
                 }
             }
+            let elapsed = start.elapsed().as_micros();
+            self.search_latencies_us.push(elapsed);
             return;
         }
 
@@ -170,6 +179,8 @@ impl App {
                 self.list_state.select(None);
             }
         }
+        let elapsed = start.elapsed().as_micros();
+        self.search_latencies_us.push(elapsed);
     }
 
     fn next_result(&mut self) {
@@ -230,9 +241,14 @@ impl App {
         let index = Arc::clone(&self.index);
         let indexing = Arc::clone(&self.indexing);
         let count = Arc::clone(&self.indexed_count);
+        let duration = Arc::clone(&self.indexing_duration_ms);
+        let last_files = Arc::clone(&self.last_indexing_files);
+
         count.store(0, Ordering::SeqCst);
+        duration.store(0, Ordering::SeqCst);
 
         std::thread::spawn(move || {
+            let start = std::time::Instant::now();
             let mut builder = WalkBuilder::new(path);
             let walk = builder
                 .threads(4)
@@ -243,9 +259,13 @@ impl App {
 
             let mut scanner = Scanner {
                 index: &index,
-                file_count: count,
+                file_count: count.clone(),
             };
             walk.visit(&mut scanner);
+
+            let final_count = count.load(Ordering::SeqCst);
+            last_files.store(final_count, Ordering::SeqCst);
+            duration.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
             indexing.store(false, Ordering::SeqCst);
         });
     }
@@ -400,12 +420,33 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
     }
 }
 
+fn format_us(us: u128) -> String {
+    if us < 1000 {
+        format!("{}µs", us)
+    } else if us < 1_000_000 {
+        format!("{:.2}ms", us as f64 / 1000.0)
+    } else {
+        format!("{:.2}s", us as f64 / 1_000_000.0)
+    }
+}
+
+fn format_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    } else {
+        format!("{:.2}m", ms as f64 / 60_000.0)
+    }
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
@@ -525,7 +566,60 @@ fn ui(f: &mut Frame, app: &mut App) {
         )
         .highlight_symbol(">> ");
 
-    f.render_stateful_widget(results_list, chunks[2], &mut app.list_state);
+    let latency_text = if app.search_latencies_us.is_empty() {
+        "Latency: N/A".to_string()
+    } else {
+        let mut sorted = app.search_latencies_us.clone();
+        sorted.sort_unstable();
+        let min = sorted.first().unwrap();
+        let max = sorted.last().unwrap();
+        let sum: u128 = sorted.iter().sum();
+        let avg = sum / sorted.len() as u128;
+        let p99_idx = (sorted.len() as f64 * 0.99).ceil() as usize - 1;
+        let p99 = sorted.get(p99_idx).unwrap_or(max);
+
+        format!(
+            "Latency - min: {}, max: {}, avg: {}, p99: {}",
+            format_us(*min),
+            format_us(*max),
+            format_us(avg),
+            format_us(*p99)
+        )
+    };
+
+    let indexing_text = if app.indexing.load(Ordering::SeqCst) {
+        format!(
+            "Indexing... {} files so far",
+            app.indexed_count.load(Ordering::SeqCst)
+        )
+    } else {
+        let last_dur = app.indexing_duration_ms.load(Ordering::SeqCst);
+        let last_files = app.last_indexing_files.load(Ordering::SeqCst);
+        if last_dur > 0 || last_files > 0 {
+            let fps = if last_dur > 0 {
+                (last_files as f64 / (last_dur as f64 / 1000.0)) as u64
+            } else {
+                0
+            };
+            format!(
+                "Last Indexing - files: {}, took: {} ({} fps)",
+                last_files,
+                format_ms(last_dur),
+                fps
+            )
+        } else {
+            "Not indexed yet".to_string()
+        }
+    };
+
+    let metrics_line = Paragraph::new(Line::from(vec![
+        Span::styled(latency_text, Style::default().fg(Color::Cyan)),
+        Span::raw(" | "),
+        Span::styled(indexing_text, Style::default().fg(Color::Magenta)),
+    ]));
+    f.render_widget(metrics_line, chunks[2]);
+
+    f.render_stateful_widget(results_list, chunks[3], &mut app.list_state);
 
     let current_selection = if let Some(i) = app.list_state.selected() {
         format!("{} / {}", i + 1, app.results.len())
@@ -556,5 +650,5 @@ fn ui(f: &mut Frame, app: &mut App) {
         Span::raw(" | "),
         Span::styled(current_selection, Style::default().fg(Color::Green)),
     ]));
-    f.render_widget(help_message, chunks[3]);
+    f.render_widget(help_message, chunks[4]);
 }
