@@ -920,7 +920,7 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
                     .map(|dt| dt.format("%y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "N/A".to_string());
             let accessed =
-                chrono::DateTime::from_timestamp((res.last_modified / 1_000_000) as i64, 0)
+                chrono::DateTime::from_timestamp((res.last_accessed / 1_000_000) as i64, 0)
                     .map(|dt| dt.format("%y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "N/A".to_string());
 

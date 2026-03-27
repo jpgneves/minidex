@@ -1432,8 +1432,8 @@ mod tests {
             path: PathBuf::from(format!("{}foo{}old.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
-            last_modified: 100 * 1_000_000, // 100 seconds
-            last_accessed: 100 * 1_000_000, // Very old
+            last_modified: 100_000_000, // 100 seconds in micros
+            last_accessed: 100_000_000, // Very old
             category: 0,
             volume_type: VolumeType::Local,
         })?;
@@ -1442,12 +1442,13 @@ mod tests {
             path: PathBuf::from(&new_path),
             volume: "vol1".to_string(),
             kind: Kind::File,
-            last_modified: 1000 * 1_000_000, // 1000 seconds
-            last_accessed: 1000 * 1_000_000, // Newer
+            last_modified: 1_000_000_000, // 1000 seconds in micros
+            last_accessed: 1_000_000_000, // Newer
             category: 0,
             volume_type: VolumeType::Local,
         })?;
 
+        // since is in seconds; only the entry at 1000s should pass
         let results = index.recent_files(500, 10, 0, SearchOptions::default())?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, PathBuf::from(&new_path));
