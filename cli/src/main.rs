@@ -453,60 +453,18 @@ impl App {
         let batch_size = self.edit_batch_size.parse::<usize>().unwrap_or(10000);
 
         count.store(0, Ordering::SeqCst);
-        // We don't reset duration and last_files here so UI keeps showing last run stats
 
         std::thread::spawn(move || {
             let _guard = IndexingGuard { indexing };
-            let start = std::time::Instant::now();
+            let (tx, rx) = std::sync::mpsc::channel();
 
-            if use_batch {
-                let walker = WalkBuilder::new(path)
-                    .hidden(false)
-                    .ignore(true)
-                    .git_ignore(true)
-                    .build();
+            let tx_clone = tx.clone();
+            let count_clone = count.clone();
+            let path_clone = path.clone();
 
-                let entries = walker.filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let metadata = entry.metadata().ok()?;
-                    let kind = if metadata.is_dir() {
-                        Kind::Directory
-                    } else if metadata.is_symlink() {
-                        Kind::Symlink
-                    } else {
-                        Kind::File
-                    };
-                    let last_modified = metadata
-                        .modified()
-                        .unwrap_or(std::time::SystemTime::now())
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as u64;
-
-                    let last_accessed = metadata
-                        .accessed()
-                        .unwrap_or(std::time::SystemTime::now())
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as u64;
-
-                    let cat = detect_category(entry.path());
-                    count.fetch_add(1, Ordering::SeqCst);
-
-                    Some(FilesystemEntry {
-                        path: entry.path().to_path_buf(),
-                        volume: "/".to_string(),
-                        volume_type: VolumeType::Local,
-                        kind,
-                        last_modified,
-                        last_accessed,
-                        category: cat,
-                    })
-                });
-
-                let _ = index.insert_batch(entries, batch_size);
-            } else {
-                let mut builder = WalkBuilder::new(path);
+            // Spawn parallel walker
+            std::thread::spawn(move || {
+                let mut builder = WalkBuilder::new(path_clone);
                 let walk = builder
                     .threads(4)
                     .hidden(false)
@@ -514,11 +472,21 @@ impl App {
                     .git_ignore(true)
                     .build_parallel();
 
-                let mut scanner = Scanner {
-                    index: &index,
-                    file_count: count.clone(),
+                let mut scanner = ChannelScanner {
+                    tx: tx_clone,
+                    file_count: count_clone,
                 };
                 walk.visit(&mut scanner);
+            });
+            drop(tx); // Drop original sender so receiver terminates when walker finishes
+
+            let start = std::time::Instant::now();
+            if use_batch {
+                let _ = index.insert_batch(rx.into_iter(), batch_size);
+            } else {
+                for entry in rx {
+                    let _ = index.insert(entry);
+                }
             }
 
             let final_count = count.load(Ordering::SeqCst);
@@ -549,21 +517,21 @@ fn detect_category(path: &std::path::Path) -> u8 {
     }
 }
 
-struct Scanner<'a> {
-    index: &'a Index,
+struct ChannelScanner {
+    tx: std::sync::mpsc::Sender<FilesystemEntry>,
     file_count: Arc<AtomicU64>,
 }
 
-impl<'s, 'a: 's> ParallelVisitorBuilder<'s> for Scanner<'a> {
+impl<'s> ParallelVisitorBuilder<'s> for ChannelScanner {
     fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
-        Box::new(Scanner {
-            index: self.index,
+        Box::new(ChannelScanner {
+            tx: self.tx.clone(),
             file_count: self.file_count.clone(),
         })
     }
 }
 
-impl<'a> ParallelVisitor for Scanner<'a> {
+impl ParallelVisitor for ChannelScanner {
     fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
         if let Ok(entry) = entry {
             let Ok(metadata) = entry.metadata() else {
@@ -592,7 +560,7 @@ impl<'a> ParallelVisitor for Scanner<'a> {
 
             let cat = detect_category(entry.path());
 
-            let _ = self.index.insert(FilesystemEntry {
+            let _ = self.tx.send(FilesystemEntry {
                 path: entry.path().to_path_buf(),
                 volume: "/".to_string(),
                 volume_type: VolumeType::Local,
