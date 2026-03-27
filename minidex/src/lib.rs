@@ -194,6 +194,65 @@ impl Index {
         Ok(())
     }
 
+    /// Insert a batch of entries from an iterator, chunking the iterator
+    /// in specific sizes to adjust throughput.
+    pub fn insert_batch(
+        &self,
+        items: impl IntoIterator<Item = FilesystemEntry>,
+        chunk_size: usize,
+    ) -> Result<(), IndexError> {
+        let mut iter = items.into_iter();
+
+        loop {
+            let chunk: Vec<(String, String, IndexEntry)> = iter
+                .by_ref()
+                .take(chunk_size)
+                .map(|item| {
+                    let seq = self.next_op_seq();
+                    (
+                        item.path.to_string_lossy().into_owned(),
+                        item.volume,
+                        IndexEntry {
+                            opstamp: Opstamp::insertion(seq),
+                            kind: item.kind,
+                            last_modified: item.last_modified,
+                            last_accessed: item.last_accessed,
+                            category: item.category,
+                            volume_type: item.volume_type,
+                        },
+                    )
+                })
+                .collect();
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            {
+                let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+
+                for (path, volume, entry) in &chunk {
+                    wal.append(path, volume, entry)?;
+                }
+            }
+
+            {
+                let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
+                for (path, volume, entry) in chunk {
+                    mem.insert(path, volume, entry);
+                }
+            }
+
+            std::thread::yield_now();
+
+            if self.should_flush() {
+                let _ = self.trigger_flush()?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn delete(&self, item: &Path) -> Result<(), IndexError> {
         let seq = self.next_op_seq();
 
@@ -834,28 +893,31 @@ impl Index {
         {
             return Ok(());
         }
-        let mut mem = self.mem_idx.write().expect("failed to lock memory");
-        let mut wal = self.wal.write().expect("failed to lock wal");
 
-        if mem.is_empty() {
-            return Ok(());
-        }
-
-        let snapshot = std::mem::take(&mut *mem);
-        let path = self.path.clone();
         let next_seq = self.next_op_seq();
-
+        let path = self.path.clone();
         let flushing_path = path.join(format!("journal.{}.flushing.wal", next_seq));
-        wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
-        // Re-write tombstones to the WAL until a full compaction runs.
-        let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
-        for (volume, prefix, seq) in tombstones_cow.iter() {
-            wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
-        }
+        let snapshot = {
+            let mut wal = self.wal.write().expect("failed to lock wal");
+            let mut mem = self.mem_idx.write().expect("failed to lock memory");
 
-        drop(wal);
-        drop(mem);
+            if mem.is_empty() {
+                return Ok(());
+            }
+
+            let snapshot = std::mem::take(&mut *mem);
+
+            wal.rotate(&flushing_path).map_err(IndexError::Io)?;
+
+            // Re-write tombstones to the WAL until a full compaction runs.
+            let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
+            for (volume, prefix, seq) in tombstones_cow.iter() {
+                wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
+            }
+
+            snapshot
+        };
 
         let base = Arc::clone(&self.base);
         let min_merge_count = self.compactor_config.min_merge_count;
@@ -1044,6 +1106,45 @@ mod tests {
             let results = index.search("bar", 10, 0, SearchOptions::default())?;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].path, PathBuf::from(&path1));
+        }
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_insert_batch() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_batch_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
+        {
+            let index = Index::open(&temp_dir)?;
+            let entries = (0..100).map(|i| FilesystemEntry {
+                path: PathBuf::from(format!("{}foo{}file_{}.txt", sep, sep, i)),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 100,
+                last_accessed: 100,
+                category: category::TEXT,
+                volume_type: VolumeType::Local,
+            });
+
+            index.insert_batch(entries, 20)?;
+
+            let results = index.search("file", 150, 0, SearchOptions::default())?;
+            assert_eq!(results.len(), 100);
+
+            index.sync()?;
+        }
+
+        // Reopen and verify
+        {
+            let index = Index::open(&temp_dir)?;
+            let results = index.search("file_42", 10, 0, SearchOptions::default())?;
+            assert_eq!(results.len(), 1);
+            assert!(results[0].path.to_string_lossy().contains("file_42.txt"));
         }
 
         std::fs::remove_dir_all(temp_dir)?;

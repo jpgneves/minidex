@@ -68,6 +68,36 @@ fn bench_index_insert(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_index_insert_batch(c: &mut Criterion) {
+    let sizes = [1000, 10000, 50000];
+    let chunk_sizes = [100, 1000, 5000];
+    let mut group = c.benchmark_group("index_insert_batch");
+
+    for size in sizes {
+        for chunk_size in chunk_sizes {
+            if chunk_size > size {
+                continue;
+            }
+            let dir = tempdir().expect("failed to create temp dir");
+            let index = Index::open(dir.path()).expect("failed to open index");
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("size_{}", size), chunk_size),
+                &chunk_size,
+                |b, &cs| {
+                    b.iter_with_setup(
+                        || (0..size).map(create_entry).collect::<Vec<_>>(),
+                        |entries| {
+                            index.insert_batch(entries, cs).expect("failed to insert batch");
+                        },
+                    );
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn bench_index_search(c: &mut Criterion) {
     let sizes = [500, 1000, 10000, 50000, 100000];
     let mut group = c.benchmark_group("index_search");
@@ -165,6 +195,7 @@ criterion_group!(
     benches,
     bench_tokenizer,
     bench_index_insert,
+    bench_index_insert_batch,
     bench_index_search,
     bench_index_delete
 );

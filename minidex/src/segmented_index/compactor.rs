@@ -5,6 +5,7 @@ use crate::{entry::IndexEntry, is_tombstoned, segmented_index::SegmentedIndexErr
 use super::{Segment, SegmentedIndex};
 
 /// Configuration for compaction
+#[derive(Debug, Clone, Copy)]
 pub struct CompactorConfig {
     /// Minimum number of segments required for compaction
     pub min_merge_count: usize,
@@ -30,9 +31,9 @@ pub struct CompactorConfigBuilder {
 impl Default for CompactorConfigBuilder {
     fn default() -> Self {
         Self {
-            min_merge_count: 4,
-            flush_threshold: 10_000, // Default to 10k entries
-            tombstone_threshold: 50,
+            min_merge_count: 8,
+            flush_threshold: 100_000,
+            tombstone_threshold: 2500,
         }
     }
 }
