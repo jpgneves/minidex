@@ -66,8 +66,8 @@ impl MemTable {
             .count() as u16;
         let meta = SegmentedIndex::pack_u128(
             id as u64, // This is okay, because it's only used for tie-breaking
-            entry.last_modified,
-            entry.last_accessed,
+            entry.last_modified / 1_000_000,
+            entry.last_accessed / 1_000_000,
             depth,
             entry.kind == Kind::Directory,
             entry.category,

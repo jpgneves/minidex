@@ -846,17 +846,7 @@ impl Index {
 
         let mut results: Vec<_> = collector.finish().collect();
 
-        if results.len() > required_matches {
-            results.select_nth_unstable_by(required_matches, |a, b| {
-                let recent_a = a.2.last_accessed.max(a.2.last_modified);
-                let recent_b = b.2.last_accessed.max(b.2.last_modified);
-
-                recent_b.cmp(&recent_a).then_with(|| a.0.cmp(&b.0)) // Path string tie-breaker
-            });
-            results.truncate(required_matches);
-        }
-
-        results.sort_unstable_by(|a, b| {
+        results.sort_by(|a, b| {
             let recent_a = a.2.last_accessed.max(a.2.last_modified);
             let recent_b = b.2.last_accessed.max(b.2.last_modified);
 
