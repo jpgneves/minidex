@@ -26,6 +26,19 @@ impl MemTable {
         if let Some(id) = self.path_to_id.get(&path) {
             self.id_to_data
                 .insert(*id, (path.clone(), volume.clone(), entry));
+            let depth = path
+                .bytes()
+                .filter(|&b| b == std::path::MAIN_SEPARATOR as u8)
+                .count() as u16;
+            self.metadata[*id as usize] = SegmentedIndex::pack_u128(
+                *id as u64,
+                entry.last_modified,
+                entry.last_accessed,
+                depth,
+                entry.kind == Kind::Directory,
+                entry.category,
+                entry.volume_type as u8,
+            );
             self.entries.insert(path, (volume, entry));
             return;
         }
