@@ -312,9 +312,9 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
     if inputs.raw_query_tokens.len() > 1 {
         let mut last_pos = 0;
         let mut is_ordered = true;
-        for raw_token in inputs.raw_query_tokens {
-            if let Some(pos) = find_ignore_case(&search_target[last_pos..], raw_token) {
-                last_pos += pos + raw_token.len();
+        for token in inputs.query_tokens {
+            if let Some(pos) = search_target[last_pos..].find(token.as_str()) {
+                last_pos += pos + token.len();
             } else {
                 is_ordered = false;
                 break;
