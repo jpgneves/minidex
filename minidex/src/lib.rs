@@ -1432,8 +1432,8 @@ mod tests {
             path: PathBuf::from(format!("{}foo{}old.txt", sep, sep)),
             volume: "vol1".to_string(),
             kind: Kind::File,
-            last_modified: 100,
-            last_accessed: 100, // Very old
+            last_modified: 100 * 1_000_000, // 100 seconds
+            last_accessed: 100 * 1_000_000, // Very old
             category: 0,
             volume_type: VolumeType::Local,
         })?;
@@ -1442,8 +1442,8 @@ mod tests {
             path: PathBuf::from(&new_path),
             volume: "vol1".to_string(),
             kind: Kind::File,
-            last_modified: 1000,
-            last_accessed: 1000, // Newer
+            last_modified: 1000 * 1_000_000, // 1000 seconds
+            last_accessed: 1000 * 1_000_000, // Newer
             category: 0,
             volume_type: VolumeType::Local,
         })?;
