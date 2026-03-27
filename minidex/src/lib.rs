@@ -246,7 +246,7 @@ impl Index {
             std::thread::yield_now();
 
             if self.should_flush() {
-                let _ = self.trigger_flush()?;
+                self.trigger_flush()?;
             }
         }
 

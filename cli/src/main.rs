@@ -87,7 +87,7 @@ impl App {
         let config = CompactorConfig::default();
         let index_exists = std::path::Path::new(index_path).exists();
         let index = if index_exists {
-            Some(Arc::new(Index::open_with_config(index_path, config.clone())?))
+            Some(Arc::new(Index::open_with_config(index_path, config)?))
         } else {
             None
         };
@@ -109,7 +109,7 @@ impl App {
             input_mode: InputMode::Search,
             search_latencies_us: Vec::new(),
 
-            compactor_config: config.clone(),
+            compactor_config: config,
             config_selection: 0,
             edit_min_merge: config.min_merge_count.to_string(),
             edit_flush_threshold: config.flush_threshold.to_string(),
@@ -153,7 +153,7 @@ impl App {
             .tombstone_threshold(tombstone_threshold)
             .build();
 
-        self.compactor_config = config.clone();
+        self.compactor_config = config;
         self.index_path = self.edit_index_path.clone();
         // Index handles its own drop (sync + join threads)
         let index = Arc::new(Index::open_with_config(&self.index_path, config)?);
@@ -243,7 +243,8 @@ impl App {
                 }
             }
             InputMode::OpenIndex => {
-                self.edit_index_path.insert(self.target_cursor_position, new_char);
+                self.edit_index_path
+                    .insert(self.target_cursor_position, new_char);
                 self.move_cursor_right();
             }
         }
@@ -289,8 +290,14 @@ impl App {
             }
             InputMode::OpenIndex => {
                 if self.target_cursor_position != 0 {
-                    let left_to_left = self.edit_index_path.chars().take(self.target_cursor_position - 1);
-                    let right_to_left = self.edit_index_path.chars().skip(self.target_cursor_position);
+                    let left_to_left = self
+                        .edit_index_path
+                        .chars()
+                        .take(self.target_cursor_position - 1);
+                    let right_to_left = self
+                        .edit_index_path
+                        .chars()
+                        .skip(self.target_cursor_position);
                     self.edit_index_path = left_to_left.chain(right_to_left).collect();
                     self.move_cursor_left();
                 }
@@ -644,7 +651,7 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
                         && app.input_mode != InputMode::Config
                         && app.input_mode != InputMode::OpenIndex =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                     app.input_mode = InputMode::OpenIndex;
@@ -817,10 +824,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(p, area);
 
-        f.set_cursor_position((
-            area.x + app.target_cursor_position as u16 + 1,
-            area.y + 1,
-        ));
+        f.set_cursor_position((area.x + app.target_cursor_position as u16 + 1, area.y + 1));
     }
 }
 
@@ -972,7 +976,7 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         let mut sorted = app.search_latencies_us.clone();
         sorted.sort_unstable();
-        let avg = (sorted.iter().sum::<u128>() / sorted.len() as u128) as u128;
+        let avg = sorted.iter().sum::<u128>() / sorted.len() as u128;
         let p99 = sorted[((sorted.len() as f64 * 0.99) as usize).max(1) - 1];
         format!("Avg Latency: {} | P99: {}", format_us(avg), format_us(p99))
     };
@@ -1009,14 +1013,18 @@ fn ui_stats(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new("No search latency data available yet.")
                 .centered()
-                .block(Block::default().borders(Borders::ALL).title("Latency Stats")),
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Latency Stats"),
+                ),
             chunks[0],
         );
     } else {
         let mut sorted = app.search_latencies_us.clone();
         sorted.sort_unstable();
         let n = sorted.len();
-        
+
         let p50 = sorted[n / 2];
         let p75 = sorted[((n as f64 * 0.75) as usize).max(1) - 1];
         let p90 = sorted[((n as f64 * 0.90) as usize).max(1) - 1];
@@ -1061,19 +1069,17 @@ fn ui_stats(f: &mut Frame, app: &App, area: Rect) {
         0
     };
 
-    let mut indexing_info = vec![
-        Line::from(vec![
-            Span::raw("Indexing Status:        "),
-            Span::styled(
-                if indexing_active { "ACTIVE" } else { "IDLE" },
-                Style::default().fg(if indexing_active {
-                    Color::Yellow
-                } else {
-                    Color::Green
-                }),
-            ),
-        ]),
-    ];
+    let mut indexing_info = vec![Line::from(vec![
+        Span::raw("Indexing Status:        "),
+        Span::styled(
+            if indexing_active { "ACTIVE" } else { "IDLE" },
+            Style::default().fg(if indexing_active {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
+        ),
+    ])];
 
     if indexing_active {
         indexing_info.push(Line::from(vec![
@@ -1296,7 +1302,9 @@ fn ui_help(f: &mut Frame, app: &App, area: Rect) {
     let help_msg = match app.input_mode {
         InputMode::OpenIndex => "Esc: Cancel | Enter: Open Path",
         _ => match app.screen {
-            Screen::Search => "Esc: Quit | Tab: Switch | Ctrl+O: Open | Ctrl+R: Index | Ctrl+K: Compact | Ctrl+D: Delete",
+            Screen::Search => {
+                "Esc: Quit | Tab: Switch | Ctrl+O: Open | Ctrl+R: Index | Ctrl+K: Compact | Ctrl+D: Delete"
+            }
             Screen::Stats => "Esc: Quit | F1-F3: Switch | Ctrl+O: Open",
             Screen::Config => "Esc: Quit | Up/Down: Navigate | Enter: Apply | Ctrl+O: Open",
         },

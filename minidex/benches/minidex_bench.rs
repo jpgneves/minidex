@@ -88,7 +88,9 @@ fn bench_index_insert_batch(c: &mut Criterion) {
                     b.iter_with_setup(
                         || (0..size).map(create_entry).collect::<Vec<_>>(),
                         |entries| {
-                            index.insert_batch(entries, cs).expect("failed to insert batch");
+                            index
+                                .insert_batch(entries, cs)
+                                .expect("failed to insert batch");
                         },
                     );
                 },
