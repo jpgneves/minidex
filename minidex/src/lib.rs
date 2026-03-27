@@ -414,8 +414,6 @@ impl Index {
                 let map = segment.as_ref().as_ref();
                 if let Some(post_offset) = map.get(vol_token) {
                     segment.append_posting_list(post_offset, &mut current_matches);
-                    current_matches.sort_unstable();
-                    current_matches.dedup();
                     first_token = false;
                 } else {
                     continue;
@@ -435,12 +433,18 @@ impl Index {
                 let map = segment.as_ref().as_ref();
                 let mut stream = map.search(&matcher).into_stream();
 
+                let mut term_count = 0;
+
                 while let Some((_, post_offset)) = stream.next() {
                     segment.append_posting_list(post_offset, &mut token_docs);
+                    term_count += 1;
                 }
 
-                token_docs.sort_unstable();
-                token_docs.dedup();
+                // TODO - maybe introduce union sorted arrays
+                if term_count > 1 {
+                    token_docs.sort_unstable();
+                    token_docs.dedup();
+                }
 
                 if first_token {
                     std::mem::swap(&mut current_matches, &mut token_docs);
@@ -584,6 +588,12 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
+        let required_matches = offset + limit;
+        // Buffer to account for items that might be filtered out by volume or tombstones
+        let disk_cap = required_matches + 500;
+
+        let mut mem_candidates = Vec::new();
+
         for (id, &metadata) in mem.metadata.iter().enumerate() {
             let (_, _, last_accessed, _, is_dir, doc_category, doc_volume_type) =
                 SegmentedIndex::unpack_u128(metadata);
@@ -607,20 +617,38 @@ impl Index {
                     continue;
                 }
 
-                if let Some((path, volume, entry)) = mem.id_to_data.get(&(id as u32)) {
-                    if let Some(filter) = options.volume_name
-                        && volume != filter
-                    {
-                        continue;
-                    }
-                    collector.insert(path.as_str(), volume.as_str(), *entry);
-                }
+                mem_candidates.push((metadata, id as u32));
             }
         }
 
-        let required_matches = offset + limit;
-        // Buffer to account for items that might be filtered out by volume or tombstones
-        let disk_cap = required_matches + 500;
+        // Top-K truncation here
+        if mem_candidates.len() > disk_cap {
+            mem_candidates.select_nth_unstable_by(disk_cap, |a, b| {
+                // Inline bitwise extraction to avoid incurring type conversion penalties
+                let last_modified_a = ((a.0 >> 40) & 0x3_FFFF_FFFF) as u64;
+                let last_accessed_a = ((a.0 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let last_modified_b = ((b.0 >> 40) & 0x3_FFFF_FFFF) as u64;
+                let last_accessed_b = ((b.0 >> 74) & 0x3_FFFF_FFFF) as u64;
+
+                last_accessed_b
+                    .cmp(&last_accessed_a)
+                    .then_with(|| last_modified_b.cmp(&last_modified_a))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            mem_candidates.truncate(disk_cap);
+        }
+
+        // Late materialization
+        for (_, id) in mem_candidates {
+            if let Some((path, volume, entry)) = mem.id_to_data.get(&{ id }) {
+                if let Some(filter) = options.volume_name
+                    && volume != filter
+                {
+                    continue;
+                }
+                collector.insert(path.as_str(), volume.as_str(), *entry);
+            }
+        }
 
         let mut disk_candidates: Vec<(&std::sync::Arc<Segment>, u128)> = Vec::new();
 
@@ -650,7 +678,6 @@ impl Index {
                         continue;
                     }
 
-                    // DO NOT read the document yet! Just save the integer.
                     disk_candidates.push((segment, packed));
                 }
             }
@@ -658,11 +685,15 @@ impl Index {
 
         if disk_candidates.len() > disk_cap {
             disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                let (_, a_mod, a_acc, _, _, _, _) = SegmentedIndex::unpack_u128(a.1);
-                let (_, b_mod, b_acc, _, _, _, _) = SegmentedIndex::unpack_u128(b.1);
-                b_acc
-                    .cmp(&a_acc) // Sort descending by access time
-                    .then_with(|| b_mod.cmp(&a_mod)) // Then by modified time
+                // Inline bitwise extraction to avoid incurring type conversion penalties
+                let last_modified_a = ((a.1 >> 40) & 0x3_FFFF_FFFF) as u64;
+                let last_accessed_a = ((a.1 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let last_modified_b = ((b.1 >> 40) & 0x3_FFFF_FFFF) as u64;
+                let last_accessed_b = ((b.1 >> 74) & 0x3_FFFF_FFFF) as u64;
+
+                last_accessed_b
+                    .cmp(&last_accessed_a) // Sort descending by access time
+                    .then_with(|| last_modified_b.cmp(&last_modified_a)) // Then by modified time
                     .then_with(|| a.1.cmp(&b.1))
             });
             disk_candidates.truncate(disk_cap);
