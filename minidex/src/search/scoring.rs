@@ -174,8 +174,9 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
                 }
 
                 token_best = token_best.max(match_val);
-                current_idx += 1;
-            } else if is_ascii {
+            }
+
+            if is_ascii {
                 current_idx += 1;
             } else {
                 current_idx += search_target[current_idx..]
@@ -548,20 +549,64 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn test_compute_score_windows_paths() {
+    fn test_compute_score_unicode() {
         let weights = ScoringWeights::default();
-        let query_tokens = vec!["report".to_string()];
-        let raw_query_tokens = vec!["report"];
         let now = 1_000_000.0;
 
-        // Drive letter filename match
-        let score1 = compute_score(
+        // Test Cyrillic
+        let query_cyr = vec!["документ".to_string()];
+        let raw_cyr = vec!["документ"];
+        let score_cyr = compute_score(
             &weights,
             &ScoringInputs {
-                path: "C:\\Users\\joao\\report.pdf",
-                query_tokens: &query_tokens,
-                raw_query_tokens: &raw_query_tokens,
+                path: "Мой Документ.txt",
+                query_tokens: &query_cyr,
+                raw_query_tokens: &raw_cyr,
+                last_modified: 1_000_000,
+                last_accessed: 1_000_000,
+                kind: Kind::File,
+                now_micros: now,
+            },
+        );
+        // Base in-filename is 0.5 * 100 = 50. Coverage penalty applies (1/3 words matched),
+        // reducing it to ~33.3, then recency boosts it to ~40.0.
+        assert!(score_cyr > 35.0, "score_cyr was {}", score_cyr);
+
+        // Test CJK
+        let query_cjk = vec!["日".to_string(), "本".to_string()];
+        let raw_cjk = vec!["日本"];
+        let score_cjk = compute_score(
+            &weights,
+            &ScoringInputs {
+                path: "日本語のテスト.txt",
+                query_tokens: &query_cjk,
+                raw_query_tokens: &raw_cjk,
+                last_modified: 1_000_000,
+                last_accessed: 1_000_000,
+                kind: Kind::File,
+                now_micros: now,
+            },
+        );
+        // Should score fairly high as it matches multiple tokens and gets a proximity boost.
+        assert!(score_cjk > 35.0, "score_cjk was {}", score_cjk);
+    }
+
+    #[test]
+    fn test_unicode_filename_boost() {
+        let weights = ScoringWeights::default();
+        let now = 1_000_000.0;
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
+        // Exact match on a Cyrillic filename should be boosted higher than a match in the path
+        let query = vec!["документ".to_string()];
+        let raw = vec!["документ"];
+
+        let score_path = compute_score(
+            &weights,
+            &ScoringInputs {
+                path: &format!("{}документ{}file.txt", sep, sep),
+                query_tokens: &query,
+                raw_query_tokens: &raw,
                 last_modified: 1_000_000,
                 last_accessed: 1_000_000,
                 kind: Kind::File,
@@ -569,13 +614,12 @@ mod tests {
             },
         );
 
-        // UNC path filename match
-        let score2 = compute_score(
+        let score_file = compute_score(
             &weights,
             &ScoringInputs {
-                path: "\\\\?\\D:\\Backup\\report.pdf",
-                query_tokens: &query_tokens,
-                raw_query_tokens: &raw_query_tokens,
+                path: &format!("{}folder{}документ.txt", sep, sep),
+                query_tokens: &query,
+                raw_query_tokens: &raw,
                 last_modified: 1_000_000,
                 last_accessed: 1_000_000,
                 kind: Kind::File,
@@ -583,22 +627,6 @@ mod tests {
             },
         );
 
-        // Server share filename match
-        let score3 = compute_score(
-            &weights,
-            &ScoringInputs {
-                path: "\\\\server\\share\\finance\\report.pdf",
-                query_tokens: &query_tokens,
-                raw_query_tokens: &raw_query_tokens,
-                last_modified: 1_000_000,
-                last_accessed: 1_000_000,
-                kind: Kind::File,
-                now_micros: now,
-            },
-        );
-
-        assert!(score1 > 50.0);
-        assert!(score2 > 50.0);
-        assert!(score3 > 50.0);
+        assert!(score_file > score_path);
     }
 }

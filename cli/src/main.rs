@@ -85,15 +85,20 @@ struct App {
 impl App {
     fn new(index_path: &str, index_target: String) -> Result<Self> {
         let config = CompactorConfig::default();
-        let index_exists = std::path::Path::new(index_path).exists();
+        let abs_index_path = std::path::Path::new(index_path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| index_path.to_string());
+
+        let index_exists = std::path::Path::new(&abs_index_path).exists();
         let index = if index_exists {
-            Some(Arc::new(Index::open_with_config(index_path, config)?))
+            Some(Arc::new(Index::open_with_config(&abs_index_path, config)?))
         } else {
             None
         };
         let target_len = index_target.len();
         let mut app = App {
-            index_path: index_path.to_string(),
+            index_path: abs_index_path.clone(),
             index,
             screen: Screen::Search,
             input: String::new(),
@@ -111,8 +116,8 @@ impl App {
 
             compactor_config: config,
             config_selection: 0,
-            edit_min_merge: config.min_merge_count.to_string(),
             edit_flush_threshold: config.flush_threshold.to_string(),
+            edit_min_merge: config.min_merge_count.to_string(),
             edit_tombstone_threshold: config.tombstone_threshold.to_string(),
             use_batch_insert: true,
             edit_batch_size: "10000".to_string(),
@@ -120,7 +125,7 @@ impl App {
             last_indexing_mode: Arc::new(AtomicBool::new(true)),
             last_indexing_batch_size: Arc::new(AtomicU64::new(0)),
 
-            edit_index_path: index_path.to_string(),
+            edit_index_path: abs_index_path,
         };
         app.update_search();
         Ok(app)
@@ -132,8 +137,8 @@ impl App {
         }
 
         let config = CompactorConfigBuilder::new()
-            .min_merge_count(self.edit_min_merge.parse().unwrap_or(8))
             .flush_threshold(self.edit_flush_threshold.parse().unwrap_or(100000))
+            .min_merge_count(self.edit_min_merge.parse().unwrap_or(8))
             .tombstone_threshold(self.edit_tombstone_threshold.parse().unwrap_or(2500))
             .build();
 
@@ -143,18 +148,27 @@ impl App {
     }
 
     fn reopen_index(&mut self) -> Result<()> {
-        let min_merge = self.edit_min_merge.parse().unwrap_or(8);
         let flush_threshold = self.edit_flush_threshold.parse().unwrap_or(100000);
+        let min_merge = self.edit_min_merge.parse().unwrap_or(8);
         let tombstone_threshold = self.edit_tombstone_threshold.parse().unwrap_or(2500);
 
         let config = CompactorConfigBuilder::new()
-            .min_merge_count(min_merge)
             .flush_threshold(flush_threshold)
+            .min_merge_count(min_merge)
             .tombstone_threshold(tombstone_threshold)
             .build();
 
         self.compactor_config = config;
-        self.index_path = self.edit_index_path.clone();
+
+        // Try to canonicalize the path if it changed
+        let abs_path = std::path::Path::new(&self.edit_index_path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.edit_index_path.clone());
+
+        self.index_path = abs_path;
+        self.edit_index_path = self.index_path.clone();
+
         // Index handles its own drop (sync + join threads)
         let index = Arc::new(Index::open_with_config(&self.index_path, config)?);
         self.index = Some(Arc::clone(&index));
@@ -201,8 +215,8 @@ impl App {
             }
             InputMode::Config => {
                 let len = match self.config_selection {
-                    0 => self.edit_min_merge.len(),
-                    1 => self.edit_flush_threshold.len(),
+                    0 => self.edit_flush_threshold.len(),
+                    1 => self.edit_min_merge.len(),
                     2 => self.edit_tombstone_threshold.len(),
                     3 => 0, // Toggle field
                     _ => self.edit_batch_size.len(),
@@ -232,8 +246,8 @@ impl App {
                 if new_char.is_ascii_digit() {
                     let target_pos = self.target_cursor_position;
                     let current_val = match self.config_selection {
-                        0 => &mut self.edit_min_merge,
-                        1 => &mut self.edit_flush_threshold,
+                        0 => &mut self.edit_flush_threshold,
+                        1 => &mut self.edit_min_merge,
                         2 => &mut self.edit_tombstone_threshold,
                         3 => return, // Toggle field
                         _ => &mut self.edit_batch_size,
@@ -276,8 +290,8 @@ impl App {
                 if self.target_cursor_position != 0 {
                     let target_pos = self.target_cursor_position;
                     let current_val = match self.config_selection {
-                        0 => &mut self.edit_min_merge,
-                        1 => &mut self.edit_flush_threshold,
+                        0 => &mut self.edit_flush_threshold,
+                        1 => &mut self.edit_min_merge,
                         2 => &mut self.edit_tombstone_threshold,
                         3 => return, // Toggle field
                         _ => &mut self.edit_batch_size,
@@ -307,8 +321,8 @@ impl App {
 
     fn get_config_value_mut(&mut self) -> &mut String {
         match self.config_selection {
-            0 => &mut self.edit_min_merge,
-            1 => &mut self.edit_flush_threshold,
+            0 => &mut self.edit_flush_threshold,
+            1 => &mut self.edit_min_merge,
             2 => &mut self.edit_tombstone_threshold,
             3 => panic!("toggle field has no string value"),
             _ => &mut self.edit_batch_size,
@@ -337,7 +351,7 @@ impl App {
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_micros() as u64;
+                .as_secs();
 
             match index.recent_files(five_days_ago, 100, 0, options) {
                 Ok(results) => {
@@ -466,7 +480,6 @@ impl App {
             std::thread::spawn(move || {
                 let mut builder = WalkBuilder::new(path_clone);
                 let walk = builder
-                    .threads(4)
                     .hidden(false)
                     .ignore(true)
                     .git_ignore(true)
@@ -482,9 +495,12 @@ impl App {
 
             let start = std::time::Instant::now();
             if use_batch {
-                let _ = index.insert_batch(rx.into_iter(), batch_size);
+                let _ = index.insert_batch(rx, batch_size);
             } else {
                 for entry in rx {
+                    // We need a way to insert with tokens in 1-by-1 mode too for parity
+                    // For now, insert_batch with size 1 would work, or we can just use insert
+                    // since the bottleneck was mainly the batch lock hold time.
                     let _ = index.insert(entry);
                 }
             }
@@ -781,7 +797,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     ui_help(f, app, chunks[2]);
 
     if app.input_mode == InputMode::OpenIndex {
-        let area = centered_rect(60, 20, f.area());
+        let area = centered_rect(60, 10, f.area());
         f.render_widget(Clear, area); // clear the background
         let block = Block::default()
             .title(" Open Index at Path ")
@@ -901,7 +917,11 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
 
             let modified =
                 chrono::DateTime::from_timestamp((res.last_modified / 1_000_000) as i64, 0)
-                    .map(|dt| dt.format("%y-%m-%d %H:%M").to_string())
+                    .map(|dt| dt.format("%y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "N/A".to_string());
+            let accessed =
+                chrono::DateTime::from_timestamp((res.last_modified / 1_000_000) as i64, 0)
+                    .map(|dt| dt.format("%y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| "N/A".to_string());
 
             let content = Line::from(vec![
@@ -916,6 +936,10 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(format!("[{:>5.1}] ", res.score), score_style),
                 Span::styled(
                     format!("M:{} ", modified),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("A:{} ", accessed),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::raw(res.path.to_string_lossy()),
@@ -1155,8 +1179,8 @@ fn ui_config(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     let compactor_fields = [
-        ("Min Merge Count", &app.edit_min_merge),
         ("Flush Threshold", &app.edit_flush_threshold),
+        ("Min Merge Count", &app.edit_min_merge),
         ("Tombstone Threshold", &app.edit_tombstone_threshold),
     ];
 

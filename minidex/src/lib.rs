@@ -76,24 +76,11 @@ impl Index {
         let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
 
         let base = Arc::new(RwLock::new(base));
-        let mut max_seq = 0u64;
         let mut mem_idx = MemTable::default();
 
         let mut prefix_tombstones = Vec::new();
 
-        let mut apply_replay = |replay_data: crate::wal::ReplayData| {
-            for (path, volume, entry) in replay_data.inserts {
-                max_seq = max_seq.max(entry.opstamp.sequence());
-                mem_idx.insert(path, volume, entry);
-            }
-            for (volume, prefix, seq) in replay_data.tombstones {
-                max_seq = max_seq.max(seq);
-                prefix_tombstones.push((volume, prefix, seq));
-            }
-        };
-
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
-
         let mut flushing_wals = Vec::new();
 
         // Recover partial, flushing WAL files
@@ -106,18 +93,68 @@ impl Index {
                 flushing_wals.push(e.path());
             }
         }
-        flushing_wals.sort_unstable();
 
-        for wal_path in flushing_wals {
+        let mut orphaned_wals = flushing_wals.clone();
+        orphaned_wals.sort_by_key(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.split('.').nth(1))
+                .and_then(|seq_str| seq_str.parse::<u64>().ok())
+                .unwrap_or(0)
+        });
+
+        // Parse all recovered WALs into memory once
+        let mut all_recovered_data = Vec::new();
+        for wal_path in &orphaned_wals {
             let partial = Wal::replay(wal_path).map_err(IndexError::Io)?;
-
-            apply_replay(partial);
+            all_recovered_data.push(partial);
         }
 
         let wal_path = path.as_ref().join("journal.wal");
 
-        let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
-        apply_replay(recovered);
+        if wal_path.exists() {
+            let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
+            all_recovered_data.push(recovered);
+        }
+
+        // Heal the on-disk WALs from recovered data
+
+        if !orphaned_wals.is_empty() {
+            let healed_wal_path = path.as_ref().join("journal.healed.wal");
+            let mut healed_wal = Wal::open(&healed_wal_path).map_err(IndexError::Io)?;
+
+            for partial in &all_recovered_data {
+                for (p, v, e) in &partial.inserts {
+                    healed_wal.append(p, v, e).map_err(IndexError::Io)?;
+                }
+                for (v, p, s) in &partial.tombstones {
+                    healed_wal
+                        .write_prefix_tombstone(v.as_deref(), p, *s)
+                        .map_err(IndexError::Io)?;
+                }
+            }
+            healed_wal.flush().map_err(IndexError::Io)?;
+
+            std::fs::rename(&healed_wal_path, &wal_path).map_err(IndexError::Io)?;
+
+            for orphaned in orphaned_wals {
+                let _ = std::fs::remove_file(&orphaned);
+            }
+        }
+
+        // Consume WAL data into memory
+        let mut max_seq = 0u64;
+        for partial in all_recovered_data {
+            for (path, volume, entry) in partial.inserts {
+                max_seq = max_seq.max(entry.opstamp.sequence());
+                let tokens = crate::tokenizer::tokenize(&path);
+                mem_idx.insert_with_tokens(path, volume, entry, tokens);
+            }
+            for (volume, prefix, seq) in partial.tombstones {
+                max_seq = max_seq.max(seq);
+                prefix_tombstones.push((volume, prefix, seq));
+            }
+        }
 
         let next_op_seq = Arc::new(AtomicU64::new(max_seq + 1));
 
@@ -204,13 +241,15 @@ impl Index {
         let mut iter = items.into_iter();
 
         loop {
-            let chunk: Vec<(String, String, IndexEntry)> = iter
+            let chunk: Vec<(String, String, IndexEntry, Vec<String>)> = iter
                 .by_ref()
                 .take(chunk_size)
                 .map(|item| {
                     let seq = self.next_op_seq();
+                    let path_str = item.path.to_string_lossy().into_owned();
+                    let tokens = crate::tokenizer::tokenize(&path_str);
                     (
-                        item.path.to_string_lossy().into_owned(),
+                        path_str,
                         item.volume,
                         IndexEntry {
                             opstamp: Opstamp::insertion(seq),
@@ -220,6 +259,7 @@ impl Index {
                             category: item.category,
                             volume_type: item.volume_type,
                         },
+                        tokens,
                     )
                 })
                 .collect();
@@ -231,15 +271,15 @@ impl Index {
             {
                 let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
 
-                for (path, volume, entry) in &chunk {
+                for (path, volume, entry, _) in &chunk {
                     wal.append(path, volume, entry)?;
                 }
             }
 
             {
                 let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
-                for (path, volume, entry) in chunk {
-                    mem.insert(path, volume, entry);
+                for (path, volume, entry, tokens) in chunk {
+                    mem.insert_with_tokens(path, volume, entry, tokens);
                 }
             }
 
@@ -629,7 +669,7 @@ impl Index {
     /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
     pub fn recent_files(
         &self,
-        since: u64, // Renamed 'until' to 'since' for clarity
+        since_secs: u64, // Renamed 'until' to 'since' for clarity
         limit: usize,
         offset: usize,
         options: SearchOptions<'_>,
@@ -657,7 +697,7 @@ impl Index {
             let (_, _, last_accessed, _, is_dir, doc_category, doc_volume_type) =
                 SegmentedIndex::unpack_u128(metadata);
 
-            if last_accessed >= since {
+            if last_accessed >= since_secs {
                 if let Some(kind) = options.kind {
                     let is_target_dir = kind == Kind::Directory;
                     let is_entry_dir = is_dir;
@@ -686,13 +726,22 @@ impl Index {
                 // Inline bitwise extraction to avoid incurring type conversion penalties
                 let last_modified_a = ((a.0 >> 40) & 0x3_FFFF_FFFF) as u64;
                 let last_accessed_a = ((a.0 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let recent_a = if last_modified_a < last_accessed_a {
+                    last_accessed_a
+                } else {
+                    last_modified_a
+                };
                 let last_modified_b = ((b.0 >> 40) & 0x3_FFFF_FFFF) as u64;
                 let last_accessed_b = ((b.0 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let recent_b = if last_modified_b < last_accessed_b {
+                    last_accessed_b
+                } else {
+                    last_modified_b
+                };
 
-                last_accessed_b
-                    .cmp(&last_accessed_a)
-                    .then_with(|| last_modified_b.cmp(&last_modified_a))
-                    .then_with(|| a.0.cmp(&b.0))
+                recent_b
+                    .cmp(&recent_a) // Sort descending by last access time
+                    .then_with(|| a.1.cmp(&b.1))
             });
             mem_candidates.truncate(disk_cap);
         }
@@ -719,7 +768,7 @@ impl Index {
                 let (_, _, accessed, _, is_dir, doc_category, doc_vol_type) =
                     SegmentedIndex::unpack_u128(packed);
 
-                if accessed >= since {
+                if accessed >= since_secs {
                     if let Some(target_kind) = options.kind {
                         let is_target_dir = target_kind == Kind::Directory;
                         if is_dir != is_target_dir {
@@ -747,13 +796,25 @@ impl Index {
                 // Inline bitwise extraction to avoid incurring type conversion penalties
                 let last_modified_a = ((a.1 >> 40) & 0x3_FFFF_FFFF) as u64;
                 let last_accessed_a = ((a.1 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let recent_a = if last_modified_a < last_accessed_a {
+                    last_accessed_a
+                } else {
+                    last_modified_a
+                };
                 let last_modified_b = ((b.1 >> 40) & 0x3_FFFF_FFFF) as u64;
                 let last_accessed_b = ((b.1 >> 74) & 0x3_FFFF_FFFF) as u64;
+                let recent_b = if last_modified_b < last_accessed_b {
+                    last_accessed_b
+                } else {
+                    last_modified_b
+                };
 
-                last_accessed_b
-                    .cmp(&last_accessed_a) // Sort descending by access time
-                    .then_with(|| last_modified_b.cmp(&last_modified_a)) // Then by modified time
-                    .then_with(|| a.1.cmp(&b.1))
+                let offset_a = a.1 & 0x0000_00FF_FFFF_FFFF;
+                let offset_b = b.1 & 0x0000_00FF_FFFF_FFFF;
+
+                recent_b
+                    .cmp(&recent_a) // Sort descending by last access time
+                    .then_with(|| offset_a.cmp(&offset_b))
             });
             disk_candidates.truncate(disk_cap);
         }
@@ -775,19 +836,19 @@ impl Index {
 
         if results.len() > required_matches {
             results.select_nth_unstable_by(required_matches, |a, b| {
-                b.2.last_accessed
-                    .cmp(&a.2.last_accessed)
-                    .then_with(|| b.2.last_modified.cmp(&a.2.last_modified))
-                    .then_with(|| a.0.cmp(&b.0))
+                let recent_a = a.2.last_accessed.max(a.2.last_modified);
+                let recent_b = b.2.last_accessed.max(b.2.last_modified);
+
+                recent_b.cmp(&recent_a).then_with(|| a.0.cmp(&b.0)) // Path string tie-breaker
             });
             results.truncate(required_matches);
         }
 
         results.sort_unstable_by(|a, b| {
-            b.2.last_accessed
-                .cmp(&a.2.last_accessed)
-                .then_with(|| b.2.last_modified.cmp(&a.2.last_modified))
-                .then_with(|| a.0.cmp(&b.0))
+            let recent_a = a.2.last_accessed.max(a.2.last_modified);
+            let recent_b = b.2.last_accessed.max(b.2.last_modified);
+
+            recent_b.cmp(&recent_a).then_with(|| a.0.cmp(&b.0))
         });
 
         let paginated_results = results
@@ -1146,6 +1207,32 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert!(results[0].path.to_string_lossy().contains("file_42.txt"));
         }
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_unicode_path() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_lib_unicode_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let index = Index::open(&temp_dir)?;
+        let unicode_path = "/home/user/日本語の文書.txt";
+        index.insert(FilesystemEntry {
+            path: PathBuf::from(unicode_path),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: category::TEXT,
+            volume_type: VolumeType::Local,
+        })?;
+
+        // Search for a fragment
+        let results = index.search("日本語", 10, 0, SearchOptions::default())?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, PathBuf::from(unicode_path));
 
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())

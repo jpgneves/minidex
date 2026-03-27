@@ -23,6 +23,17 @@ pub(crate) struct MemTable {
 
 impl MemTable {
     pub fn insert(&mut self, path: String, volume: String, entry: IndexEntry) {
+        let tokens = crate::tokenizer::tokenize(&path);
+        self.insert_with_tokens(path, volume, entry, tokens);
+    }
+
+    pub fn insert_with_tokens(
+        &mut self,
+        path: String,
+        volume: String,
+        entry: IndexEntry,
+        tokens: Vec<String>,
+    ) {
         if let Some(id) = self.path_to_id.get(&path) {
             self.id_to_data
                 .insert(*id, (path.clone(), volume.clone(), entry));
@@ -32,8 +43,8 @@ impl MemTable {
                 .count() as u16;
             self.metadata[*id as usize] = SegmentedIndex::pack_u128(
                 *id as u64,
-                entry.last_modified,
-                entry.last_accessed,
+                entry.last_modified / 1_000_000,
+                entry.last_accessed / 1_000_000,
                 depth,
                 entry.kind == Kind::Directory,
                 entry.category,
@@ -65,7 +76,6 @@ impl MemTable {
 
         self.metadata.push(meta);
 
-        let tokens = crate::tokenizer::tokenize(&path);
         for token in tokens {
             self.inverted_index.entry(token).or_default().push(id);
         }

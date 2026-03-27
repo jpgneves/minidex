@@ -392,8 +392,8 @@ impl SegmentedIndex {
 
             let packed_meta = Self::pack_u128(
                 current_dat_offset,
-                entry.last_modified,
-                entry.last_accessed,
+                entry.last_modified / 1_000_000,
+                entry.last_accessed / 1_000_000,
                 depth,
                 is_dir,
                 entry.category,
@@ -535,18 +535,18 @@ impl SegmentedIndex {
             packed |= 1 << 116;
         }
         packed |= ((category as u128) & 0xFF) << 117;
-        packed |= ((volume_type as u128) & 0b11) << 124;
+        packed |= ((volume_type as u128) & 0b11) << 125;
         packed
     }
 
     pub fn unpack_u128(packed: u128) -> (u64, u64, u64, u16, bool, u8, u8) {
         let offset = (packed & 0x0000_00FF_FFFF_FFFF) as u64;
-        let last_modified = ((packed >> 40) & 0x3_FFFF_FFFF) as u64;
-        let last_accessed = ((packed >> 74) & 0x3_FFFF_FFFF) as u64;
+        let last_modified = ((packed >> 40) & 0x3_FFFF_FFFF) as u64; // In seconds
+        let last_accessed = ((packed >> 74) & 0x3_FFFF_FFFF) as u64; // In seconds
         let depth = ((packed >> 108) & 0xFF) as u16;
         let is_dir = ((packed >> 116) & 1) == 1;
         let category = ((packed >> 117) & 0xFF) as u8;
-        let volume_type = ((packed >> 124) & 0b11) as u8;
+        let volume_type = ((packed >> 125) & 0b11) as u8;
         (
             offset,
             last_modified,

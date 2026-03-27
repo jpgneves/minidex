@@ -60,7 +60,7 @@ pub(crate) fn evaluate_candidate(
     let depth = ((packed >> 108) & 0xFF) as u64;
     let is_dir = ((packed >> 116) & 1) as u64; // Yields exactly 1 or 0
     let category = ((packed >> 117) & 0xFF) as u8;
-    let volume_type = ((packed >> 124) & 0b11) as u8;
+    let volume_type = ((packed >> 125) & 0b11) as u8;
 
     // Apply fast bitwise filters first
     if let Some(target_kind) = options.kind {

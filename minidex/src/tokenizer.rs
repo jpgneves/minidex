@@ -150,6 +150,21 @@ mod tests {
         let tokens = tokenize("日本語");
         // CJK characters should be fragmented
         assert_eq!(tokens, vec!["日", "本", "語"]);
+
+        // "한국어" (Korean)
+        let tokens2 = tokenize("한국어");
+        // Korean characters are decomposed in NFD
+        // "국", "어", "한" (sorted)
+        assert_eq!(tokens2, vec!["국", "어", "한"]);
+    }
+
+    #[test]
+    fn test_tokenize_cyrillic() {
+        let tokens = tokenize("Документ.txt");
+        // Cyrillic is usually not fragmented like CJK unless there are boundaries
+        // but it should be lowercased and normalized.
+        // Tokens are sorted: ["txt", "документ", "документ.txt"]
+        assert_eq!(tokens, vec!["txt", "документ", "документ.txt"]);
     }
 
     #[test]
