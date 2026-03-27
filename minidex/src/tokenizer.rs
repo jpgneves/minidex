@@ -90,6 +90,34 @@ fn is_cjk(c: char) -> bool {
     (0xAC00..=0xD7AF).contains(&u) // Hangul Syllables
 }
 
+/// Generate all tokens, including synthetic tokens.
+pub fn extract_all_tokens(path: &str, volume: &str) -> Vec<String> {
+    let mut tokens = tokenize(path);
+    let path_lower = path.to_lowercase();
+
+    // Synthetic path fragments
+    for (i, _) in path_lower.match_indices(['/', '\\']) {
+        if i > 0 {
+            tokens.push(synthesize_path_token(&path_lower[..=i]));
+        }
+    }
+
+    // Synthetic volume token
+    if !volume.is_empty() {
+        tokens.push(synthesize_volume_token(&volume.to_lowercase()));
+    }
+
+    // Synthetic extension token
+    if let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        tokens.push(synthesize_ext_token(&ext.to_lowercase()));
+    }
+
+    tokens
+}
+
 /// Folds an entire path string for substring matching in the in-memory index
 pub(crate) fn fold_path(input: &str) -> String {
     input

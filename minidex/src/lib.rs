@@ -1,5 +1,4 @@
 use std::{
-    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -47,6 +46,7 @@ pub struct Index {
     base: Arc<RwLock<SegmentedIndex>>,
     next_op_seq: Arc<AtomicU64>,
     mem_idx: RwLock<MemTable>,
+    flushing_mem: Arc<RwLock<Option<Arc<MemTable>>>>, // for double buffering
     wal: RwLock<Wal>,
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -147,7 +147,7 @@ impl Index {
         for partial in all_recovered_data {
             for (path, volume, entry) in partial.inserts {
                 max_seq = max_seq.max(entry.opstamp.sequence());
-                let tokens = crate::tokenizer::tokenize(&path);
+                let tokens = crate::tokenizer::extract_all_tokens(&path, &volume);
                 mem_idx.insert_with_tokens(path, volume, entry, tokens);
             }
             for (volume, prefix, seq) in partial.tombstones {
@@ -165,6 +165,7 @@ impl Index {
             base,
             next_op_seq,
             mem_idx: RwLock::new(mem_idx),
+            flushing_mem: Arc::new(RwLock::new(None)),
             wal: RwLock::new(wal),
             compactor_config,
             compactor: Arc::new(RwLock::new(None)),
@@ -180,24 +181,7 @@ impl Index {
 
     /// Insert a filesystem entry into the index.
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
-        let threshold = self.compactor_config.flush_threshold * 3;
-
-        // Backpressure mechanism - block inserts if we're blowing through
-        // the flushing threshold.
-        if self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len() > threshold {
-            let flusher = {
-                self.flusher
-                    .write()
-                    .map_err(|_| IndexError::WriteLock)?
-                    .take()
-            };
-
-            if let Some(handle) = flusher {
-                let _ = handle.join();
-            }
-
-            let _ = self.trigger_flush();
-        }
+        self.apply_backpressure_if_needed()?;
 
         let seq = self.next_op_seq();
         let path_str = item.path.to_string_lossy().to_string();
@@ -241,13 +225,15 @@ impl Index {
         let mut iter = items.into_iter();
 
         loop {
+            self.apply_backpressure_if_needed()?;
+
             let chunk: Vec<(String, String, IndexEntry, Vec<String>)> = iter
                 .by_ref()
                 .take(chunk_size)
                 .map(|item| {
                     let seq = self.next_op_seq();
                     let path_str = item.path.to_string_lossy().into_owned();
-                    let tokens = crate::tokenizer::tokenize(&path_str);
+                    let tokens = crate::tokenizer::extract_all_tokens(&path_str, &item.volume);
                     (
                         path_str,
                         item.volume,
@@ -294,6 +280,7 @@ impl Index {
     }
 
     pub fn delete(&self, item: &Path) -> Result<(), IndexError> {
+        self.apply_backpressure_if_needed()?;
         let seq = self.next_op_seq();
 
         let path_str = item.to_string_lossy().to_string();
@@ -396,6 +383,13 @@ impl Index {
         let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
+        let flushing_arc = &self
+            .flushing_mem
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .as_ref()
+            .cloned();
+
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
 
@@ -409,90 +403,25 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        let mut mem_candidates: Option<Vec<u32>> = None;
-        let mut mem_intersect_buf = Vec::new();
-
         // In-memory searches
-        if !tokens.is_empty() {
-            for token in &tokens {
-                let mut end_bound = String::with_capacity(token.len() + 4);
-                end_bound.push_str(token);
-                end_bound.push('\u{FFFF}');
+        crate::search::scan_mem_for_search(
+            &mem,
+            &mut collector,
+            &tokens,
+            scoring_cap,
+            &options,
+            volume_type_mask,
+        );
 
-                let matching_arrays: Vec<&Vec<u32>> = mem
-                    .inverted_index
-                    .range::<str, _>((
-                        Bound::Included(token.as_str()),
-                        Bound::Included(end_bound.as_str()),
-                    ))
-                    .map(|(_, ids)| ids)
-                    .collect();
-
-                if matching_arrays.is_empty() {
-                    mem_candidates = Some(Vec::new());
-                    break;
-                }
-
-                let current_token_ids = if matching_arrays.len() == 1 {
-                    std::borrow::Cow::Borrowed(matching_arrays[0])
-                } else {
-                    let mut merged = Vec::new();
-                    for ids in matching_arrays {
-                        merged.extend_from_slice(ids);
-                    }
-                    merged.sort_unstable();
-                    merged.dedup();
-                    std::borrow::Cow::Owned(merged)
-                };
-
-                match mem_candidates.as_mut() {
-                    // Two point merge in the RAM path
-                    Some(existing) => {
-                        mem_intersect_buf.clear();
-                        crate::simd::intersect_arrays(
-                            existing,
-                            &current_token_ids,
-                            &mut mem_intersect_buf,
-                        );
-                        std::mem::swap(existing, &mut mem_intersect_buf);
-                    }
-                    None => mem_candidates = Some(current_token_ids.into_owned()),
-                }
-
-                if let Some(c) = &mem_candidates
-                    && c.is_empty()
-                {
-                    break;
-                }
-            }
-        } else {
-            mem_candidates = Some(mem.id_to_data.keys().copied().collect());
-        }
-
-        if let Some(candidates) = mem_candidates {
-            let mut mem_sortable = Vec::with_capacity(candidates.len());
-
-            for id in candidates {
-                let metadata = mem.metadata[id as usize];
-
-                if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask) {
-                    mem_sortable.push((sort_key, id));
-                }
-            }
-
-            // Top-K truncation in memory
-            crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
-
-            for (_, id) in mem_sortable {
-                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
-                    if let Some(filter) = options.volume_name
-                        && volume != filter
-                    {
-                        continue;
-                    }
-                    collector.insert(path.as_str(), volume.as_str(), *entry);
-                }
-            }
+        if let Some(flushing) = flushing_arc.as_deref() {
+            crate::search::scan_mem_for_search(
+                flushing,
+                &mut collector,
+                &tokens,
+                scoring_cap,
+                &options,
+                volume_type_mask,
+            );
         }
 
         // Disk searches
@@ -666,7 +595,7 @@ impl Index {
         Ok(paginated_results)
     }
 
-    /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
+    /// Retrieve all indexed files modified since the given timestamp (in seconds).
     pub fn recent_files(
         &self,
         since_secs: u64, // Renamed 'until' to 'since' for clarity
@@ -674,8 +603,9 @@ impl Index {
         offset: usize,
         options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
-        let segments = self.base.read().unwrap();
-        let mem = self.mem_idx.read().unwrap();
+        let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
+        let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+        let flushing_arc = &self.flushing_mem.read().map_err(|_| IndexError::ReadLock)?;
 
         let active_tombstones = self
             .prefix_tombstones
@@ -691,77 +621,24 @@ impl Index {
         // Buffer to account for items that might be filtered out by volume or tombstones
         let disk_cap = required_matches + 500;
 
-        let mut mem_candidates = Vec::new();
+        crate::search::scan_mem_for_recent(
+            &mem,
+            &mut collector,
+            since_secs,
+            disk_cap,
+            &options,
+            volume_type_mask,
+        );
 
-        for (id, &metadata) in mem.metadata.iter().enumerate() {
-            let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_volume_type) =
-                SegmentedIndex::unpack_u128(metadata);
-
-            let recent = if last_modified < last_accessed {
-                last_accessed
-            } else {
-                last_modified
-            };
-
-            if recent >= since_secs {
-                if let Some(kind) = options.kind {
-                    let is_target_dir = kind == Kind::Directory;
-                    let is_entry_dir = is_dir;
-                    if is_entry_dir != is_target_dir {
-                        continue;
-                    };
-                }
-
-                if let Some(category) = options.category
-                    && doc_category & category == 0
-                {
-                    continue;
-                }
-
-                if (volume_type_mask & (1 << doc_volume_type)) == 0 {
-                    continue;
-                }
-
-                mem_candidates.push((metadata, id as u32));
-            }
-        }
-
-        // Top-K truncation here
-        if mem_candidates.len() > disk_cap {
-            mem_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                // Inline bitwise extraction to avoid incurring type conversion penalties
-                let last_modified_a = ((a.0 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_a = ((a.0 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_a = if last_modified_a < last_accessed_a {
-                    last_accessed_a
-                } else {
-                    last_modified_a
-                };
-                let last_modified_b = ((b.0 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_b = ((b.0 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_b = if last_modified_b < last_accessed_b {
-                    last_accessed_b
-                } else {
-                    last_modified_b
-                };
-
-                recent_b
-                    .cmp(&recent_a) // Sort descending by last access time
-                    .then_with(|| a.1.cmp(&b.1))
-            });
-            mem_candidates.truncate(disk_cap);
-        }
-
-        // Late materialization
-        for (_, id) in mem_candidates {
-            if let Some((path, volume, entry)) = mem.id_to_data.get(&{ id }) {
-                if let Some(filter) = options.volume_name
-                    && volume != filter
-                {
-                    continue;
-                }
-                collector.insert(path.as_str(), volume.as_str(), *entry);
-            }
+        if let Some(flushing) = flushing_arc.as_deref() {
+            crate::search::scan_mem_for_recent(
+                flushing,
+                &mut collector,
+                since_secs,
+                disk_cap,
+                &options,
+                volume_type_mask,
+            );
         }
 
         let mut disk_candidates: Vec<(&std::sync::Arc<Segment>, u128)> = Vec::new();
@@ -771,16 +648,10 @@ impl Index {
 
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_vol_type) =
+                let (_, last_modified, _, _, is_dir, doc_category, doc_vol_type) =
                     SegmentedIndex::unpack_u128(packed);
 
-                let recent = if last_modified < last_accessed {
-                    last_accessed
-                } else {
-                    last_modified
-                };
-
-                if recent >= since_secs {
+                if last_modified >= since_secs {
                     if let Some(target_kind) = options.kind {
                         let is_target_dir = target_kind == Kind::Directory;
                         if is_dir != is_target_dir {
@@ -805,28 +676,12 @@ impl Index {
 
         if disk_candidates.len() > disk_cap {
             disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                // Inline bitwise extraction to avoid incurring type conversion penalties
                 let last_modified_a = ((a.1 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_a = ((a.1 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_a = if last_modified_a < last_accessed_a {
-                    last_accessed_a
-                } else {
-                    last_modified_a
-                };
                 let last_modified_b = ((b.1 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_b = ((b.1 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_b = if last_modified_b < last_accessed_b {
-                    last_accessed_b
-                } else {
-                    last_modified_b
-                };
 
-                let offset_a = a.1 & 0x0000_00FF_FFFF_FFFF;
-                let offset_b = b.1 & 0x0000_00FF_FFFF_FFFF;
-
-                recent_b
-                    .cmp(&recent_a) // Sort descending by last access time
-                    .then_with(|| offset_a.cmp(&offset_b))
+                last_modified_b
+                    .cmp(&last_modified_a)
+                    .then_with(|| (a.1 & 0x0000_00FF_FFFF_FFFF).cmp(&(b.1 & 0x0000_00FF_FFFF_FFFF)))
             });
             disk_candidates.truncate(disk_cap);
         }
@@ -847,10 +702,9 @@ impl Index {
         let mut results: Vec<_> = collector.finish().collect();
 
         results.sort_by(|a, b| {
-            let recent_a = a.2.last_accessed.max(a.2.last_modified);
-            let recent_b = b.2.last_accessed.max(b.2.last_modified);
-
-            recent_b.cmp(&recent_a).then_with(|| a.0.cmp(&b.0))
+            b.2.last_modified
+                .cmp(&a.2.last_modified)
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         let paginated_results = results
@@ -963,13 +817,25 @@ impl Index {
 
         let snapshot = {
             let mut wal = self.wal.write().expect("failed to lock wal");
-            let mut mem = self.mem_idx.write().expect("failed to lock memory");
 
-            if mem.is_empty() {
+            if self
+                .flushing_mem
+                .read()
+                .expect("failed to lock mem double buffer")
+                .is_some()
+            {
                 return Ok(());
             }
 
-            let snapshot = std::mem::take(&mut *mem);
+            let snapshot = {
+                let mut mem = self.mem_idx.write().expect("failed to lock memory");
+                if mem.is_empty() {
+                    return Ok(());
+                }
+                Arc::new(std::mem::take(&mut *mem))
+            };
+
+            *self.flushing_mem.write().unwrap() = Some(Arc::clone(&snapshot));
 
             wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
@@ -987,6 +853,7 @@ impl Index {
         let compactor_lock = Arc::clone(&self.compactor);
         let op_seq = Arc::clone(&self.next_op_seq);
         let prefix_tombstones = Arc::clone(&self.prefix_tombstones);
+        let flushing_mem_ref = Arc::clone(&self.flushing_mem);
 
         let flusher = std::thread::Builder::new()
             .name("minidex-flush".to_owned())
@@ -998,13 +865,14 @@ impl Index {
                     &tmp_segment_path,
                     snapshot
                         .entries
-                        .into_iter()
-                        .map(|(path, (volume, entry))| (path, volume, entry)),
+                        .iter()
+                        .map(|(path, (volume, entry))| (path, volume, *entry)),
                     false,
                 ) {
                     log::error!("flush failed to write: {}", e);
                     let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
                     Segment::remove_files(&tmp_paths);
+                    *flushing_mem_ref.write().unwrap() = None;
                     return;
                 }
 
@@ -1024,6 +892,7 @@ impl Index {
                 if let Err(e) = std::fs::remove_file(&flushing_path) {
                     log::error!("failed to delete rotated WAL: {}", e);
                 }
+                *flushing_mem_ref.write().unwrap() = None;
 
                 let snapshot = {
                     let base = base.read().expect("failed to read-lock base");
@@ -1094,6 +963,35 @@ impl Index {
             Some(allowed) => allowed.iter().fold(0, |acc, &vt| acc | (1 << (vt as u8))),
             None => 0b0000_1111,
         }
+    }
+
+    fn apply_backpressure_if_needed(&self) -> Result<(), IndexError> {
+        let threshold = self.compactor_config.flush_threshold * 3;
+
+        if self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len() > threshold {
+            let is_flushing = self
+                .flushing_mem
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .is_some();
+
+            if is_flushing {
+                // Buffer 1 and 2 are full. Block ingestion to prevent OOM.
+                let flusher = self
+                    .flusher
+                    .write()
+                    .map_err(|_| IndexError::WriteLock)?
+                    .take();
+                if let Some(handle) = flusher {
+                    log::debug!("Double buffer full. Waiting for background flush...");
+                    let _ = handle.join();
+                }
+            }
+
+            // Move Buffer 1 to Buffer 2
+            let _ = self.trigger_flush();
+        }
+        Ok(())
     }
 }
 

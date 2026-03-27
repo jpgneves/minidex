@@ -404,38 +404,10 @@ impl SegmentedIndex {
 
             // Tokenize the path, generate synthetic tokens and add them too.
 
-            let tokens = crate::tokenizer::tokenize(path_ref);
+            let tokens = crate::tokenizer::extract_all_tokens(path_ref, volume_ref);
             for token in tokens {
                 inverted_index
                     .entry(token)
-                    .or_default()
-                    .push(doc_id_counter);
-            }
-
-            let path_lower = path_ref.to_lowercase();
-            for (i, _) in path_lower.match_indices(['/', '\\']) {
-                if i > 0 {
-                    let synth = crate::tokenizer::synthesize_path_token(&path_lower[..=i]);
-                    inverted_index
-                        .entry(synth)
-                        .or_default()
-                        .push(doc_id_counter);
-                }
-            }
-
-            // Generate synthetic tokens for the volume data and insert them
-            if !volume_ref.is_empty() {
-                let synth = crate::tokenizer::synthesize_volume_token(&volume_ref.to_lowercase());
-                inverted_index
-                    .entry(synth)
-                    .or_default()
-                    .push(doc_id_counter);
-            }
-
-            if let Some(ext) = Path::new(path_ref).extension().and_then(|ext| ext.to_str()) {
-                let synth = crate::tokenizer::synthesize_ext_token(&ext.to_lowercase());
-                inverted_index
-                    .entry(synth)
                     .or_default()
                     .push(doc_id_counter);
             }
