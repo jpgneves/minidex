@@ -694,10 +694,16 @@ impl Index {
         let mut mem_candidates = Vec::new();
 
         for (id, &metadata) in mem.metadata.iter().enumerate() {
-            let (_, _, last_accessed, _, is_dir, doc_category, doc_volume_type) =
+            let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_volume_type) =
                 SegmentedIndex::unpack_u128(metadata);
 
-            if last_accessed >= since_secs {
+            let recent = if last_modified < last_accessed {
+                last_accessed
+            } else {
+                last_modified
+            };
+
+            if recent >= since_secs {
                 if let Some(kind) = options.kind {
                     let is_target_dir = kind == Kind::Directory;
                     let is_entry_dir = is_dir;
@@ -765,10 +771,16 @@ impl Index {
 
             for chunk in meta_mmap.chunks_exact(16) {
                 let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (_, _, accessed, _, is_dir, doc_category, doc_vol_type) =
+                let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_vol_type) =
                     SegmentedIndex::unpack_u128(packed);
 
-                if accessed >= since_secs {
+                let recent = if last_modified < last_accessed {
+                    last_accessed
+                } else {
+                    last_modified
+                };
+
+                if recent >= since_secs {
                     if let Some(target_kind) = options.kind {
                         let is_target_dir = target_kind == Kind::Directory;
                         if is_dir != is_target_dir {
