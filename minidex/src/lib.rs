@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ops::Bound,
     path::{Path, PathBuf},
 };
@@ -929,18 +930,22 @@ impl Index {
 
         let compactor_seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
+        let final_path = self.path.join(format!("{}", compactor_seq));
 
         let snapshot_tombstones = {
             let guard = self.prefix_tombstones.read().expect("lock poisoned");
             guard.clone()
         };
 
-        compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone())
-            .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
+        if let Err(e) = compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone())
+            .map_err(|e| IndexError::Io(std::io::Error::other(e)))
+        {
+            let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
+            Segment::remove_files(&tmp_paths);
+            return Err(e);
+        }
 
         let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
-        let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
-        let final_path = PathBuf::from(final_path_str);
         let final_paths = Segment::to_paths(&final_path);
 
         Segment::rename_files(&tmp_paths, &final_paths).map_err(IndexError::Io)?;
@@ -1008,6 +1013,7 @@ impl Index {
 
         let base = Arc::clone(&self.base);
         let min_merge_count = self.compactor_config.min_merge_count;
+        let tombstone_threshold = self.compactor_config.tombstone_threshold;
         let compactor_lock = Arc::clone(&self.compactor);
         let op_seq = Arc::clone(&self.next_op_seq);
         let prefix_tombstones = Arc::clone(&self.prefix_tombstones);
@@ -1049,13 +1055,34 @@ impl Index {
                     log::error!("failed to delete rotated WAL: {}", e);
                 }
 
-                let snapshot = {
+                let force_full = prefix_tombstones
+                    .read()
+                    .expect("failed to acquire prefix tombstone lock")
+                    .len()
+                    > tombstone_threshold;
+
+                let (candidates, is_full) = {
                     let base = base.read().expect("failed to read-lock base");
-                    if base.segments().count() <= min_merge_count {
+                    let segments: Vec<_> = base.snapshot();
+
+                    // Clear tombstones if we have nothing in disk
+                    if segments.is_empty() && force_full {
+                        let mut tombstones = prefix_tombstones
+                            .write()
+                            .expect("failed to acquire prefix tombstones write-lock");
+                        Arc::make_mut(&mut tombstones).clear();
                         return;
                     }
 
-                    base.snapshot()
+                    let c =
+                        Self::find_compaction_candidates(&segments, min_merge_count, force_full);
+
+                    if c.is_empty() {
+                        return; // No tier is full yet, do nothing!
+                    }
+
+                    let full = c.len() == segments.len();
+                    (c, full)
                 };
 
                 let mut compactor_guard = compactor_lock
@@ -1067,7 +1094,8 @@ impl Index {
                     return;
                 }
 
-                *compactor_guard = Self::compact(base, path, snapshot, prefix_tombstones, op_seq);
+                *compactor_guard =
+                    Self::compact(base, path, candidates, prefix_tombstones, op_seq, is_full);
             })
             .map_err(IndexError::Io)?;
 
@@ -1081,6 +1109,7 @@ impl Index {
         snapshot: Vec<Arc<Segment>>,
         prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
         next_op_seq: Arc<AtomicU64>,
+        is_full: bool,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
             return None;
@@ -1121,15 +1150,64 @@ impl Index {
                             base_guard.apply_compaction(&snapshot, new_segment);
                         }
 
-                        let mut tombstones = prefix_tombstones.write().unwrap();
-                        Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
+                        if is_full {
+                            let mut tombstones = prefix_tombstones
+                                .write()
+                                .expect("failed to acquire prefix tombstones write lock");
+                            Arc::make_mut(&mut tombstones)
+                                .retain(|(_, _, seq)| *seq >= compactor_seq);
+                        }
 
                         log::debug!("Compaction finished");
                     }
-                    Err(e) => log::error!("Compaction failed: {}", e),
+                    Err(e) => {
+                        log::error!("Compaction failed: {}", e);
+                        let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
+                        Segment::remove_files(&tmp_paths);
+                    }
                 }
             })
             .ok()
+    }
+
+    fn find_compaction_candidates(
+        segments: &[Arc<Segment>],
+        min_merge_count: usize,
+        force_full: bool,
+    ) -> Vec<Arc<Segment>> {
+        // If tombstones exceed the threshold, we MUST do a full compaction
+        // to safely drop them without resurrecting deleted files.
+        if force_full {
+            return segments.to_vec();
+        }
+
+        // Group segments into base-4 logarithmic size buckets
+        let mut buckets: BTreeMap<u32, Vec<Arc<Segment>>> = BTreeMap::new();
+
+        for seg in segments {
+            let size = seg.meta_map().len().max(1) as u64; // Meta length perfectly correlates to doc count
+            let bucket_idx = size.ilog2() / 2; // Base-4 grouping
+            buckets.entry(bucket_idx).or_default().push(seg.clone());
+        }
+
+        // Find the smallest bucket that has reached the merge threshold
+        for (_, mut bucket_segments) in buckets.into_iter() {
+            if bucket_segments.len() >= min_merge_count {
+                bucket_segments.truncate(min_merge_count); // Keep compactions tight
+                return bucket_segments;
+            }
+        }
+
+        // Fallback: If we accumulate way too many segments overall without forming
+        // a complete bucket, force a merge of the smallest ones to prevent file descriptor exhaustion.
+        if segments.len() > min_merge_count * 3 {
+            let mut sorted = segments.to_vec();
+            sorted.sort_by_key(|s| s.meta_map().len());
+            sorted.truncate(min_merge_count);
+            return sorted;
+        }
+
+        Vec::new()
     }
 
     fn compile_allowed_volume_mask(allowed_volume_types: Option<&[VolumeType]>) -> u8 {
