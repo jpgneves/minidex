@@ -1,5 +1,5 @@
 #[cfg(all(test, feature = "shuttle"))]
-mod concurrency_tests {
+mod _concurrency_tests {
     use crate::sync::Arc;
     use crate::*;
     use shuttle::check_random;
