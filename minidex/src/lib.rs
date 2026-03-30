@@ -1200,7 +1200,7 @@ impl Index {
 
         // Fallback: If we accumulate way too many segments overall without forming
         // a complete bucket, force a merge of the smallest ones to prevent file descriptor exhaustion.
-        if segments.len() > min_merge_count * 3 {
+        if segments.len() > min_merge_count.saturating_mul(3) {
             let mut sorted = segments.to_vec();
             sorted.sort_by_key(|s| s.meta_map().len());
             sorted.truncate(min_merge_count);
@@ -1219,7 +1219,7 @@ impl Index {
 
     #[inline(always)]
     fn apply_backpressure(&self) -> Result<(), IndexError> {
-        let threshold = self.compactor_config.flush_threshold * 3;
+        let threshold = self.compactor_config.flush_threshold.saturating_mul(3);
 
         // Backpressure mechanism - block inserts if we're blowing through
         // the flushing threshold.
