@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.23.0"
+version = "0.23.1"
 dependencies = [
  "bstr",
  "criterion",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "minidex-cli"
-version = "0.8.0"
+version = "0.8.0+0.23.1"
 dependencies = [
  "anyhow",
  "chrono",

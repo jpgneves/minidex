@@ -162,7 +162,7 @@ impl Index {
 
         let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
 
-        Ok(Self {
+        let index = Self {
             path: path.as_ref().to_path_buf(),
             base,
             next_op_seq,
@@ -172,7 +172,13 @@ impl Index {
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
             prefix_tombstones: Arc::new(RwLock::new(Arc::new(prefix_tombstones))),
-        })
+        };
+
+        if index.should_flush() {
+            index.flush()?;
+        }
+
+        Ok(index)
     }
 
     fn next_op_seq(&self) -> u64 {
@@ -977,19 +983,22 @@ impl Index {
         let snapshot = {
             let mut wal = self.wal.write().expect("failed to lock wal");
 
-            let snapshot = {
+            let (snapshot, tombstones_cow) = {
                 let mut mem = self.mem_idx.write().expect("failed to lock memory");
 
                 if mem.is_empty() {
                     return Ok(());
                 }
-                std::mem::take(&mut *mem)
+
+                let snapshot = std::mem::take(&mut *mem);
+                let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
+                (snapshot, tombstones_cow)
             };
 
             wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
             // Re-write tombstones to the WAL until a full compaction runs.
-            let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
+
             for (volume, prefix, seq) in tombstones_cow.iter() {
                 wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
             }
