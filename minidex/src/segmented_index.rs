@@ -231,6 +231,8 @@ impl Drop for Segment {
         if self.deleted.load(Ordering::SeqCst) {
             self.map.take();
             self.data.take();
+            self.post.take();
+            self.meta.take();
 
             let paths = Self::to_paths(&self.path);
 
@@ -278,8 +280,10 @@ impl SegmentedIndex {
                 if file_name.contains(".tmp") {
                     log::trace!("Cleaning up orphaned temporary file: {}", file_name);
 
-                    // We can safely delete the all the files
-                    let paths = Segment::to_paths(&path);
+                    // Derive the base tmp path (e.g. "7.tmp") from the seg
+                    // file (e.g. "7.tmp.seg") and clean up all sibling files.
+                    let base_tmp_path = path.with_extension(""); // strip .seg → "7.tmp"
+                    let paths = Segment::paths_with_additional_extension(&base_tmp_path);
                     Segment::remove_files(&paths);
 
                     continue; // Skip loading!
@@ -315,19 +319,25 @@ impl SegmentedIndex {
 
     /// Atomically swaps out old segments for a newly compacted segment,
     /// and cleans up the old files from disk.
+    /// Returns `true` if the compaction covered every segment (i.e. the
+    /// resulting index contains only the new segment).
     pub(crate) fn apply_compaction(
         &mut self,
         old_segments: &[Arc<Segment>],
         new_segment: Arc<Segment>,
-    ) {
+    ) -> bool {
         self.segments
             .retain(|active_seg| !old_segments.iter().any(|old| Arc::ptr_eq(active_seg, old)));
+
+        let was_full = self.segments.is_empty();
 
         self.segments.push(new_segment);
 
         for old_seg in old_segments {
             old_seg.mark_deleted();
         }
+
+        was_full
     }
 
     pub(crate) fn build_segment_files<I, S>(

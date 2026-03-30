@@ -679,8 +679,8 @@ impl Index {
         offset: usize,
         options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
-        let segments = self.base.read().unwrap();
-        let mem = self.mem_idx.read().unwrap();
+        let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
+        let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
         let active_tombstones = self
             .prefix_tombstones
@@ -954,13 +954,16 @@ impl Index {
             Segment::load(final_path).map_err(|e| IndexError::Io(std::io::Error::other(e)))?,
         );
 
-        {
+        let was_full = {
             let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
-            base_guard.apply_compaction(&snapshot, new_segment);
-        }
+            base_guard.apply_compaction(&snapshot, new_segment)
+        };
 
-        {
-            let mut tombstones = self.prefix_tombstones.write().unwrap();
+        if was_full {
+            let mut tombstones = self
+                .prefix_tombstones
+                .write()
+                .map_err(|_| IndexError::WriteLock)?;
             Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
         }
 
@@ -969,13 +972,18 @@ impl Index {
     }
 
     fn should_flush(&self) -> bool {
-        self.mem_idx.read().unwrap().len() > self.compactor_config.flush_threshold
-            || self.prefix_tombstones.read().unwrap().len()
+        self.mem_idx.read().expect("mem_idx lock poisoned").len()
+            > self.compactor_config.flush_threshold
+            || self
+                .prefix_tombstones
+                .read()
+                .expect("prefix_tombstones lock poisoned")
+                .len()
                 > self.compactor_config.tombstone_threshold
     }
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
-        if let Some(ref flusher) = *self.flusher.read().expect("failed to read flusher")
+        if let Some(ref flusher) = *self.flusher.read().map_err(|_| IndexError::ReadLock)?
             && !flusher.is_completed()
         {
             return Ok(());
@@ -986,17 +994,22 @@ impl Index {
         let flushing_path = path.join(format!("journal.{}.flushing.wal", next_seq));
 
         let snapshot = {
-            let mut wal = self.wal.write().expect("failed to lock wal");
+            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
 
             let (snapshot, tombstones_cow) = {
-                let mut mem = self.mem_idx.write().expect("failed to lock memory");
+                let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
 
                 if mem.is_empty() {
                     return Ok(());
                 }
 
                 let snapshot = std::mem::take(&mut *mem);
-                let tombstones_cow = { self.prefix_tombstones.read().unwrap().clone() };
+                let tombstones_cow = {
+                    self.prefix_tombstones
+                        .read()
+                        .map_err(|_| IndexError::ReadLock)?
+                        .clone()
+                };
                 (snapshot, tombstones_cow)
             };
 
@@ -1042,10 +1055,19 @@ impl Index {
 
                 let final_paths = Segment::paths_with_additional_extension(&final_segment_path);
 
-                let _ = Segment::rename_files(&tmp_paths, &final_paths);
+                if let Err(e) = Segment::rename_files(&tmp_paths, &final_paths) {
+                    log::error!("flush failed to rename segment files: {}", e);
+                    Segment::remove_files(&tmp_paths);
+                    return;
+                }
 
-                let new_segment =
-                    Arc::new(Segment::load(final_segment_path).expect("failed to load"));
+                let new_segment = match Segment::load(final_segment_path) {
+                    Ok(seg) => Arc::new(seg),
+                    Err(e) => {
+                        log::error!("flush failed to load segment: {}", e);
+                        return;
+                    }
+                };
                 {
                     let mut base_guard = base.write().expect("failed to lock base");
                     base_guard.add_segment(new_segment);
@@ -1061,7 +1083,7 @@ impl Index {
                     .len()
                     > tombstone_threshold;
 
-                let (candidates, is_full) = {
+                let candidates = {
                     let base = base.read().expect("failed to read-lock base");
                     let segments: Vec<_> = base.snapshot();
 
@@ -1081,8 +1103,7 @@ impl Index {
                         return; // No tier is full yet, do nothing!
                     }
 
-                    let full = c.len() == segments.len();
-                    (c, full)
+                    c
                 };
 
                 let mut compactor_guard = compactor_lock
@@ -1094,12 +1115,11 @@ impl Index {
                     return;
                 }
 
-                *compactor_guard =
-                    Self::compact(base, path, candidates, prefix_tombstones, op_seq, is_full);
+                *compactor_guard = Self::compact(base, path, candidates, prefix_tombstones, op_seq);
             })
             .map_err(IndexError::Io)?;
 
-        *self.flusher.write().unwrap() = Some(flusher);
+        *self.flusher.write().map_err(|_| IndexError::WriteLock)? = Some(flusher);
         Ok(())
     }
 
@@ -1109,7 +1129,6 @@ impl Index {
         snapshot: Vec<Arc<Segment>>,
         prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
         next_op_seq: Arc<AtomicU64>,
-        is_full: bool,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
             return None;
@@ -1122,16 +1141,21 @@ impl Index {
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
-                let snapshot_tombstones = { prefix_tombstones.read().unwrap().clone() };
+                let snapshot_tombstones = {
+                    prefix_tombstones
+                        .read()
+                        .expect("prefix_tombstones lock poisoned")
+                        .clone()
+                };
                 match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
                     Ok(compactor_seq) => {
                         let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
-                        let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
-                        let final_path = PathBuf::from(final_path_str);
+                        let final_path = path.join(format!("{}", next_seq));
                         let final_paths = Segment::to_paths(&final_path);
 
                         if let Err(e) = Segment::rename_files(&tmp_paths, &final_paths) {
                             log::error!("Failed to rename compacted files: {}", e);
+                            Segment::remove_files(&tmp_paths);
                             return;
                         }
 
@@ -1143,14 +1167,14 @@ impl Index {
                             }
                         };
 
-                        {
+                        let was_full = {
                             let mut base_guard = base
                                 .write()
                                 .expect("failed to lock base for compaction apply");
-                            base_guard.apply_compaction(&snapshot, new_segment);
-                        }
+                            base_guard.apply_compaction(&snapshot, new_segment)
+                        };
 
-                        if is_full {
+                        if was_full {
                             let mut tombstones = prefix_tombstones
                                 .write()
                                 .expect("failed to acquire prefix tombstones write lock");
