@@ -80,6 +80,30 @@ pub fn tokenize(input: &str) -> Vec<String> {
     tokens
 }
 
+/// Generate all tokens, including synthetic tokens.
+pub(crate) fn extract_all_tokens(path: &str, volume: &str) -> Vec<String> {
+    let mut tokens = tokenize(path); // Base tokens
+
+    for (i, c) in path.char_indices() {
+        if (c == '/' || c == '\\') && i > 0 {
+            tokens.push(synthesize_token(SYNTH_PATH_TOKEN_TAG, &path[..=i]));
+        }
+    }
+
+    if !volume.is_empty() {
+        tokens.push(synthesize_token(SYNTH_VOLUME_TOKEN_TAG, volume));
+    }
+
+    if let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        tokens.push(synthesize_token(SYNTH_EXT_TOKEN_TAG, ext));
+    }
+
+    tokens
+}
+
 /// A fast, rough check for Chinese, Japanese, and Korean Unicode blocks.
 fn is_cjk(c: char) -> bool {
     let u = c as u32;
@@ -100,19 +124,23 @@ pub(crate) fn fold_path(input: &str) -> String {
 }
 
 const SYNTH_PATH_TOKEN_TAG: char = '\x00';
-const SYNTH_VOLUME_TOKEN_TAG: char = '\x01';
+pub(crate) const SYNTH_VOLUME_TOKEN_TAG: char = '\x01';
 const SYNTH_EXT_TOKEN_TAG: char = '\x02';
 
-pub(crate) fn synthesize_path_token(orig: &str) -> String {
-    format!("{SYNTH_PATH_TOKEN_TAG}{orig}")
-}
+#[inline(always)]
+pub(crate) fn synthesize_token(tag: char, orig: &str) -> String {
+    // Exactly 1 byte for the tag + the byte length of the string
+    let mut token = String::with_capacity(1 + orig.len());
+    token.push(tag);
 
-pub(crate) fn synthesize_volume_token(orig: &str) -> String {
-    format!("{SYNTH_VOLUME_TOKEN_TAG}{orig}")
-}
-
-pub(crate) fn synthesize_ext_token(orig: &str) -> String {
-    format!("{SYNTH_EXT_TOKEN_TAG}{orig}")
+    if orig.is_ascii() {
+        for &b in orig.as_bytes() {
+            token.push(b.to_ascii_lowercase() as char);
+        }
+    } else {
+        token.extend(orig.chars().flat_map(|c| c.to_lowercase()));
+    }
+    token
 }
 
 #[cfg(test)]
@@ -174,9 +202,9 @@ mod tests {
 
     #[test]
     fn test_synthetic_tokens() {
-        assert_eq!(synthesize_path_token("abc"), "\x00abc");
-        assert_eq!(synthesize_volume_token("c:"), "\x01c:");
-        assert_eq!(synthesize_ext_token("pdf"), "\x02pdf");
+        assert_eq!(synthesize_token(SYNTH_PATH_TOKEN_TAG, "abc"), "\x00abc");
+        assert_eq!(synthesize_token(SYNTH_VOLUME_TOKEN_TAG, "c:"), "\x01c:");
+        assert_eq!(synthesize_token(SYNTH_EXT_TOKEN_TAG, "pdf"), "\x02pdf");
     }
 
     #[test]

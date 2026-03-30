@@ -1,11 +1,13 @@
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    thread::JoinHandle,
+};
+
+mod sync;
+use crate::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+    thread::{JoinHandle, JoinHandleExt},
 };
 
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
@@ -147,7 +149,7 @@ impl Index {
         for partial in all_recovered_data {
             for (path, volume, entry) in partial.inserts {
                 max_seq = max_seq.max(entry.opstamp.sequence());
-                let tokens = crate::tokenizer::tokenize(&path);
+                let tokens = crate::tokenizer::extract_all_tokens(&path, &volume);
                 mem_idx.insert_with_tokens(path, volume, entry, tokens);
             }
             for (volume, prefix, seq) in partial.tombstones {
@@ -174,30 +176,12 @@ impl Index {
     }
 
     fn next_op_seq(&self) -> u64 {
-        self.next_op_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        self.next_op_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Insert a filesystem entry into the index.
     pub fn insert(&self, item: FilesystemEntry) -> Result<(), IndexError> {
-        let threshold = self.compactor_config.flush_threshold * 3;
-
-        // Backpressure mechanism - block inserts if we're blowing through
-        // the flushing threshold.
-        if self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len() > threshold {
-            let flusher = {
-                self.flusher
-                    .write()
-                    .map_err(|_| IndexError::WriteLock)?
-                    .take()
-            };
-
-            if let Some(handle) = flusher {
-                let _ = handle.join();
-            }
-
-            let _ = self.trigger_flush();
-        }
+        self.apply_backpressure()?;
 
         let seq = self.next_op_seq();
         let path_str = item.path.to_string_lossy().to_string();
@@ -218,10 +202,11 @@ impl Index {
         }
 
         {
+            let tokens = crate::tokenizer::extract_all_tokens(&path_str, &volume);
             self.mem_idx
                 .write()
                 .map_err(|_| IndexError::WriteLock)?
-                .insert(path_str, volume, entry);
+                .insert_with_tokens(path_str, volume, entry, tokens);
         }
 
         if self.should_flush() {
@@ -241,13 +226,15 @@ impl Index {
         let mut iter = items.into_iter();
 
         loop {
+            self.apply_backpressure()?;
+
             let chunk: Vec<(String, String, IndexEntry, Vec<String>)> = iter
                 .by_ref()
                 .take(chunk_size)
                 .map(|item| {
                     let seq = self.next_op_seq();
                     let path_str = item.path.to_string_lossy().into_owned();
-                    let tokens = crate::tokenizer::tokenize(&path_str);
+                    let tokens = crate::tokenizer::extract_all_tokens(&path_str, &item.volume);
                     (
                         path_str,
                         item.volume,
@@ -283,7 +270,7 @@ impl Index {
                 }
             }
 
-            std::thread::yield_now();
+            crate::sync::thread::yield_now();
 
             if self.should_flush() {
                 self.trigger_flush()?;
@@ -393,8 +380,11 @@ impl Index {
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-        let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
-        let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+        let segments = self
+            .base
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .snapshot();
 
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
@@ -409,90 +399,98 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        let mut mem_candidates: Option<Vec<u32>> = None;
-        let mut mem_intersect_buf = Vec::new();
+        let mut mem_materialized = Vec::new();
+        {
+            let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+            let mut mem_candidates: Option<Vec<u32>> = None;
+            let mut mem_intersect_buf = Vec::new();
 
-        // In-memory searches
-        if !tokens.is_empty() {
-            for token in &tokens {
-                let mut end_bound = String::with_capacity(token.len() + 4);
-                end_bound.push_str(token);
-                end_bound.push('\u{FFFF}');
+            // In-memory searches
+            if !tokens.is_empty() {
+                for token in &tokens {
+                    let mut end_bound = String::with_capacity(token.len() + 4);
+                    end_bound.push_str(token);
+                    end_bound.push('\u{FFFF}');
 
-                let matching_arrays: Vec<&Vec<u32>> = mem
-                    .inverted_index
-                    .range::<str, _>((
-                        Bound::Included(token.as_str()),
-                        Bound::Included(end_bound.as_str()),
-                    ))
-                    .map(|(_, ids)| ids)
-                    .collect();
+                    let matching_arrays: Vec<&Vec<u32>> = mem
+                        .inverted_index
+                        .range::<str, _>((
+                            Bound::Included(token.as_str()),
+                            Bound::Included(end_bound.as_str()),
+                        ))
+                        .map(|(_, ids)| ids)
+                        .collect();
 
-                if matching_arrays.is_empty() {
-                    mem_candidates = Some(Vec::new());
-                    break;
-                }
-
-                let current_token_ids = if matching_arrays.len() == 1 {
-                    std::borrow::Cow::Borrowed(matching_arrays[0])
-                } else {
-                    let mut merged = Vec::new();
-                    for ids in matching_arrays {
-                        merged.extend_from_slice(ids);
+                    if matching_arrays.is_empty() {
+                        mem_candidates = Some(Vec::new());
+                        break;
                     }
-                    merged.sort_unstable();
-                    merged.dedup();
-                    std::borrow::Cow::Owned(merged)
-                };
 
-                match mem_candidates.as_mut() {
-                    // Two point merge in the RAM path
-                    Some(existing) => {
-                        mem_intersect_buf.clear();
-                        crate::simd::intersect_arrays(
-                            existing,
-                            &current_token_ids,
-                            &mut mem_intersect_buf,
-                        );
-                        std::mem::swap(existing, &mut mem_intersect_buf);
+                    let current_token_ids = if matching_arrays.len() == 1 {
+                        std::borrow::Cow::Borrowed(matching_arrays[0])
+                    } else {
+                        let mut merged = Vec::new();
+                        for ids in matching_arrays {
+                            merged.extend_from_slice(ids);
+                        }
+                        merged.sort_unstable();
+                        merged.dedup();
+                        std::borrow::Cow::Owned(merged)
+                    };
+
+                    match mem_candidates.as_mut() {
+                        // Two point merge in the RAM path
+                        Some(existing) => {
+                            mem_intersect_buf.clear();
+                            crate::simd::intersect_arrays(
+                                existing,
+                                &current_token_ids,
+                                &mut mem_intersect_buf,
+                            );
+                            std::mem::swap(existing, &mut mem_intersect_buf);
+                        }
+                        None => mem_candidates = Some(current_token_ids.into_owned()),
                     }
-                    None => mem_candidates = Some(current_token_ids.into_owned()),
-                }
 
-                if let Some(c) = &mem_candidates
-                    && c.is_empty()
-                {
-                    break;
-                }
-            }
-        } else {
-            mem_candidates = Some(mem.id_to_data.keys().copied().collect());
-        }
-
-        if let Some(candidates) = mem_candidates {
-            let mut mem_sortable = Vec::with_capacity(candidates.len());
-
-            for id in candidates {
-                let metadata = mem.metadata[id as usize];
-
-                if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask) {
-                    mem_sortable.push((sort_key, id));
-                }
-            }
-
-            // Top-K truncation in memory
-            crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
-
-            for (_, id) in mem_sortable {
-                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
-                    if let Some(filter) = options.volume_name
-                        && volume != filter
+                    if let Some(c) = &mem_candidates
+                        && c.is_empty()
                     {
-                        continue;
+                        break;
                     }
-                    collector.insert(path.as_str(), volume.as_str(), *entry);
+                }
+            } else {
+                mem_candidates = Some(mem.id_to_data.keys().copied().collect());
+            }
+
+            if let Some(candidates) = mem_candidates {
+                let mut mem_sortable = Vec::with_capacity(candidates.len());
+
+                for id in candidates {
+                    let metadata = mem.metadata[id as usize];
+
+                    if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask)
+                    {
+                        mem_sortable.push((sort_key, id));
+                    }
+                }
+
+                // Top-K truncation in memory
+                crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
+
+                for (_, id) in mem_sortable {
+                    if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
+                        if let Some(filter) = options.volume_name
+                            && volume != filter
+                        {
+                            continue;
+                        }
+                        mem_materialized.push((path.clone(), volume.clone(), *entry));
+                    }
                 }
             }
+        }
+        for (path, volume, entry) in &mem_materialized {
+            collector.insert(path.as_str(), volume.as_str(), *entry);
         }
 
         // Disk searches
@@ -500,11 +498,11 @@ impl Index {
         let mut current_matches = Vec::new();
         let mut disk_intersect_buf = Vec::new();
 
-        let vol_token = options
-            .volume_name
-            .map(|vol| crate::tokenizer::synthesize_volume_token(&vol.to_lowercase()));
+        let vol_token = options.volume_name.map(|vol| {
+            crate::tokenizer::synthesize_token(crate::tokenizer::SYNTH_VOLUME_TOKEN_TAG, vol)
+        });
 
-        for segment in segments.segments() {
+        for segment in &segments {
             current_matches.clear();
             let mut first_token = true;
             let mut valid_matches = true;
@@ -619,8 +617,8 @@ impl Index {
             results.truncate(scoring_cap);
         }
 
-        let now_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now_micros = crate::sync::time::SystemTime::now()
+            .duration_since(crate::sync::time::UNIX_EPOCH)
             .expect("failed to get system time")
             .as_micros() as f64;
 
@@ -764,7 +762,7 @@ impl Index {
             }
         }
 
-        let mut disk_candidates: Vec<(&std::sync::Arc<Segment>, u128)> = Vec::new();
+        let mut disk_candidates: Vec<(&Arc<Segment>, u128)> = Vec::new();
 
         for segment in segments.segments() {
             let meta_mmap = segment.meta_map();
@@ -924,7 +922,6 @@ impl Index {
         log::debug!("Forcing full compaction of {} segments...", snapshot.len());
 
         let compactor_seq = self.next_op_seq.fetch_add(1, Ordering::SeqCst);
-
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
 
         let snapshot_tombstones = {
@@ -935,10 +932,26 @@ impl Index {
         compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone())
             .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
 
-        let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
-        base_guard
-            .apply_compaction(&snapshot, tmp_path)
-            .map_err(|e| IndexError::Io(std::io::Error::other(e)))?;
+        let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
+        let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
+        let final_path = PathBuf::from(final_path_str);
+        let final_paths = Segment::to_paths(&final_path);
+
+        Segment::rename_files(&tmp_paths, &final_paths).map_err(IndexError::Io)?;
+
+        let new_segment = Arc::new(
+            Segment::load(final_path).map_err(|e| IndexError::Io(std::io::Error::other(e)))?,
+        );
+
+        {
+            let mut base_guard = self.base.write().map_err(|_| IndexError::WriteLock)?;
+            base_guard.apply_compaction(&snapshot, new_segment);
+        }
+
+        {
+            let mut tombstones = self.prefix_tombstones.write().unwrap();
+            Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
+        }
 
         log::debug!("Full compaction complete");
         Ok(())
@@ -952,7 +965,7 @@ impl Index {
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
         if let Some(ref flusher) = *self.flusher.read().expect("failed to read flusher")
-            && !flusher.is_finished()
+            && !flusher.is_completed()
         {
             return Ok(());
         }
@@ -963,13 +976,15 @@ impl Index {
 
         let snapshot = {
             let mut wal = self.wal.write().expect("failed to lock wal");
-            let mut mem = self.mem_idx.write().expect("failed to lock memory");
 
-            if mem.is_empty() {
-                return Ok(());
-            }
+            let snapshot = {
+                let mut mem = self.mem_idx.write().expect("failed to lock memory");
 
-            let snapshot = std::mem::take(&mut *mem);
+                if mem.is_empty() {
+                    return Ok(());
+                }
+                std::mem::take(&mut *mem)
+            };
 
             wal.rotate(&flushing_path).map_err(IndexError::Io)?;
 
@@ -988,7 +1003,7 @@ impl Index {
         let op_seq = Arc::clone(&self.next_op_seq);
         let prefix_tombstones = Arc::clone(&self.prefix_tombstones);
 
-        let flusher = std::thread::Builder::new()
+        let flusher = crate::sync::thread::Builder::new()
             .name("minidex-flush".to_owned())
             .spawn(move || {
                 let final_segment_path = path.join(format!("{}", next_seq));
@@ -1038,7 +1053,7 @@ impl Index {
                     .write()
                     .expect("failed to acquire compactor write-lock");
                 if let Some(handle) = compactor_guard.as_ref()
-                    && !handle.is_finished()
+                    && !handle.is_completed()
                 {
                     return;
                 }
@@ -1062,7 +1077,7 @@ impl Index {
             return None;
         }
 
-        std::thread::Builder::new()
+        crate::sync::thread::Builder::new()
             .name("minidex-compactor".to_string())
             .spawn(move || {
                 let next_seq = next_op_seq.fetch_add(1, Ordering::SeqCst);
@@ -1072,12 +1087,31 @@ impl Index {
                 let snapshot_tombstones = { prefix_tombstones.read().unwrap().clone() };
                 match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
                     Ok(compactor_seq) => {
-                        let mut base_guard = base
-                            .write()
-                            .expect("failed to lock base for compaction apply");
-                        if let Err(e) = base_guard.apply_compaction(&snapshot, tmp_path) {
-                            log::error!("Failed to apply compaction: {}", e);
+                        let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
+                        let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
+                        let final_path = PathBuf::from(final_path_str);
+                        let final_paths = Segment::to_paths(&final_path);
+
+                        if let Err(e) = Segment::rename_files(&tmp_paths, &final_paths) {
+                            log::error!("Failed to rename compacted files: {}", e);
+                            return;
                         }
+
+                        let new_segment = match Segment::load(final_path) {
+                            Ok(seg) => Arc::new(seg),
+                            Err(e) => {
+                                log::error!("Failed to load compacted segment: {}", e);
+                                return;
+                            }
+                        };
+
+                        {
+                            let mut base_guard = base
+                                .write()
+                                .expect("failed to lock base for compaction apply");
+                            base_guard.apply_compaction(&snapshot, new_segment);
+                        }
+
                         let mut tombstones = prefix_tombstones.write().unwrap();
                         Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
 
@@ -1093,6 +1127,30 @@ impl Index {
         match allowed_volume_types {
             Some(allowed) => allowed.iter().fold(0, |acc, &vt| acc | (1 << (vt as u8))),
             None => 0b0000_1111,
+        }
+    }
+
+    #[inline(always)]
+    fn apply_backpressure(&self) -> Result<(), IndexError> {
+        let threshold = self.compactor_config.flush_threshold * 3;
+
+        // Backpressure mechanism - block inserts if we're blowing through
+        // the flushing threshold.
+        if self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len() > threshold {
+            let flusher = {
+                self.flusher
+                    .write()
+                    .map_err(|_| IndexError::WriteLock)?
+                    .take()
+            };
+
+            if let Some(handle) = flusher {
+                let _ = handle.join();
+            }
+
+            self.trigger_flush()
+        } else {
+            Ok(())
         }
     }
 }
@@ -1130,6 +1188,9 @@ pub enum IndexError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+#[cfg(all(test, feature = "shuttle"))]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1275,7 +1336,7 @@ mod tests {
         })?;
 
         // Wait a bit for background flush
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        crate::sync::thread::sleep(crate::sync::time::Duration::from_millis(500));
 
         let results = index.search("foo", 10, 0, SearchOptions::default())?;
         assert_eq!(results.len(), 2);
@@ -1387,7 +1448,7 @@ mod tests {
                 volume_type: VolumeType::Local,
             })?;
             // Force wait for each flush
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            crate::sync::thread::sleep(crate::sync::time::Duration::from_millis(200));
         }
 
         // Wait for final flush to finish
@@ -1515,8 +1576,8 @@ mod tests {
     }
 
     fn rand_id() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        crate::sync::time::SystemTime::now()
+            .duration_since(crate::sync::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
     }

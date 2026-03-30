@@ -2,10 +2,11 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+};
+
+use crate::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use crate::{Kind, Path, PathBuf, entry::IndexEntry, leb128::DeltaLeb128Iterator};
@@ -317,29 +318,16 @@ impl SegmentedIndex {
     pub(crate) fn apply_compaction(
         &mut self,
         old_segments: &[Arc<Segment>],
-        tmp_path: PathBuf,
-    ) -> Result<(), SegmentedIndexError> {
-        let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
-
-        let final_path_str = tmp_path.to_string_lossy().replace(".tmp", "");
-        let final_path = PathBuf::from(final_path_str);
-
-        let final_paths = Segment::to_paths(&final_path);
-
-        Segment::rename_files(&tmp_paths, &final_paths).map_err(SegmentedIndexError::Io)?;
-
-        let new_seg = Arc::new(Segment::load(final_path)?);
-
+        new_segment: Arc<Segment>,
+    ) {
         self.segments
             .retain(|active_seg| !old_segments.iter().any(|old| Arc::ptr_eq(active_seg, old)));
 
-        self.segments.push(new_seg);
+        self.segments.push(new_segment);
 
         for old_seg in old_segments {
             old_seg.mark_deleted();
         }
-
-        Ok(())
     }
 
     pub(crate) fn build_segment_files<I, S>(
@@ -402,40 +390,10 @@ impl SegmentedIndex {
 
             meta_writer.write_all(&packed_meta.to_le_bytes())?;
 
-            // Tokenize the path, generate synthetic tokens and add them too.
-
-            let tokens = crate::tokenizer::tokenize(path_ref);
+            let tokens = crate::tokenizer::extract_all_tokens(path_ref, volume_ref);
             for token in tokens {
                 inverted_index
                     .entry(token)
-                    .or_default()
-                    .push(doc_id_counter);
-            }
-
-            let path_lower = path_ref.to_lowercase();
-            for (i, _) in path_lower.match_indices(['/', '\\']) {
-                if i > 0 {
-                    let synth = crate::tokenizer::synthesize_path_token(&path_lower[..=i]);
-                    inverted_index
-                        .entry(synth)
-                        .or_default()
-                        .push(doc_id_counter);
-                }
-            }
-
-            // Generate synthetic tokens for the volume data and insert them
-            if !volume_ref.is_empty() {
-                let synth = crate::tokenizer::synthesize_volume_token(&volume_ref.to_lowercase());
-                inverted_index
-                    .entry(synth)
-                    .or_default()
-                    .push(doc_id_counter);
-            }
-
-            if let Some(ext) = Path::new(path_ref).extension().and_then(|ext| ext.to_str()) {
-                let synth = crate::tokenizer::synthesize_ext_token(&ext.to_lowercase());
-                inverted_index
-                    .entry(synth)
                     .or_default()
                     .push(doc_id_counter);
             }
@@ -687,8 +645,8 @@ mod tests {
     }
 
     fn rand_id() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        crate::sync::time::SystemTime::now()
+            .duration_since(crate::sync::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
     }

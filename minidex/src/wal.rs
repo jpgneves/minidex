@@ -345,8 +345,8 @@ mod tests {
     }
 
     fn rand_id() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        crate::sync::time::SystemTime::now()
+            .duration_since(crate::sync::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
     }
