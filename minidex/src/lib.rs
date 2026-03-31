@@ -24,13 +24,12 @@ mod leb128;
 use collector::*;
 pub use common::{Kind, VolumeType, category};
 mod entry;
-pub use entry::FilesystemEntry;
-use entry::*;
+pub use entry::{FilesystemEntry, IndexEntry};
 mod memtable;
-mod segmented_index;
+pub mod segmented_index;
 pub use segmented_index::compactor::*;
 use segmented_index::*;
-mod opstamp;
+pub mod opstamp;
 use opstamp::*;
 use wal::Wal;
 mod search;
@@ -1044,6 +1043,7 @@ impl Index {
                         .into_iter()
                         .map(|(path, (volume, entry))| (path, volume, entry)),
                     false,
+                    None,
                 ) {
                     log::error!("flush failed to write: {}", e);
                     let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);

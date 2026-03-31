@@ -166,7 +166,13 @@ pub(crate) fn merge_segments(
         }
     });
 
-    SegmentedIndex::build_segment_files(&out, merged_iterator, true)
+    // Strategy: reuse the dictionary from the first segment being merged.
+    // In tiered compaction, segments being merged are usually from the same tier
+    // or include a newly flushed segment. Reusing an existing dictionary
+    // avoids expensive training on every compaction.
+    let existing_dict = segments.first().and_then(|s| s.dict.as_deref());
+
+    SegmentedIndex::build_segment_files(&out, merged_iterator, true, existing_dict)
 }
 
 #[cfg(test)]
@@ -208,7 +214,7 @@ mod tests {
                 },
             ),
         ];
-        SegmentedIndex::build_segment_files(&seg1_path, entries1, false)?;
+        SegmentedIndex::build_segment_files(&seg1_path, entries1, false, None)?;
 
         let seg2_path = temp_dir.join("2");
         let entries2 = vec![
@@ -237,7 +243,7 @@ mod tests {
                 },
             ),
         ];
-        SegmentedIndex::build_segment_files(&seg2_path, entries2, false)?;
+        SegmentedIndex::build_segment_files(&seg2_path, entries2, false, None)?;
 
         let s1 = Arc::new(Segment::load(seg1_path)?);
         let s2 = Arc::new(Segment::load(seg2_path)?);
@@ -297,7 +303,7 @@ mod tests {
                 },
             ),
         ];
-        SegmentedIndex::build_segment_files(&seg_path, entries, false)?;
+        SegmentedIndex::build_segment_files(&seg_path, entries, false, None)?;
 
         let s1 = Arc::new(Segment::load(seg_path)?);
 

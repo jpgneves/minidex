@@ -30,10 +30,13 @@ const POST_EXT: &str = "post";
 /// Flat array of 16-byte u128 integers containing document IDs
 const META_EXT: &str = "meta";
 
+const DATA_MAGIC: &[u8; 4] = b"zMDX";
+
 /// A live index segment
 pub(crate) struct Segment {
     map: Option<Map<Mmap>>,
     data: Option<Mmap>,
+    dict: Option<Vec<u8>>,
     post: Option<Mmap>,
     meta: Option<Mmap>,
     path: PathBuf,
@@ -56,6 +59,27 @@ impl Segment {
         let dat_file = File::open(dat_path).map_err(SegmentedIndexError::Io)?;
         let data = unsafe { Mmap::map(&dat_file).map_err(SegmentedIndexError::Io)? };
 
+        let mut dict = None;
+        if data.len() >= DATA_MAGIC.len() && &data[0..DATA_MAGIC.len()] == DATA_MAGIC {
+            let dict_len = u32::from_le_bytes(
+                data[DATA_MAGIC.len()..DATA_MAGIC.len() + size_of::<u32>()]
+                    .try_into()
+                    .map_err(|_| {
+                        SegmentedIndexError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid dictionary length",
+                        ))
+                    })?,
+            ) as usize;
+            if DATA_MAGIC.len() + size_of::<u32>() + dict_len <= data.len() {
+                dict = Some(
+                    data[DATA_MAGIC.len() + size_of::<u32>()
+                        ..DATA_MAGIC.len() + size_of::<u32>() + dict_len]
+                        .to_vec(),
+                );
+            }
+        }
+
         // Load the postings
         let post_file = File::open(post_path).map_err(SegmentedIndexError::Io)?;
         let post = unsafe { Mmap::map(&post_file).map_err(SegmentedIndexError::Io)? };
@@ -67,6 +91,7 @@ impl Segment {
         Ok(Self {
             map: Some(map),
             data: Some(data),
+            dict,
             post: Some(post),
             meta: Some(meta),
             path,
@@ -133,15 +158,51 @@ impl Segment {
 
     /// Iterator over the documents in this segment
     pub(crate) fn documents(&self) -> DocumentIterator<'_> {
-        DocumentIterator::new(self.data.as_ref().expect("Expected data to be loaded"))
+        let mut cursor = 0;
+        if let Some(data) = self.data.as_ref()
+            && data.len() >= DATA_MAGIC.len()
+            && &data[0..DATA_MAGIC.len()] == DATA_MAGIC
+        {
+            let dict_len = u32::from_le_bytes(
+                data[DATA_MAGIC.len()..DATA_MAGIC.len() + size_of::<u32>()]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            ) as usize;
+            cursor = DATA_MAGIC.len() + size_of::<u32>() + dict_len;
+        }
+        DocumentIterator::new(self, cursor)
     }
 
     /// Reads document data for the given offset.
-    pub(crate) fn read_document(&self, offset: u64) -> Option<(&str, &str, IndexEntry)> {
+    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
         let data = self.data.as_ref().expect("expected data to be loaded");
-        Self::parse_document_borrowed(data, cursor)
-            .map(|(path, volume, entry, _)| (path, volume, entry))
+
+        if let Some(dict) = &self.dict {
+            if cursor + size_of::<u32>() > data.len() {
+                return None;
+            }
+            let compressed_len =
+                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
+                    as usize;
+            if cursor + size_of::<u32>() + compressed_len > data.len() {
+                return None;
+            }
+            let compressed_data =
+                &data[cursor + size_of::<u32>()..cursor + size_of::<u32>() + compressed_len];
+
+            // Fast block decompression
+            let mut decompressed = vec![0u8; 8 * 1024];
+            let size = zstd::bulk::Decompressor::with_dictionary(dict)
+                .ok()?
+                .decompress_to_buffer(compressed_data, &mut decompressed)
+                .ok()?;
+            decompressed.truncate(size);
+
+            Self::parse_document_owned(&decompressed, 0).map(|(p, v, e, _)| (p, v, e))
+        } else {
+            Self::parse_document_owned(data, cursor).map(|(p, v, e, _)| (p, v, e))
+        }
     }
 
     pub(crate) fn meta_map(&self) -> &Mmap {
@@ -243,7 +304,7 @@ impl Drop for Segment {
 
 /// A `SegmentedIndex` contains the (on-disk) segments
 /// that are committed with index data.
-pub(crate) struct SegmentedIndex {
+pub struct SegmentedIndex {
     segments: Vec<Arc<Segment>>,
     _lockfile: File,
 }
@@ -340,10 +401,11 @@ impl SegmentedIndex {
         was_full
     }
 
-    pub(crate) fn build_segment_files<I, S>(
+    pub fn build_segment_files<I, S>(
         out_path: &Path,
         items: I,
         drop_deletions: bool,
+        existing_dict: Option<&[u8]>,
     ) -> Result<u64, SegmentedIndexError>
     where
         I: IntoIterator<Item = (S, S, IndexEntry)>,
@@ -359,9 +421,12 @@ impl SegmentedIndex {
         let mut meta_writer = BufWriter::new(File::create(&meta_path)?);
 
         let mut inverted_index: BTreeMap<String, Vec<DocumentId>> = BTreeMap::new();
-        let mut current_dat_offset = 0u64;
 
-        let mut doc_id_counter: u32 = 0;
+        let mut items_vec = Vec::new();
+        let mut samples = Vec::new();
+        let mut sample_sizes = Vec::new();
+
+        let build_dict = existing_dict.is_none();
 
         for (path, volume, entry) in items {
             if drop_deletions && entry.opstamp.is_deletion() {
@@ -375,14 +440,79 @@ impl SegmentedIndex {
 
             let entry_bytes = entry.as_bytes();
 
-            dat_writer.write_all(&(path_bytes.len() as u32).to_le_bytes())?;
-            dat_writer.write_all(path_bytes)?;
-            dat_writer.write_all(&(volume_bytes.len() as u32).to_le_bytes())?;
-            dat_writer.write_all(volume_bytes)?;
-            dat_writer.write_all(&entry_bytes)?;
+            let mut serialized = Vec::with_capacity(
+                size_of::<u32>()
+                    + path_bytes.len()
+                    + size_of::<u32>()
+                    + volume_bytes.len()
+                    + entry_bytes.len(),
+            );
+            serialized.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            serialized.extend_from_slice(path_bytes);
+            serialized.extend_from_slice(&(volume_bytes.len() as u32).to_le_bytes());
+            serialized.extend_from_slice(volume_bytes);
+            serialized.extend_from_slice(&entry_bytes);
+
+            // Sample records only if we need to build a new dictionary
+            if build_dict && items_vec.len() % 100 == 0 && sample_sizes.len() < 1000 {
+                samples.extend_from_slice(&serialized);
+                sample_sizes.push(serialized.len());
+            }
+
+            items_vec.push((
+                path_ref.to_owned(),
+                volume_ref.to_owned(),
+                entry,
+                serialized,
+            ));
+        }
+
+        let dict = if let Some(d) = existing_dict {
+            d.to_vec()
+        } else if !samples.is_empty() {
+            // Use a smaller dictionary size to speed up training
+            zstd::dict::from_continuous(&samples, &sample_sizes, 40 * 1024).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        dat_writer.write_all(DATA_MAGIC)?;
+        dat_writer.write_all(&(dict.len() as u32).to_le_bytes())?;
+        dat_writer.write_all(&dict)?;
+
+        let mut current_dat_offset = (DATA_MAGIC.len() + size_of::<u32>() + dict.len()) as u64;
+        let mut doc_id_counter: u32 = 0;
+
+        let mut compressor = if !dict.is_empty() {
+            Some(
+                zstd::bulk::Compressor::with_dictionary(0, &dict)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?,
+            )
+        } else {
+            None
+        };
+
+        for (path_ref, volume_ref, entry, serialized) in items_vec {
+            let compressed = if let Some(ref mut comp) = compressor {
+                // Use a safe bound for compression
+                let max_size = serialized.len() + (serialized.len() / 16) + 64;
+                let mut out = vec![0u8; max_size];
+                let size = comp
+                    .compress_to_buffer(&serialized, &mut out)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?;
+                out.truncate(size);
+                out
+            } else {
+                zstd::encode_all(&serialized[..], 0)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?
+            };
+
+            dat_writer.write_all(&(compressed.len() as u32).to_le_bytes())?;
+            dat_writer.write_all(&compressed)?;
 
             // Pack u128 metadata
-            let depth = path_bytes
+            let depth = path_ref
+                .as_bytes()
                 .iter()
                 .filter(|&&b| b == std::path::MAIN_SEPARATOR as u8)
                 .count() as u16;
@@ -400,7 +530,7 @@ impl SegmentedIndex {
 
             meta_writer.write_all(&packed_meta.to_le_bytes())?;
 
-            let tokens = crate::tokenizer::extract_all_tokens(path_ref, volume_ref);
+            let tokens = crate::tokenizer::extract_all_tokens(&path_ref, &volume_ref);
             for token in tokens {
                 inverted_index
                     .entry(token)
@@ -408,11 +538,7 @@ impl SegmentedIndex {
                     .push(doc_id_counter);
             }
 
-            current_dat_offset += (size_of::<u32>()
-                + path_bytes.len()
-                + size_of::<u32>()
-                + volume_bytes.len()
-                + entry_bytes.len()) as u64;
+            current_dat_offset += (size_of::<u32>() + compressed.len()) as u64;
             doc_id_counter += 1
         }
 
@@ -546,13 +672,13 @@ impl From<std::io::Error> for SegmentedIndexError {
 }
 
 pub(crate) struct DocumentIterator<'a> {
-    data: &'a [u8],
+    segment: &'a Segment,
     cursor: usize,
 }
 
 impl<'a> DocumentIterator<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, cursor: 0 }
+    fn new(segment: &'a Segment, cursor: usize) -> Self {
+        Self { segment, cursor }
     }
 }
 
@@ -560,11 +686,39 @@ impl Iterator for DocumentIterator<'_> {
     type Item = (String, String, IndexEntry);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (path, volume, entry, new_cursor) =
-            Segment::parse_document_owned(self.data, self.cursor)?;
-        self.cursor = new_cursor;
+        let data = self.segment.data.as_ref().expect("expected data");
+        if let Some(dict) = &self.segment.dict {
+            if self.cursor + size_of::<u32>() > data.len() {
+                return None;
+            }
+            let compressed_len = u32::from_le_bytes(
+                data[self.cursor..self.cursor + size_of::<u32>()]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            self.cursor += size_of::<u32>();
+            if self.cursor + compressed_len > data.len() {
+                return None;
+            }
+            let compressed_data = &data[self.cursor..self.cursor + compressed_len];
+            self.cursor += compressed_len;
 
-        Some((path, volume, entry))
+            // Fast block decompression
+            let mut decompressed = vec![0u8; 8 * 1024];
+            let size = zstd::bulk::Decompressor::with_dictionary(dict)
+                .ok()?
+                .decompress_to_buffer(compressed_data, &mut decompressed)
+                .ok()?;
+            decompressed.truncate(size);
+
+            Segment::parse_document_owned(&decompressed, 0).map(|(p, v, e, _)| (p, v, e))
+        } else {
+            let (path, volume, entry, new_cursor) =
+                Segment::parse_document_owned(data, self.cursor)?;
+            self.cursor = new_cursor;
+
+            Some((path, volume, entry))
+        }
     }
 }
 
@@ -617,7 +771,7 @@ mod tests {
             ),
         ];
 
-        SegmentedIndex::build_segment_files(&seg_path, entries.clone(), false)?;
+        SegmentedIndex::build_segment_files(&seg_path, entries.clone(), false, None)?;
 
         let segment = Segment::load(seg_path)?;
 
