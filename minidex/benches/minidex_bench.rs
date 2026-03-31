@@ -107,27 +107,62 @@ fn bench_index_search(c: &mut Criterion) {
     for size in sizes {
         let dir = tempdir().expect("failed to create temp dir");
         let config = CompactorConfigBuilder::new().flush_threshold(2000).build();
-        let index = Index::open_with_config(dir.path(), config).expect("failed to open index");
+        
+        // Single-threaded index
+        let st_config = minidex::IndexConfig {
+            compactor_config: config,
+            search_threads: 1,
+        };
+        let index_st = Index::open_with_config(dir.path(), st_config).expect("failed to open index");
 
-        populate_index(&index, size);
+        populate_index(&index_st, size);
 
         // Wait for background flushes to finish
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        group.bench_with_input(BenchmarkId::new("disk_search_hit", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("disk_search_hit_st", size), &size, |b, _| {
             b.iter(|| {
-                let _ = index
+                let _ = index_st
                     .search(black_box("bar_50"), 10, 0, SearchOptions::default())
                     .expect("search failed");
             })
         });
 
         group.bench_with_input(
-            BenchmarkId::new("disk_search_prefix", size),
+            BenchmarkId::new("disk_search_prefix_st", size),
             &size,
             |b, _| {
                 b.iter(|| {
-                    let _ = index
+                    let _ = index_st
+                        .search(black_box("bar"), 10, 0, SearchOptions::default())
+                        .expect("search failed");
+                })
+            },
+        );
+
+        // Multi-threaded index (default)
+        let mt_config = minidex::IndexConfig {
+            compactor_config: config,
+            search_threads: 0,
+        };
+        let index_mt = Index::open_with_config(dir.path(), mt_config).expect("failed to open index");
+        // It's the same physical index, we just want to test different search pools.
+        // Actually, we should probably reopen it.
+        
+        group.bench_with_input(BenchmarkId::new("disk_search_hit_mt", size), &size, |b, _| {
+            b.iter(|| {
+                let _ = index_mt
+                    .search(black_box("bar_50"), 10, 0, SearchOptions::default())
+                    .expect("search failed");
+            })
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("disk_search_prefix_mt", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let _ = index_mt
                         .search(black_box("bar"), 10, 0, SearchOptions::default())
                         .expect("search failed");
                 })
@@ -136,7 +171,7 @@ fn bench_index_search(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("mem_search_hit", size), &size, |b, _| {
             let path = format!("/foo/mem_only_entry_{}.txt", size);
-            index
+            index_st
                 .insert(FilesystemEntry {
                     path: PathBuf::from(&path),
                     volume: "vol1".to_string(),
@@ -150,7 +185,7 @@ fn bench_index_search(c: &mut Criterion) {
 
             let search_term = format!("mem_only_entry_{}", size);
             b.iter(|| {
-                let _ = index
+                let _ = index_st
                     .search(black_box(&search_term), 10, 0, SearchOptions::default())
                     .expect("search failed");
             })

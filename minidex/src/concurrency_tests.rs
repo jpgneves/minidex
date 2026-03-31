@@ -8,10 +8,13 @@ mod _concurrency_tests {
 
     fn setup_index() -> (TempDir, Index) {
         let temp_dir = TempDir::new().unwrap();
-        let config = CompactorConfig {
-            flush_threshold: 2,
-            min_merge_count: 2,
-            ..Default::default()
+        let config = IndexConfig {
+            compactor_config: CompactorConfig {
+                flush_threshold: 2,
+                min_merge_count: 2,
+                ..Default::default()
+            },
+            search_threads: 2,
         };
         let index = Index::open_with_config(temp_dir.path(), config).unwrap();
         (temp_dir, index)

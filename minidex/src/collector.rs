@@ -43,6 +43,20 @@ impl<'a> LsmCollector<'a> {
             .or_insert((volume_cow, entry));
     }
 
+    pub(crate) fn merge(&mut self, other: LsmCollector<'a>) {
+        for (path, (volume, entry)) in other.candidates {
+            self.candidates
+                .entry(path)
+                .and_modify(|(current_volume, current_entry)| {
+                    if entry.opstamp.sequence() > current_entry.opstamp.sequence() {
+                        *current_entry = entry;
+                        *current_volume = volume.clone();
+                    }
+                })
+                .or_insert((volume, entry));
+        }
+    }
+
     #[inline]
     pub(crate) fn finish(self) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>, IndexEntry)> {
         self.candidates

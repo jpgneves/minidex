@@ -103,7 +103,8 @@ pub(crate) fn merge_segments(
                     min_idx = match min_idx {
                         None => Some(i), // We're the first
                         Some(idx) => {
-                            let (path_min, _, _) = currents[idx].as_ref().unwrap();
+                            let (path_min, _, _) =
+                                currents[idx].as_ref().expect("head should be loaded");
                             if path_i < path_min {
                                 Some(i)
                             } else {
@@ -117,7 +118,9 @@ pub(crate) fn merge_segments(
             // If we've exhausted all iterators, merge completed.
             let target_idx = min_idx?;
 
-            let mut best_item = currents[target_idx].take().unwrap();
+            let mut best_item = currents[target_idx]
+                .take()
+                .expect("head should not be empty");
 
             // Refill the head with the next one.
             currents[target_idx] = iterators[target_idx].next();
@@ -127,7 +130,7 @@ pub(crate) fn merge_segments(
             for i in 0..currents.len() {
                 while let Some((path, _, _)) = &currents[i] {
                     if *path == best_item.0 {
-                        let item = currents[i].take().unwrap();
+                        let item = currents[i].take().expect("head should not be empty");
 
                         // Check for tombstones
                         let path_bytes = item.0.as_bytes();

@@ -24,6 +24,7 @@ bstr = "1.12.1"
 unicode-normalization = "0.1.25"
 zstd = "0.13"
 shuttle = { version = "0.8.1", optional = true }
+rayon = "1.11.0"
 
 [dev-dependencies]
 criterion = "0.8"

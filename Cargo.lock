@@ -1033,6 +1033,7 @@ dependencies = [
  "log",
  "memmap2",
  "rand 0.10.0",
+ "rayon",
  "regex-automata",
  "regex-syntax",
  "shuttle",

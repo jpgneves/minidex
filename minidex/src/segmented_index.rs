@@ -6,7 +6,7 @@ use std::{
 
 use crate::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
 use crate::{Kind, Path, PathBuf, entry::IndexEntry, leb128::DeltaLeb128Iterator};
@@ -100,7 +100,7 @@ impl Segment {
     }
 
     pub(crate) fn mark_deleted(&self) {
-        self.deleted.store(true, Ordering::SeqCst);
+        self.deleted.store(true, AtomicOrdering::SeqCst);
     }
 
     pub(crate) fn to_paths(path: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -125,35 +125,146 @@ impl Segment {
 
     /// Helper to append a posting list directly to an existing Vec
     pub(crate) fn append_posting_list(&self, offset: u64, out: &mut Vec<u32>) {
-        let start = offset as usize;
+        let start = (offset & 0x0000_00FF_FFFF_FFFF) as usize;
         let post = self.post.as_ref().expect("posting should be loaded");
 
         if start + size_of::<u32>() > post.len() {
             return;
         }
 
-        let count =
-            u32::from_le_bytes(post[start..start + size_of::<u32>()].try_into().unwrap()) as usize;
-
-        let byte_len = u32::from_le_bytes(
-            post[start + size_of::<u32>()..start + (2 * size_of::<u32>())]
+        let total_count = u32::from_le_bytes(
+            post[start..start + size_of::<u32>()]
                 .try_into()
-                .unwrap(),
+                .expect("failed to read total count"),
         ) as usize;
 
-        let cursor = start + (2 * size_of::<u32>());
-        let end = cursor + byte_len;
+        let mut cursor = start + size_of::<u32>();
 
-        if end > post.len() {
+        out.reserve(total_count);
+
+        let mut items_read = 0;
+        while items_read < total_count {
+            if cursor + (2 * size_of::<u32>()) > post.len() {
+                break;
+            }
+
+            // Skip max_id in block (used for skipping, not for full append)
+            cursor += size_of::<u32>();
+
+            let block_len = u32::from_le_bytes(
+                post[cursor..cursor + size_of::<u32>()]
+                    .try_into()
+                    .expect("failed to read block length"),
+            ) as usize;
+            cursor += size_of::<u32>();
+
+            if cursor + block_len > post.len() {
+                break;
+            }
+
+            let compressed_slice = &post[cursor..cursor + block_len];
+            let iter = DeltaLeb128Iterator::new(compressed_slice);
+
+            let mut count_in_this_block = 0;
+            for id in iter {
+                out.push(id);
+                count_in_this_block += 1;
+            }
+            items_read += count_in_this_block;
+            cursor += block_len;
+        }
+    }
+
+    /// Helper to append a posting list directly to an existing Vec,
+    /// bounded by current_matches
+    pub(crate) fn append_posting_list_bounded(
+        &self,
+        offset: u64,
+        out: &mut Vec<u32>,
+        current_matches: &[u32],
+    ) {
+        let start = (offset & 0x0000_00FF_FFFF_FFFF) as usize;
+        let post = self.post.as_ref().expect("posting should be loaded");
+
+        if start + size_of::<u32>() > post.len() {
             return;
         }
 
-        out.reserve(count);
+        let total_count = u32::from_le_bytes(
+            post[start..start + size_of::<u32>()]
+                .try_into()
+                .expect("failed to read total count"),
+        ) as usize;
 
-        let compressed_slice = &post[cursor..end];
-        let iter = DeltaLeb128Iterator::new(compressed_slice);
+        let mut cursor = start + size_of::<u32>();
 
-        out.extend(iter);
+        out.reserve(total_count);
+
+        let mut items_read = 0;
+        let mut match_idx = 0;
+
+        while items_read < total_count {
+            if match_idx >= current_matches.len() {
+                break;
+            }
+            if cursor + (2 * size_of::<u32>()) > post.len() {
+                break;
+            }
+
+            let max_in_block = u32::from_le_bytes(
+                post[cursor..cursor + size_of::<u32>()]
+                    .try_into()
+                    .expect("failed to read max in block"),
+            );
+            cursor += size_of::<u32>();
+
+            let block_len = u32::from_le_bytes(
+                post[cursor..cursor + 4]
+                    .try_into()
+                    .expect("failed to read block length"),
+            ) as usize;
+            cursor += size_of::<u32>();
+
+            let items_in_block = if total_count - items_read >= 128 {
+                128
+            } else {
+                total_count - items_read
+            };
+
+            let target = current_matches[match_idx];
+
+            if max_in_block < target {
+                cursor += block_len;
+                items_read += items_in_block;
+                continue;
+            }
+
+            if cursor + block_len > post.len() {
+                break;
+            }
+
+            let compressed_slice = &post[cursor..cursor + block_len];
+            let iter = DeltaLeb128Iterator::new(compressed_slice);
+
+            for id in iter {
+                while match_idx < current_matches.len() && current_matches[match_idx] < id {
+                    match_idx += 1;
+                }
+                if match_idx == current_matches.len() {
+                    break;
+                }
+                if current_matches[match_idx] == id {
+                    out.push(id);
+                }
+            }
+
+            while match_idx < current_matches.len() && current_matches[match_idx] <= max_in_block {
+                match_idx += 1;
+            }
+
+            items_read += items_in_block;
+            cursor += block_len;
+        }
     }
 
     /// Iterator over the documents in this segment
@@ -174,7 +285,11 @@ impl Segment {
     }
 
     /// Reads document data for the given offset.
-    pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
+    pub(crate) fn read_document(
+        &self,
+        offset: u64,
+        out_buffer: &mut Vec<u8>,
+    ) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
         let data = self.data.as_ref().expect("expected data to be loaded");
 
@@ -182,24 +297,27 @@ impl Segment {
             if cursor + size_of::<u32>() > data.len() {
                 return None;
             }
-            let compressed_len =
-                u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
-                    as usize;
+            let compressed_len = u32::from_le_bytes(
+                data[cursor..cursor + size_of::<u32>()]
+                    .try_into()
+                    .expect("failed to read compressed length"),
+            ) as usize;
             if cursor + size_of::<u32>() + compressed_len > data.len() {
                 return None;
             }
             let compressed_data =
                 &data[cursor + size_of::<u32>()..cursor + size_of::<u32>() + compressed_len];
 
-            // Fast block decompression
-            let mut decompressed = vec![0u8; 8 * 1024];
+            // Fast block decompression using reusable buffer
+            out_buffer.clear();
+            out_buffer.resize(8 * 1024, 0); // Pre-allocate up to 8KB without changing capacity if already large enough
             let size = zstd::bulk::Decompressor::with_dictionary(dict)
                 .ok()?
-                .decompress_to_buffer(compressed_data, &mut decompressed)
+                .decompress_to_buffer(compressed_data, out_buffer)
                 .ok()?;
-            decompressed.truncate(size);
+            out_buffer.truncate(size);
 
-            Self::parse_document_owned(&decompressed, 0).map(|(p, v, e, _)| (p, v, e))
+            Self::parse_document_owned(out_buffer, 0).map(|(p, v, e, _)| (p, v, e))
         } else {
             Self::parse_document_owned(data, cursor).map(|(p, v, e, _)| (p, v, e))
         }
@@ -236,9 +354,11 @@ impl Segment {
         if cursor + size_of::<u32>() > data_len {
             return None;
         }
-        let path_len =
-            u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
-                as usize;
+        let path_len = u32::from_le_bytes(
+            data[cursor..cursor + size_of::<u32>()]
+                .try_into()
+                .expect("failed to read path length"),
+        ) as usize;
         cursor += size_of::<u32>();
 
         if cursor + path_len > data_len {
@@ -250,9 +370,11 @@ impl Segment {
         if cursor + size_of::<u32>() > data_len {
             return None;
         }
-        let volume_len =
-            u32::from_le_bytes(data[cursor..cursor + size_of::<u32>()].try_into().unwrap())
-                as usize;
+        let volume_len = u32::from_le_bytes(
+            data[cursor..cursor + size_of::<u32>()]
+                .try_into()
+                .expect("failed to read volume length"),
+        ) as usize;
         cursor += size_of::<u32>();
 
         if cursor + volume_len > data_len {
@@ -283,13 +405,13 @@ impl Segment {
 
 impl AsRef<Map<Mmap>> for Segment {
     fn as_ref(&self) -> &Map<Mmap> {
-        self.map.as_ref().unwrap()
+        self.map.as_ref().expect("segment map should be loaded")
     }
 }
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        if self.deleted.load(Ordering::SeqCst) {
+        if self.deleted.load(AtomicOrdering::SeqCst) {
             self.map.take();
             self.data.take();
             self.post.take();
@@ -367,10 +489,6 @@ impl SegmentedIndex {
     /// Take a snapshop of all currently living segments
     pub(crate) fn snapshot(&self) -> Vec<Arc<Segment>> {
         self.segments.clone()
-    }
-
-    pub(crate) fn segments(&self) -> impl Iterator<Item = &Arc<Segment>> {
-        self.segments.iter()
     }
 
     /// Add segment to the index
@@ -492,23 +610,27 @@ impl SegmentedIndex {
             None
         };
 
+        let mut compression_buffer = Vec::new();
+
         for (path_ref, volume_ref, entry, serialized) in items_vec {
             let compressed = if let Some(ref mut comp) = compressor {
                 // Use a safe bound for compression
                 let max_size = serialized.len() + (serialized.len() / 16) + 64;
-                let mut out = vec![0u8; max_size];
+                if compression_buffer.len() < max_size {
+                    compression_buffer.resize(max_size, 0);
+                }
                 let size = comp
-                    .compress_to_buffer(&serialized, &mut out)
+                    .compress_to_buffer(&serialized, &mut compression_buffer)
                     .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?;
-                out.truncate(size);
-                out
+                &compression_buffer[..size]
             } else {
-                zstd::encode_all(&serialized[..], 0)
-                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?
+                compression_buffer = zstd::encode_all(&serialized[..], 0)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?;
+                &compression_buffer[..]
             };
 
             dat_writer.write_all(&(compressed.len() as u32).to_le_bytes())?;
-            dat_writer.write_all(&compressed)?;
+            dat_writer.write_all(compressed)?;
 
             // Pack u128 metadata
             let depth = path_ref
@@ -553,37 +675,56 @@ impl SegmentedIndex {
         let mut current_post_offset = 0u64;
         let mut compressed_buffer = Vec::new();
 
+        // Write postings using Skip Pointers to avoid decompressing
+        // whole blocks of offsets unnecessarily
         for (token, doc_offsets) in inverted_index {
             compressed_buffer.clear();
-            let mut last_id = 0u32;
 
-            for &offset in &doc_offsets {
-                let delta = offset - last_id;
-                last_id = offset;
-                let mut val = delta;
-
-                loop {
-                    let mut byte = (val & 0x7F) as u8;
-                    val >>= 7;
-                    if val != 0 {
-                        byte |= 0x80;
-                        compressed_buffer.push(byte);
-                    } else {
-                        compressed_buffer.push(byte);
-                        break;
-                    }
-                }
-            }
+            let doc_freq = doc_offsets.len() as u64;
+            let start_of_posting = current_post_offset;
 
             post_writer.write_all(&(doc_offsets.len() as u32).to_le_bytes())?;
-            post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
-            post_writer.write_all(&compressed_buffer)?;
+            current_post_offset += size_of::<u32>() as u64;
 
+            for block in doc_offsets.chunks(128) {
+                let last_in_block = *block.last().expect("could not get highest offset");
+                let mut last_id = 0u32;
+
+                for &offset in block {
+                    let delta = offset - last_id;
+                    last_id = offset;
+                    let mut val = delta;
+
+                    loop {
+                        let mut byte = (val & 0x7F) as u8;
+                        val >>= 7;
+                        if val != 0 {
+                            byte |= 0x80;
+                            compressed_buffer.push(byte);
+                        } else {
+                            compressed_buffer.push(byte);
+                            break;
+                        }
+                    }
+                }
+
+                post_writer.write_all(&last_in_block.to_le_bytes())?;
+                post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
+                post_writer.write_all(&compressed_buffer)?;
+
+                current_post_offset +=
+                    (size_of::<u32>() * 2) as u64 + compressed_buffer.len() as u64;
+                compressed_buffer.clear();
+            }
+
+            // Let's take only 40 bits for the actual offset, the remaining 24
+            // are used to pack the document frequency.
+            // This gives us a maximum document frequency of ~16.7M documents
+            // per segment and ~1TB of posting lists per segment.
+            let packed_df_offset = (doc_freq << 40) | (start_of_posting & 0x0000_00FF_FFFF_FFFF);
             seg_builder
-                .insert(token, current_post_offset)
+                .insert(token, packed_df_offset)
                 .map_err(SegmentedIndexError::Fst)?;
-
-            current_post_offset += (2 * size_of::<u32>() as u64) + compressed_buffer.len() as u64;
         }
 
         meta_writer
@@ -674,11 +815,16 @@ impl From<std::io::Error> for SegmentedIndexError {
 pub(crate) struct DocumentIterator<'a> {
     segment: &'a Segment,
     cursor: usize,
+    decompressed_buffer: Vec<u8>,
 }
 
 impl<'a> DocumentIterator<'a> {
     fn new(segment: &'a Segment, cursor: usize) -> Self {
-        Self { segment, cursor }
+        Self {
+            segment,
+            cursor,
+            decompressed_buffer: Vec::with_capacity(8 * 1024),
+        }
     }
 }
 
@@ -694,7 +840,7 @@ impl Iterator for DocumentIterator<'_> {
             let compressed_len = u32::from_le_bytes(
                 data[self.cursor..self.cursor + size_of::<u32>()]
                     .try_into()
-                    .unwrap(),
+                    .expect("failed to read compressed length"),
             ) as usize;
             self.cursor += size_of::<u32>();
             if self.cursor + compressed_len > data.len() {
@@ -703,15 +849,17 @@ impl Iterator for DocumentIterator<'_> {
             let compressed_data = &data[self.cursor..self.cursor + compressed_len];
             self.cursor += compressed_len;
 
-            // Fast block decompression
-            let mut decompressed = vec![0u8; 8 * 1024];
+            // Fast block decompression using reusable buffer
+            self.decompressed_buffer.clear();
+            self.decompressed_buffer.resize(8 * 1024, 0);
             let size = zstd::bulk::Decompressor::with_dictionary(dict)
                 .ok()?
-                .decompress_to_buffer(compressed_data, &mut decompressed)
+                .decompress_to_buffer(compressed_data, &mut self.decompressed_buffer)
                 .ok()?;
-            decompressed.truncate(size);
+            self.decompressed_buffer.truncate(size);
 
-            Segment::parse_document_owned(&decompressed, 0).map(|(p, v, e, _)| (p, v, e))
+            Segment::parse_document_owned(&self.decompressed_buffer, 0)
+                .map(|(p, v, e, _)| (p, v, e))
         } else {
             let (path, volume, entry, new_cursor) =
                 Segment::parse_document_owned(data, self.cursor)?;
@@ -811,7 +959,7 @@ mod tests {
     fn rand_id() -> u64 {
         crate::sync::time::SystemTime::now()
             .duration_since(crate::sync::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("failed to get system time")
             .as_nanos() as u64
     }
 }

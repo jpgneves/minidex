@@ -12,6 +12,7 @@ use crate::sync::{
 };
 
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
+use rayon::prelude::*;
 
 use memtable::MemTable;
 use search::evaluate_candidate;
@@ -41,6 +42,33 @@ pub use search::{ScoringConfig, ScoringInputs, ScoringWeights, SearchOptions, Se
 
 pub type Tombstone = (Option<String>, String, u64);
 
+/// Configuration for the Index
+#[derive(Debug, Clone, Copy)]
+pub struct IndexConfig {
+    pub compactor_config: CompactorConfig,
+    /// Number of threads to use for parallel searching across segments.
+    /// If 0, it will use the number of logical cores available.
+    pub search_threads: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            compactor_config: CompactorConfig::default(),
+            search_threads: 0,
+        }
+    }
+}
+
+impl From<CompactorConfig> for IndexConfig {
+    fn from(compactor_config: CompactorConfig) -> Self {
+        Self {
+            compactor_config,
+            search_threads: 0,
+        }
+    }
+}
+
 /// A Minidex Index, managing both the in-memory and disk data.
 /// Insertions and deletions auto-commit to the Write-Ahead Log
 /// and may trigger compaction.
@@ -54,33 +82,50 @@ pub struct Index {
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
     prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+    search_pool: rayon::ThreadPool,
+    search_threads: usize,
 }
 
 impl Index {
-    /// Open the index on disk with a default compactor configuration.
+    /// Open the index on disk with a default configuration.
     /// This function will:
     /// 1. Create (if it doesn't exist) the directory at `path`
     /// 2. Try to obtain a lock on the directory
     /// 3. Load the discovered segments, data and posting
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
-        Self::open_with_config(path, CompactorConfig::default())
+        Self::open_with_config(path, IndexConfig::default())
     }
 
-    /// Open the index on disk with a custom compactor configuration.
+    /// Open the index on disk with a custom configuration.
     /// This function will:
     /// 1. Create (if it doesn't exist) the directory at `path`
     /// 2. Try to obtain a lock on the directory
     /// 3. Load the discovered segments, data and posting
-    pub fn open_with_config<P: AsRef<Path>>(
+    pub fn open_with_config<P: AsRef<Path>, C: Into<IndexConfig>>(
         path: P,
-        compactor_config: CompactorConfig,
+        config: C,
     ) -> Result<Self, IndexError> {
+        let config = config.into();
         let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
 
         let base = Arc::new(RwLock::new(base));
         let mut mem_idx = MemTable::default();
 
         let mut prefix_tombstones = Vec::new();
+
+        let search_threads = if config.search_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        } else {
+            config.search_threads
+        };
+
+        let search_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(search_threads)
+            .thread_name(|i| format!("minidex-search-{}", i))
+            .build()
+            .map_err(|e| IndexError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
         let mut flushing_wals = Vec::new();
@@ -168,10 +213,12 @@ impl Index {
             next_op_seq,
             mem_idx: RwLock::new(mem_idx),
             wal: RwLock::new(wal),
-            compactor_config,
+            compactor_config: config.compactor_config,
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
             prefix_tombstones: Arc::new(RwLock::new(Arc::new(prefix_tombstones))),
+            search_pool,
+            search_threads,
         };
 
         if index.should_flush() {
@@ -375,7 +422,7 @@ impl Index {
         offset: usize,
         options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
-        let mut tokens = crate::tokenizer::tokenize(query);
+        let tokens = crate::tokenizer::tokenize(query);
 
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -384,13 +431,34 @@ impl Index {
         let query_lower = query.to_lowercase();
         let raw_query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
-        tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
-
         let segments = self
             .base
             .read()
             .map_err(|_| IndexError::ReadLock)?
             .snapshot();
+
+        let tokens: Vec<String> = if tokens.len() > 1 {
+            // Lookup all search terms in the FST to get their Document frequencies
+            let mut term_dfs: Vec<(String, u64)> = tokens.into_iter().map(|t| (t, 0)).collect();
+            for (token, total_df) in &mut term_dfs {
+                let matcher = fst::automaton::Str::new(token).starts_with();
+                for segment in &segments {
+                    let map = segment.as_ref().as_ref();
+                    let mut stream = map.search(&matcher).into_stream();
+
+                    while let Some((_, packed_value)) = stream.next() {
+                        let df = packed_value >> 40;
+                        *total_df += df;
+                    }
+                }
+            }
+
+            // Sort the tokens so the rarest are processed_first
+            term_dfs.sort_unstable_by_key(|(_, df)| *df);
+            term_dfs.into_iter().map(|(t, _)| t).collect()
+        } else {
+            tokens
+        };
 
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
@@ -405,19 +473,21 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
-        let mut mem_materialized = Vec::new();
-        {
-            let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
-            let mut mem_candidates: Option<Vec<u32>> = None;
-            let mut mem_intersect_buf = Vec::new();
+        let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+        let mut mem_candidates: Option<Vec<u32>> = None;
+        let mut mem_intersect_buf = Vec::new();
 
-            // In-memory searches
-            if !tokens.is_empty() {
-                for token in &tokens {
-                    let mut end_bound = String::with_capacity(token.len() + 4);
-                    end_bound.push_str(token);
-                    end_bound.push('\u{FFFF}');
+        // In-memory searches
+        if !tokens.is_empty() {
+            struct MemTokenResult<'a> {
+                total_size: usize,
+                matching_arrays: Vec<&'a Vec<u32>>,
+            }
 
+            let mut token_results: Vec<MemTokenResult> = tokens
+                .iter()
+                .map(|token| {
+                    let end_bound = token.to_owned() + "\u{FFFF}";
                     let matching_arrays: Vec<&Vec<u32>> = mem
                         .inverted_index
                         .range::<str, _>((
@@ -427,186 +497,376 @@ impl Index {
                         .map(|(_, ids)| ids)
                         .collect();
 
-                    if matching_arrays.is_empty() {
-                        mem_candidates = Some(Vec::new());
-                        break;
+                    let total_size = matching_arrays.iter().map(|ids| ids.len()).sum();
+                    MemTokenResult {
+                        total_size,
+                        matching_arrays,
                     }
+                })
+                .collect();
 
-                    let current_token_ids = if matching_arrays.len() == 1 {
-                        std::borrow::Cow::Borrowed(matching_arrays[0])
-                    } else {
-                        let mut merged = Vec::new();
-                        for ids in matching_arrays {
-                            merged.extend_from_slice(ids);
-                        }
-                        merged.sort_unstable();
-                        merged.dedup();
-                        std::borrow::Cow::Owned(merged)
-                    };
+            // Sort by rarest total size first
+            token_results.sort_unstable_by_key(|r| r.total_size);
 
-                    match mem_candidates.as_mut() {
-                        // Two point merge in the RAM path
-                        Some(existing) => {
-                            mem_intersect_buf.clear();
-                            crate::simd::intersect_arrays(
-                                existing,
-                                &current_token_ids,
-                                &mut mem_intersect_buf,
-                            );
-                            std::mem::swap(existing, &mut mem_intersect_buf);
-                        }
-                        None => mem_candidates = Some(current_token_ids.into_owned()),
-                    }
-
-                    if let Some(c) = &mem_candidates
-                        && c.is_empty()
-                    {
-                        break;
-                    }
+            for result in token_results {
+                if result.matching_arrays.is_empty() {
+                    mem_candidates = Some(Vec::new());
+                    break;
                 }
-            } else {
-                mem_candidates = Some(mem.id_to_data.keys().copied().collect());
+
+                let current_token_ids = if result.matching_arrays.len() == 1 {
+                    std::borrow::Cow::Borrowed(result.matching_arrays[0])
+                } else {
+                    let mut merged = Vec::new();
+                    for ids in &result.matching_arrays {
+                        merged.extend_from_slice(ids);
+                    }
+                    merged.sort_unstable();
+                    merged.dedup();
+                    std::borrow::Cow::Owned(merged)
+                };
+
+                match mem_candidates.as_mut() {
+                    // Two point merge in the RAM path
+                    Some(existing) => {
+                        mem_intersect_buf.clear();
+
+                        // Leapfrog join
+                        for arr in &result.matching_arrays {
+                            let mut match_idx = 0;
+                            for &id in *arr {
+                                while match_idx < existing.len() && existing[match_idx] < id {
+                                    match_idx += 1;
+                                }
+                                if match_idx == existing.len() {
+                                    break;
+                                }
+                                if existing[match_idx] == id {
+                                    mem_intersect_buf.push(id);
+                                }
+                            }
+                        }
+
+                        if result.matching_arrays.len() > 1 {
+                            mem_intersect_buf.sort_unstable();
+                            mem_intersect_buf.dedup();
+                        }
+
+                        std::mem::swap(existing, &mut mem_intersect_buf);
+                    }
+                    None => mem_candidates = Some(current_token_ids.into_owned()),
+                }
+
+                if let Some(c) = &mem_candidates
+                    && c.is_empty()
+                {
+                    break;
+                }
             }
-
-            if let Some(candidates) = mem_candidates {
-                let mut mem_sortable = Vec::with_capacity(candidates.len());
-
-                for id in candidates {
-                    let metadata = mem.metadata[id as usize];
-
-                    if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask)
-                    {
-                        mem_sortable.push((sort_key, id));
-                    }
-                }
-
-                // Top-K truncation in memory
-                crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
-
-                for (_, id) in mem_sortable {
-                    if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
-                        if let Some(filter) = options.volume_name
-                            && volume != filter
-                        {
-                            continue;
-                        }
-                        mem_materialized.push((path.clone(), volume.clone(), *entry));
-                    }
-                }
-            }
+        } else {
+            mem_candidates = Some(mem.id_to_data.keys().copied().collect());
         }
-        for (path, volume, entry) in &mem_materialized {
-            collector.insert(path.as_str(), volume.as_str(), *entry);
+
+        if let Some(candidates) = mem_candidates {
+            let mut mem_sortable = Vec::with_capacity(candidates.len());
+
+            for id in candidates {
+                let metadata = mem.metadata[id as usize];
+
+                if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask) {
+                    mem_sortable.push((sort_key, id));
+                }
+            }
+
+            // Top-K truncation in memory
+            crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
+
+            for (_, id) in mem_sortable {
+                if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
+                    if let Some(filter) = options.volume_name
+                        && volume != filter
+                    {
+                        continue;
+                    }
+                    collector.insert(path.as_str(), volume.as_str(), *entry);
+                }
+            }
         }
 
         // Disk searches
-        let mut token_docs = Vec::new();
-        let mut current_matches = Vec::new();
-        let mut disk_intersect_buf = Vec::new();
-
         let vol_token = options.volume_name.map(|vol| {
             crate::tokenizer::synthesize_token(crate::tokenizer::SYNTH_VOLUME_TOKEN_TAG, vol)
         });
 
-        for segment in &segments {
-            current_matches.clear();
-            let mut first_token = true;
-            let mut valid_matches = true;
+        if self.search_threads <= 1 {
+            // Fast path for single-threaded search to avoid rayon overhead
+            for segment in &segments {
+                let mut segment_collector = LsmCollector::new(&active_tombstones);
+                let mut current_matches = Vec::new();
+                let mut decompress_buffer = Vec::with_capacity(8 * 1024);
+                let mut token_docs = Vec::new();
+                let mut first_token = true;
+                let mut valid_matches = true;
 
-            if let Some(ref vol_token) = vol_token {
-                let map = segment.as_ref().as_ref();
-                if let Some(post_offset) = map.get(vol_token) {
-                    segment.append_posting_list(post_offset, &mut current_matches);
-                    first_token = false;
-                } else {
-                    continue;
-                }
-            }
-
-            for token in &tokens {
-                // Skip on 0 matches
-                if !first_token && current_matches.is_empty() {
-                    valid_matches = false;
-                    break;
-                }
-
-                let matcher = Str::new(token).starts_with();
-
-                token_docs.clear();
-                let map = segment.as_ref().as_ref();
-                let mut stream = map.search(&matcher).into_stream();
-
-                let mut term_count = 0;
-
-                while let Some((_, post_offset)) = stream.next() {
-                    segment.append_posting_list(post_offset, &mut token_docs);
-                    term_count += 1;
-                }
-
-                // TODO - maybe introduce union sorted arrays
-                if term_count > 1 {
-                    token_docs.sort_unstable();
-                    token_docs.dedup();
-                }
-
-                if first_token {
-                    std::mem::swap(&mut current_matches, &mut token_docs);
-                    first_token = false;
-                } else {
-                    disk_intersect_buf.clear();
-                    crate::simd::intersect_arrays(
-                        &current_matches,
-                        &token_docs,
-                        &mut disk_intersect_buf,
-                    );
-                    std::mem::swap(&mut current_matches, &mut disk_intersect_buf);
-                }
-            }
-
-            if valid_matches && !current_matches.is_empty() {
-                let valid_docs = &current_matches;
-                let mut sortable_docs: Vec<(u64, u128)> = Vec::with_capacity(valid_docs.len());
-                let meta_mmap = segment.meta_map();
-                let meta_ptr = meta_mmap.as_ptr();
-                let meta_len = meta_mmap.len();
-
-                for &doc_id in valid_docs {
-                    let byte_offset = (doc_id as usize) * size_of::<u128>();
-
-                    if byte_offset + size_of::<u128>() > meta_len {
-                        continue;
-                    }
-
-                    let packed_val = unsafe {
-                        std::ptr::read_unaligned(meta_ptr.add(byte_offset) as *const u128)
-                    }
-                    .to_le();
-
-                    if let Some(sort_key) =
-                        evaluate_candidate(packed_val, &options, volume_type_mask)
-                    {
-                        sortable_docs.push((sort_key, packed_val));
+                if let Some(ref vol_token) = vol_token {
+                    let map = segment.as_ref().as_ref();
+                    if let Some(packed_value) = map.get(vol_token) {
+                        let post_offset = packed_value & 0x0000_00FF_FFFF_FFFF;
+                        segment.append_posting_list(post_offset, &mut current_matches);
+                        first_token = false;
+                    } else {
+                        valid_matches = false;
                     }
                 }
 
-                crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
+                if valid_matches {
+                    for token in &tokens {
+                        // Skip on 0 matches
+                        if !first_token && current_matches.is_empty() {
+                            valid_matches = false;
+                            break;
+                        }
 
-                // Re-sort by dat_offset ascending to align with in-disk layout
-                sortable_docs
-                    .sort_unstable_by_key(|&(_, packed)| (packed & 0x0000_00FF_FFFF_FFFF) as u64);
+                        let matcher = Str::new(token).starts_with();
+                        let map = segment.as_ref().as_ref();
+                        let mut stream = map.search(&matcher).into_stream();
 
-                for (_, packed_val) in sortable_docs {
-                    let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
+                        let mut post_offsets = Vec::new();
+                        while let Some((_, packed_value)) = stream.next() {
+                            let df = packed_value >> 40;
+                            let offset = packed_value & 0x0000_00FF_FFFF_FFFF;
+                            post_offsets.push((df, offset));
+                        }
 
-                    if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                        if let Some(filter) = options.volume_name
-                            && volume != filter
-                        {
+                        if post_offsets.is_empty() {
+                            valid_matches = false;
+                            break;
+                        }
+
+                        let total_prefix_df: u64 = post_offsets.iter().map(|(df, _)| *df).sum();
+
+                        if first_token {
+                            current_matches.clear();
+                            current_matches.reserve(total_prefix_df as usize);
+
+                            for (_, offset) in &post_offsets {
+                                segment.append_posting_list(*offset, &mut current_matches);
+                            }
+
+                            if post_offsets.len() > 1 {
+                                current_matches.sort_unstable();
+                                current_matches.dedup();
+                            }
+                        } else {
+                            token_docs.clear();
+
+                            for (_, offset) in &post_offsets {
+                                segment.append_posting_list_bounded(
+                                    *offset,
+                                    &mut token_docs,
+                                    &current_matches,
+                                );
+                            }
+
+                            if post_offsets.len() > 1 {
+                                token_docs.sort_unstable();
+                                token_docs.dedup();
+                            }
+
+                            std::mem::swap(&mut current_matches, &mut token_docs);
+                        }
+
+                        first_token = false;
+                    }
+                }
+
+                if valid_matches && !current_matches.is_empty() {
+                    let valid_docs = &current_matches;
+                    let mut sortable_docs: Vec<(u64, u128)> = Vec::with_capacity(valid_docs.len());
+                    let meta_mmap = segment.meta_map();
+                    let meta_ptr = meta_mmap.as_ptr();
+                    let meta_len = meta_mmap.len();
+
+                    for &doc_id in valid_docs {
+                        let byte_offset = (doc_id as usize) * size_of::<u128>();
+
+                        if byte_offset + size_of::<u128>() > meta_len {
                             continue;
                         }
-                        collector.insert(path, volume, entry);
+
+                        let packed_val = unsafe {
+                            std::ptr::read_unaligned(meta_ptr.add(byte_offset) as *const u128)
+                        }
+                        .to_le();
+
+                        if let Some(sort_key) =
+                            evaluate_candidate(packed_val, &options, volume_type_mask)
+                        {
+                            sortable_docs.push((sort_key, packed_val));
+                        }
+                    }
+
+                    crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
+
+                    // Re-sort by dat_offset ascending to align with in-disk layout
+                    sortable_docs.sort_unstable_by_key(|&(_, packed)| {
+                        (packed & 0x0000_00FF_FFFF_FFFF) as u64
+                    });
+
+                    for (_, packed_val) in sortable_docs {
+                        let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
+
+                        if let Some((path, volume, entry)) =
+                            segment.read_document(dat_offset, &mut decompress_buffer)
+                        {
+                            if let Some(filter) = options.volume_name
+                                && volume != filter
+                            {
+                                continue;
+                            }
+                            segment_collector.insert(path, volume, entry);
+                        }
                     }
                 }
+                collector.merge(segment_collector);
+            }
+        } else {
+            let segment_collectors: Vec<LsmCollector> = self.search_pool.install(|| {
+                segments
+                    .par_iter()
+                    .map(|segment| {
+                        let mut segment_collector = LsmCollector::new(&active_tombstones);
+                        let mut current_matches = Vec::new();
+                        let mut decompress_buffer = Vec::with_capacity(8 * 1024);
+                        let mut token_docs = Vec::new();
+                        let mut first_token = true;
+                        let mut valid_matches = true;
+
+                        if let Some(ref vol_token) = vol_token {
+                            let map = segment.as_ref().as_ref();
+                            if let Some(packed_value) = map.get(vol_token) {
+                                let post_offset = packed_value & 0x0000_00FF_FFFF_FFFF;
+                                segment.append_posting_list(post_offset, &mut current_matches);
+                                first_token = false;
+                            } else {
+                                valid_matches = false;
+                            }
+                        }
+
+                        if valid_matches {
+                            for token in &tokens {
+                                let matcher = Str::new(token).starts_with();
+                                let map = segment.as_ref().as_ref();
+                                let mut stream = map.search(&matcher).into_stream();
+
+                                let mut post_offsets = Vec::new();
+                                while let Some((_, packed_value)) = stream.next() {
+                                    let df = packed_value >> 40;
+                                    let offset = packed_value & 0x0000_00FF_FFFF_FFFF;
+                                    post_offsets.push((df, offset));
+                                }
+
+                                if post_offsets.is_empty() {
+                                    valid_matches = false;
+                                    break;
+                                }
+
+                                let total_prefix_df: u64 =
+                                    post_offsets.iter().map(|(df, _)| *df).sum();
+
+                                if first_token {
+                                    current_matches.clear();
+                                    current_matches.reserve(total_prefix_df as usize);
+
+                                    for (_, offset) in &post_offsets {
+                                        segment.append_posting_list(*offset, &mut current_matches);
+                                    }
+
+                                    if post_offsets.len() > 1 {
+                                        current_matches.sort_unstable();
+                                        current_matches.dedup();
+                                    }
+                                } else {
+                                    token_docs.clear();
+
+                                    for (_, offset) in &post_offsets {
+                                        segment.append_posting_list_bounded(
+                                            *offset,
+                                            &mut token_docs,
+                                            &current_matches,
+                                        );
+                                    }
+
+                                    if post_offsets.len() > 1 {
+                                        token_docs.sort_unstable();
+                                        token_docs.dedup();
+                                    }
+
+                                    std::mem::swap(&mut current_matches, &mut token_docs);
+                                }
+                                first_token = false;
+                            }
+                        }
+
+                        if valid_matches && !current_matches.is_empty() {
+                            let valid_docs = &current_matches;
+                            let mut sortable_docs: Vec<(u64, u128)> =
+                                Vec::with_capacity(valid_docs.len());
+                            let meta_mmap = segment.meta_map();
+                            let meta_ptr = meta_mmap.as_ptr();
+                            let meta_len = meta_mmap.len();
+
+                            for &doc_id in valid_docs {
+                                let byte_offset = (doc_id as usize) * size_of::<u128>();
+
+                                if byte_offset + size_of::<u128>() > meta_len {
+                                    continue;
+                                }
+
+                                let packed_val = unsafe {
+                                    std::ptr::read_unaligned(
+                                        meta_ptr.add(byte_offset) as *const u128
+                                    )
+                                }
+                                .to_le();
+
+                                if let Some(sort_key) =
+                                    evaluate_candidate(packed_val, &options, volume_type_mask)
+                                {
+                                    sortable_docs.push((sort_key, packed_val));
+                                }
+                            }
+
+                            crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
+
+                            // Re-sort by dat_offset ascending to align with in-disk layout
+                            sortable_docs.sort_unstable_by_key(|&(_, packed)| {
+                                (packed & 0x0000_00FF_FFFF_FFFF) as u64
+                            });
+
+                            for (_, packed_val) in sortable_docs {
+                                let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
+
+                                if let Some((path, volume, entry)) =
+                                    segment.read_document(dat_offset, &mut decompress_buffer)
+                                {
+                                    if let Some(filter) = options.volume_name
+                                        && volume != filter
+                                    {
+                                        continue;
+                                    }
+                                    segment_collector.insert(path, volume, entry);
+                                }
+                            }
+                        }
+
+                        segment_collector
+                    })
+                    .collect()
+            });
+
+            for sc in segment_collectors {
+                collector.merge(sc);
             }
         }
 
@@ -678,7 +938,11 @@ impl Index {
         offset: usize,
         options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
-        let segments = self.base.read().map_err(|_| IndexError::ReadLock)?;
+        let segments = self
+            .base
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .snapshot();
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
         let active_tombstones = self
@@ -768,83 +1032,193 @@ impl Index {
             }
         }
 
-        let mut disk_candidates: Vec<(&Arc<Segment>, u128)> = Vec::new();
+        if self.search_threads <= 1 {
+            for segment in &segments {
+                let mut segment_collector = LsmCollector::new(&active_tombstones);
+                let mut segment_candidates = Vec::new();
+                let meta_mmap = segment.meta_map();
 
-        for segment in segments.segments() {
-            let meta_mmap = segment.meta_map();
+                for chunk in meta_mmap.chunks_exact(16) {
+                    let packed = u128::from_le_bytes(
+                        chunk.try_into().expect("failed to convert chunk to u128"),
+                    );
+                    let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_vol_type) =
+                        SegmentedIndex::unpack_u128(packed);
 
-            for chunk in meta_mmap.chunks_exact(16) {
-                let packed = u128::from_le_bytes(chunk.try_into().unwrap());
-                let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_vol_type) =
-                    SegmentedIndex::unpack_u128(packed);
+                    let recent = if last_modified < last_accessed {
+                        last_accessed
+                    } else {
+                        last_modified
+                    };
 
-                let recent = if last_modified < last_accessed {
-                    last_accessed
-                } else {
-                    last_modified
-                };
+                    if recent >= since_secs {
+                        if let Some(target_kind) = options.kind {
+                            let is_target_dir = target_kind == Kind::Directory;
+                            if is_dir != is_target_dir {
+                                continue;
+                            }
+                        }
 
-                if recent >= since_secs {
-                    if let Some(target_kind) = options.kind {
-                        let is_target_dir = target_kind == Kind::Directory;
-                        if is_dir != is_target_dir {
+                        if let Some(category) = options.category
+                            && doc_category & category == 0
+                        {
                             continue;
                         }
-                    }
 
-                    if let Some(category) = options.category
-                        && doc_category & category == 0
+                        if (volume_type_mask & (1 << doc_vol_type)) == 0 {
+                            continue;
+                        }
+
+                        segment_candidates.push(packed);
+                    }
+                }
+
+                if segment_candidates.len() > disk_cap {
+                    segment_candidates.select_nth_unstable_by(disk_cap, |a, b| {
+                        let last_modified_a = ((*a >> 40) & 0x3_FFFF_FFFF) as u64;
+                        let last_accessed_a = ((*a >> 74) & 0x3_FFFF_FFFF) as u64;
+                        let recent_a = if last_modified_a < last_accessed_a {
+                            last_accessed_a
+                        } else {
+                            last_modified_a
+                        };
+                        let last_modified_b = ((*b >> 40) & 0x3_FFFF_FFFF) as u64;
+                        let last_accessed_b = ((*b >> 74) & 0x3_FFFF_FFFF) as u64;
+                        let recent_b = if last_modified_b < last_accessed_b {
+                            last_accessed_b
+                        } else {
+                            last_modified_b
+                        };
+
+                        let offset_a = *a & 0x0000_00FF_FFFF_FFFF;
+                        let offset_b = *b & 0x0000_00FF_FFFF_FFFF;
+
+                        recent_b
+                            .cmp(&recent_a)
+                            .then_with(|| offset_a.cmp(&offset_b))
+                    });
+                    segment_candidates.truncate(disk_cap);
+                }
+
+                let mut decompress_buffer = Vec::with_capacity(8 * 1024);
+                for packed in segment_candidates {
+                    let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
+
+                    if let Some((path, volume, entry)) =
+                        segment.read_document(dat_offset, &mut decompress_buffer)
                     {
-                        continue;
+                        if let Some(filter) = options.volume_name
+                            && volume != filter
+                        {
+                            continue;
+                        }
+                        segment_collector.insert(path, volume, entry);
                     }
-
-                    if (volume_type_mask & (1 << doc_vol_type)) == 0 {
-                        continue;
-                    }
-
-                    disk_candidates.push((segment, packed));
                 }
+                collector.merge(segment_collector);
             }
-        }
+        } else {
+            let segment_collectors: Vec<LsmCollector> = self.search_pool.install(|| {
+                segments
+                    .par_iter()
+                    .map(|segment| {
+                        let mut segment_collector = LsmCollector::new(&active_tombstones);
+                        let mut segment_candidates = Vec::new();
+                        let meta_mmap = segment.meta_map();
 
-        if disk_candidates.len() > disk_cap {
-            disk_candidates.select_nth_unstable_by(disk_cap, |a, b| {
-                // Inline bitwise extraction to avoid incurring type conversion penalties
-                let last_modified_a = ((a.1 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_a = ((a.1 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_a = if last_modified_a < last_accessed_a {
-                    last_accessed_a
-                } else {
-                    last_modified_a
-                };
-                let last_modified_b = ((b.1 >> 40) & 0x3_FFFF_FFFF) as u64;
-                let last_accessed_b = ((b.1 >> 74) & 0x3_FFFF_FFFF) as u64;
-                let recent_b = if last_modified_b < last_accessed_b {
-                    last_accessed_b
-                } else {
-                    last_modified_b
-                };
+                        for chunk in meta_mmap.chunks_exact(16) {
+                            let packed = u128::from_le_bytes(
+                                chunk.try_into().expect("failed to convert chunk to u128"),
+                            );
+                            let (
+                                _,
+                                last_modified,
+                                last_accessed,
+                                _,
+                                is_dir,
+                                doc_category,
+                                doc_vol_type,
+                            ) = SegmentedIndex::unpack_u128(packed);
 
-                let offset_a = a.1 & 0x0000_00FF_FFFF_FFFF;
-                let offset_b = b.1 & 0x0000_00FF_FFFF_FFFF;
+                            let recent = if last_modified < last_accessed {
+                                last_accessed
+                            } else {
+                                last_modified
+                            };
 
-                recent_b
-                    .cmp(&recent_a) // Sort descending by last access time
-                    .then_with(|| offset_a.cmp(&offset_b))
+                            if recent >= since_secs {
+                                if let Some(target_kind) = options.kind {
+                                    let is_target_dir = target_kind == Kind::Directory;
+                                    if is_dir != is_target_dir {
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(category) = options.category
+                                    && doc_category & category == 0
+                                {
+                                    continue;
+                                }
+
+                                if (volume_type_mask & (1 << doc_vol_type)) == 0 {
+                                    continue;
+                                }
+
+                                segment_candidates.push(packed);
+                            }
+                        }
+
+                        if segment_candidates.len() > disk_cap {
+                            segment_candidates.select_nth_unstable_by(disk_cap, |a, b| {
+                                let last_modified_a = ((*a >> 40) & 0x3_FFFF_FFFF) as u64;
+                                let last_accessed_a = ((*a >> 74) & 0x3_FFFF_FFFF) as u64;
+                                let recent_a = if last_modified_a < last_accessed_a {
+                                    last_accessed_a
+                                } else {
+                                    last_modified_a
+                                };
+                                let last_modified_b = ((*b >> 40) & 0x3_FFFF_FFFF) as u64;
+                                let last_accessed_b = ((*b >> 74) & 0x3_FFFF_FFFF) as u64;
+                                let recent_b = if last_modified_b < last_accessed_b {
+                                    last_accessed_b
+                                } else {
+                                    last_modified_b
+                                };
+
+                                let offset_a = *a & 0x0000_00FF_FFFF_FFFF;
+                                let offset_b = *b & 0x0000_00FF_FFFF_FFFF;
+
+                                recent_b
+                                    .cmp(&recent_a)
+                                    .then_with(|| offset_a.cmp(&offset_b))
+                            });
+                            segment_candidates.truncate(disk_cap);
+                        }
+
+                        let mut decompress_buffer = Vec::with_capacity(8 * 1024);
+                        for packed in segment_candidates {
+                            let (dat_offset, _, _, _, _, _, _) =
+                                SegmentedIndex::unpack_u128(packed);
+
+                            if let Some((path, volume, entry)) =
+                                segment.read_document(dat_offset, &mut decompress_buffer)
+                            {
+                                if let Some(filter) = options.volume_name
+                                    && volume != filter
+                                {
+                                    continue;
+                                }
+                                segment_collector.insert(path, volume, entry);
+                            }
+                        }
+
+                        segment_collector
+                    })
+                    .collect()
             });
-            disk_candidates.truncate(disk_cap);
-        }
 
-        for (segment, packed) in disk_candidates {
-            let (dat_offset, _, _, _, _, _, _) = SegmentedIndex::unpack_u128(packed);
-
-            if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
-                if let Some(filter) = options.volume_name
-                    && volume != filter
-                {
-                    continue;
-                }
-                collector.insert(path, volume, entry);
+            for sc in segment_collectors {
+                collector.merge(sc);
             }
         }
 
@@ -1571,10 +1945,11 @@ mod tests {
 
         {
             let base = index.base.read().unwrap();
+            let seg_count = base.snapshot().len();
             assert!(
-                base.segments().count() >= 2,
+                seg_count >= 2,
                 "Should have at least 2 segments, got {}",
-                base.segments().count()
+                seg_count
             );
         }
 
@@ -1582,7 +1957,7 @@ mod tests {
 
         {
             let base = index.base.read().unwrap();
-            assert_eq!(base.segments().count(), 1);
+            assert_eq!(base.snapshot().len(), 1);
         }
 
         let results = index.search("foo", 10, 0, SearchOptions::default())?;
