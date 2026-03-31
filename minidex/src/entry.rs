@@ -7,19 +7,19 @@ use crate::{
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct IndexEntry {
-    pub(crate) opstamp: Opstamp,
-    pub(crate) kind: Kind,
-    pub(crate) last_modified: u64,
-    pub(crate) last_accessed: u64,
-    pub(crate) category: u8,
-    pub(crate) volume_type: VolumeType,
+pub struct IndexEntry {
+    pub opstamp: Opstamp,
+    pub kind: Kind,
+    pub last_modified: u64,
+    pub last_accessed: u64,
+    pub category: u8,
+    pub volume_type: VolumeType,
 }
 
 impl IndexEntry {
-    pub(crate) const SIZE: usize = std::mem::size_of::<Self>();
+    pub const SIZE: usize = std::mem::size_of::<Self>();
 
-    pub(crate) fn as_bytes(&self) -> [u8; Self::SIZE] {
+    pub fn as_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..8].copy_from_slice(&self.opstamp.as_bytes());
         buf[8] = self.kind as u8;

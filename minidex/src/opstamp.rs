@@ -2,39 +2,39 @@
 /// We use the most significant bit as a tombstone to indicate if
 /// the opstamp refers to an insertion or deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Opstamp(u64);
+pub struct Opstamp(u64);
 
 impl Opstamp {
     const TOMBSTONE_BIT: u64 = 1 << 63;
     const SEQ_MASK: u64 = !Self::TOMBSTONE_BIT;
 
     #[inline]
-    pub(crate) fn deletion(seq: u64) -> Self {
+    pub fn deletion(seq: u64) -> Self {
         Self(seq | Self::TOMBSTONE_BIT)
     }
 
     #[inline]
-    pub(crate) fn insertion(seq: u64) -> Self {
+    pub fn insertion(seq: u64) -> Self {
         Self(seq & Self::SEQ_MASK)
     }
 
     #[inline]
-    pub(crate) fn is_deletion(&self) -> bool {
+    pub fn is_deletion(&self) -> bool {
         (self.0 & Self::TOMBSTONE_BIT) != 0
     }
 
     #[inline]
-    pub(crate) fn sequence(&self) -> u64 {
+    pub fn sequence(&self) -> u64 {
         self.0 & Self::SEQ_MASK
     }
 
     #[inline]
-    pub(crate) fn as_bytes(&self) -> [u8; 8] {
+    pub fn as_bytes(&self) -> [u8; 8] {
         self.0.to_le_bytes()
     }
 
     #[inline]
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(u64::from_le_bytes(
             bytes.try_into().expect("bad binary format for opstamp"),
         ))
