@@ -75,9 +75,6 @@ impl Wal {
 
         writer.write_all(prefix_bytes)?;
 
-        writer.flush()?;
-        writer.get_ref().sync_data()?;
-
         Ok(())
     }
 
