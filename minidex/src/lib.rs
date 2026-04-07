@@ -54,7 +54,7 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
-    prefix_tombstones: Arc<ArcSwap<Vec<Tombstone>>>,
+    prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
     recovery: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
@@ -81,7 +81,7 @@ impl Index {
         let base = Arc::new(ArcSwap::from_pointee(base));
 
         let mem_idx = MemTable::default();
-        let prefix_tombstones = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let prefix_tombstones = Arc::new(RwLock::new(Arc::new(Vec::new())));
 
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
         let mut frozen_wals = Vec::new();
@@ -179,7 +179,7 @@ impl Index {
         path: PathBuf,
         frozen_wals: Vec<PathBuf>,
         base: Arc<ArcSwap<SegmentedIndex>>,
-        live_tombstones: Arc<ArcSwap<Vec<Tombstone>>>,
+        live_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
     ) {
         log::info!(
             "Starting background WAL recovery for {} files...",
@@ -203,11 +203,10 @@ impl Index {
         }
 
         if !recovered_tombstones.is_empty() {
-            live_tombstones.rcu(|current| {
-                let mut next = (**current).clone();
-                next.extend(recovered_tombstones.iter().cloned());
-                next
-            });
+            let mut guard = live_tombstones
+                .write()
+                .expect("failed to acquire tombstone write lock");
+            Arc::make_mut(&mut guard).extend(recovered_tombstones);
         }
 
         // We compile the WALs directly to a disk segment since we are cleanly split
@@ -411,15 +410,16 @@ impl Index {
             .replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR)
             .to_lowercase();
         {
-            self.prefix_tombstones.rcu(|current| {
-                let mut next = (**current).clone();
-                next.push((
-                    volume.map(|s| s.to_string()),
-                    normalized_prefix.clone(),
-                    seq,
-                ));
-                Arc::new(next)
-            });
+            let mut tombstones = self
+                .prefix_tombstones
+                .write()
+                .map_err(|_| IndexError::WriteLock)?;
+
+            Arc::make_mut(&mut tombstones).push((
+                volume.map(|s| s.to_string()),
+                normalized_prefix.clone(),
+                seq,
+            ));
         }
 
         {
@@ -465,7 +465,12 @@ impl Index {
         let required_matches = limit + offset;
         let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
 
-        let active_tombstones = self.prefix_tombstones.load().clone();
+        let active_tombstones = {
+            self.prefix_tombstones
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .clone()
+        };
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
@@ -747,7 +752,12 @@ impl Index {
         let segments = self.base.load();
         let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
 
-        let active_tombstones = self.prefix_tombstones.load().clone();
+        let active_tombstones = {
+            self.prefix_tombstones
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .clone()
+        };
 
         let mut collector = LsmCollector::new(&active_tombstones);
 
@@ -992,7 +1002,10 @@ impl Index {
         let tmp_path = self.path.join(format!("{}.tmp", compactor_seq));
         let final_path = self.path.join(format!("{}", compactor_seq));
 
-        let snapshot_tombstones = self.prefix_tombstones.load_full();
+        let snapshot_tombstones = {
+            let guard = self.prefix_tombstones.read().expect("lock poisoned");
+            guard.clone()
+        };
 
         if let Err(e) = compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone())
             .map_err(|e| IndexError::Io(std::io::Error::other(e)))
@@ -1022,11 +1035,11 @@ impl Index {
         };
 
         if was_full {
-            self.prefix_tombstones.rcu(|current| {
-                let mut next = (**current).clone();
-                next.retain(|(_, _, seq)| *seq >= compactor_seq);
-                next
-            });
+            let mut tombstones = self
+                .prefix_tombstones
+                .write()
+                .map_err(|_| IndexError::WriteLock)?;
+            Arc::make_mut(&mut tombstones).retain(|(_, _, seq)| *seq >= compactor_seq);
         }
 
         log::debug!("Full compaction complete");
@@ -1036,7 +1049,12 @@ impl Index {
     fn should_flush(&self) -> bool {
         self.mem_idx.read().expect("mem_idx lock poisoned").len()
             > self.compactor_config.flush_threshold
-            || self.prefix_tombstones.load().len() > self.compactor_config.tombstone_threshold
+            || self
+                .prefix_tombstones
+                .read()
+                .expect("prefix_tombstones lock poisoned")
+                .len()
+                > self.compactor_config.tombstone_threshold
     }
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
@@ -1061,7 +1079,11 @@ impl Index {
                 }
 
                 let snapshot = std::mem::take(&mut *mem);
-                let tombstones_cow = self.prefix_tombstones.load_full();
+                let tombstones_cow: Arc<Vec<Tombstone>> = self
+                    .prefix_tombstones
+                    .read()
+                    .map_err(|_| IndexError::ReadLock)?
+                    .clone();
                 (snapshot, tombstones_cow)
             };
 
@@ -1131,14 +1153,21 @@ impl Index {
                     log::error!("failed to delete rotated WAL: {}", e);
                 }
 
-                let force_full = prefix_tombstones.load().len() > tombstone_threshold;
+                let force_full = prefix_tombstones
+                    .read()
+                    .expect("failed to acquire prefix tombstone lock")
+                    .len()
+                    > tombstone_threshold;
 
                 let candidates = {
                     let segments = base.load().snapshot();
 
                     // Clear tombstones if we have nothing in disk
                     if segments.is_empty() && force_full {
-                        prefix_tombstones.store(Arc::new(Vec::new()));
+                        let mut tombstones = prefix_tombstones
+                            .write()
+                            .expect("failed to acquire prefix tombstones write-lock");
+                        Arc::make_mut(&mut tombstones).clear();
                         return;
                     }
 
@@ -1173,7 +1202,7 @@ impl Index {
         base: Arc<ArcSwap<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        prefix_tombstones: Arc<ArcSwap<Vec<Tombstone>>>,
+        prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
@@ -1187,7 +1216,10 @@ impl Index {
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
                 log::debug!("Starting compaction with {} segments", snapshot.len());
-                let snapshot_tombstones = prefix_tombstones.load_full();
+                let snapshot_tombstones = prefix_tombstones
+                    .read()
+                    .expect("prefix_tombstones lock poisoned")
+                    .clone();
                 match compactor::merge_segments(&snapshot, snapshot_tombstones, tmp_path.clone()) {
                     Ok(compactor_seq) => {
                         let tmp_paths = Segment::paths_with_additional_extension(&tmp_path);
@@ -1219,11 +1251,11 @@ impl Index {
                         };
 
                         if was_full {
-                            prefix_tombstones.rcu(|current| {
-                                let mut next = (**current).clone();
-                                next.retain(|(_, _, seq)| *seq >= compactor_seq);
-                                next
-                            });
+                            let mut tombstones = prefix_tombstones
+                                .write()
+                                .expect("failed to acquire prefix tombstones write lock");
+                            Arc::make_mut(&mut tombstones)
+                                .retain(|(_, _, seq)| *seq >= compactor_seq);
                         }
 
                         log::debug!("Compaction finished");
