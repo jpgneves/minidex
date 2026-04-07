@@ -304,9 +304,10 @@ impl Drop for Segment {
 
 /// A `SegmentedIndex` contains the (on-disk) segments
 /// that are committed with index data.
+#[derive(Clone)]
 pub struct SegmentedIndex {
     segments: Vec<Arc<Segment>>,
-    _lockfile: File,
+    _lockfile: Arc<File>,
 }
 
 impl SegmentedIndex {
@@ -331,7 +332,7 @@ impl SegmentedIndex {
 
         let mut result = Self {
             segments: Vec::new(),
-            _lockfile: lockfile,
+            _lockfile: Arc::new(lockfile),
         };
 
         for entry in entries.flatten() {
