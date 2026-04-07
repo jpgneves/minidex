@@ -54,6 +54,7 @@ pub struct Index {
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
     prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+    recovery: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 impl Index {
@@ -76,109 +77,177 @@ impl Index {
         compactor_config: CompactorConfig,
     ) -> Result<Self, IndexError> {
         let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
-
         let base = Arc::new(RwLock::new(base));
-        let mut mem_idx = MemTable::default();
 
-        let mut prefix_tombstones = Vec::new();
+        let mem_idx = MemTable::default();
+        let prefix_tombstones = Vec::new();
 
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
-        let mut flushing_wals = Vec::new();
+        let mut frozen_wals = Vec::new();
+        let mut max_mtime = 0u64;
 
-        // Recover partial, flushing WAL files
         for entry in entries {
             if let Ok(e) = entry
                 && let Ok(file_type) = e.file_type()
                 && file_type.is_file()
-                && e.file_name().to_string_lossy().ends_with(".flushing.wal")
             {
-                flushing_wals.push(e.path());
+                let file_name = e.file_name().to_string_lossy().into_owned();
+                let is_journal = file_name == "journal.wal";
+                let is_flushing = file_name.ends_with(".flushing.wal");
+
+                if is_journal || is_flushing {
+                    let frozen_name = format!("{}.frozen", file_name);
+                    let frozen_path = path.as_ref().join(&frozen_name);
+
+                    std::fs::rename(e.path(), &frozen_path).map_err(IndexError::Io)?;
+
+                    let mtime = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(crate::sync::time::UNIX_EPOCH)
+                        .duration_since(crate::sync::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    max_mtime = max_mtime.max(mtime);
+                    frozen_wals.push(frozen_path);
+                }
             }
         }
 
-        let mut orphaned_wals = flushing_wals.clone();
-        orphaned_wals.sort_by_key(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.split('.').nth(1))
-                .and_then(|seq_str| seq_str.parse::<u64>().ok())
-                .unwrap_or(0)
-        });
+        let current_micros = crate::sync::time::SystemTime::now()
+            .duration_since(crate::sync::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
 
-        // Parse all recovered WALs into memory once
-        let mut all_recovered_data = Vec::new();
-        for wal_path in &orphaned_wals {
-            let partial = Wal::replay(wal_path).map_err(IndexError::Io)?;
-            all_recovered_data.push(partial);
-        }
+        // Safety buffer: Start 1 second ahead of the last known disk write
+        let safe_seq = std::cmp::max(current_micros, max_mtime + 1_000_000);
+        let next_op_seq = Arc::new(AtomicU64::new(safe_seq));
 
         let wal_path = path.as_ref().join("journal.wal");
-
-        if wal_path.exists() {
-            let recovered = Wal::replay(&wal_path).map_err(IndexError::Io)?;
-            all_recovered_data.push(recovered);
-        }
-
-        // Heal the on-disk WALs from recovered data
-
-        if !orphaned_wals.is_empty() {
-            let healed_wal_path = path.as_ref().join("journal.healed.wal");
-            let mut healed_wal = Wal::open(&healed_wal_path).map_err(IndexError::Io)?;
-
-            for partial in &all_recovered_data {
-                for (p, v, e) in &partial.inserts {
-                    healed_wal.append(p, v, e).map_err(IndexError::Io)?;
-                }
-                for (v, p, s) in &partial.tombstones {
-                    healed_wal
-                        .write_prefix_tombstone(v.as_deref(), p, *s)
-                        .map_err(IndexError::Io)?;
-                }
-            }
-            healed_wal.flush().map_err(IndexError::Io)?;
-
-            std::fs::rename(&healed_wal_path, &wal_path).map_err(IndexError::Io)?;
-
-            for orphaned in orphaned_wals {
-                let _ = std::fs::remove_file(&orphaned);
-            }
-        }
-
-        // Consume WAL data into memory
-        let mut max_seq = 0u64;
-        for partial in all_recovered_data {
-            for (path, volume, entry) in partial.inserts {
-                max_seq = max_seq.max(entry.opstamp.sequence());
-                let tokens = crate::tokenizer::extract_all_tokens(&path, &volume);
-                mem_idx.insert_with_tokens(path, volume, entry, tokens);
-            }
-            for (volume, prefix, seq) in partial.tombstones {
-                max_seq = max_seq.max(seq);
-                prefix_tombstones.push((volume, prefix, seq));
-            }
-        }
-
-        let next_op_seq = Arc::new(AtomicU64::new(max_seq + 1));
-
         let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
+
+        let prefix_tombstones = Arc::new(RwLock::new(Arc::new(prefix_tombstones)));
+
+        let recovery = if !frozen_wals.is_empty() {
+            let recovery_base = Arc::clone(&base);
+            let recovery_path = path.as_ref().to_path_buf();
+            let prefix_tombstones = Arc::clone(&prefix_tombstones);
+
+            let handle = crate::sync::thread::Builder::new()
+                .name("minidex-recovery".to_owned())
+                .spawn(move || {
+                    Self::recover_frozen_wals_to_disk(
+                        recovery_path,
+                        frozen_wals,
+                        recovery_base,
+                        prefix_tombstones,
+                    );
+                })
+                .map_err(IndexError::Io)?;
+
+            Some(handle)
+        } else {
+            None
+        };
 
         let index = Self {
             path: path.as_ref().to_path_buf(),
-            base,
+            base: Arc::clone(&base),
             next_op_seq,
             mem_idx: RwLock::new(mem_idx),
             wal: RwLock::new(wal),
             compactor_config,
             compactor: Arc::new(RwLock::new(None)),
             flusher: Arc::new(RwLock::new(None)),
-            prefix_tombstones: Arc::new(RwLock::new(Arc::new(prefix_tombstones))),
+            prefix_tombstones,
+            recovery: Arc::new(RwLock::new(recovery)),
         };
 
-        if index.should_flush() {
-            index.flush()?;
+        Ok(index)
+    }
+
+    pub fn wait_for_completed_recovery(&self) {
+        if let Ok(mut lock) = self.recovery.write()
+            && let Some(handle) = lock.take()
+        {
+            log::debug!("Waiting for background WAL recovery to finish...");
+            let _ = handle.join();
+        }
+    }
+
+    fn recover_frozen_wals_to_disk(
+        path: PathBuf,
+        frozen_wals: Vec<PathBuf>,
+        base: Arc<RwLock<SegmentedIndex>>,
+        live_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+    ) {
+        log::info!(
+            "Starting background WAL recovery for {} files...",
+            frozen_wals.len()
+        );
+
+        let mut local_mem = MemTable::default();
+        let mut recovered_tombstones = Vec::new();
+
+        for wal_path in &frozen_wals {
+            match Wal::replay(wal_path) {
+                Ok(partial) => {
+                    for (p, v, e) in partial.inserts {
+                        let tokens = crate::tokenizer::extract_all_tokens(&p, &v);
+                        local_mem.insert_with_tokens(p, v, e, tokens);
+                    }
+                    recovered_tombstones.extend(partial.tombstones);
+                }
+                Err(e) => log::error!("Failed to replay WAL {:?}: {}", wal_path, e),
+            }
         }
 
-        Ok(index)
+        if !recovered_tombstones.is_empty() {
+            let mut guard = live_tombstones.write().expect("tombstone lock poisoned");
+            Arc::make_mut(&mut guard).extend(recovered_tombstones);
+        }
+
+        // We compile the WALs directly to a disk segment since we are cleanly split
+        // from the "live" data.
+        if !local_mem.is_empty() {
+            let recovery_seq = crate::sync::time::SystemTime::now()
+                .duration_since(crate::sync::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64;
+
+            let tmp_segment_path = path.join(format!("{}.tmp", recovery_seq));
+            let final_segment_path = path.join(format!("{}", recovery_seq));
+
+            let snapshot = local_mem;
+
+            if let Err(e) = SegmentedIndex::build_segment_files(
+                &tmp_segment_path,
+                snapshot.entries.into_iter().map(|(p, (v, e))| (p, v, e)),
+                false,
+                None,
+            ) {
+                log::error!("Background recovery failed to write segment: {}", e);
+                let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
+                Segment::remove_files(&tmp_paths);
+            } else {
+                let tmp_paths = Segment::paths_with_additional_extension(&tmp_segment_path);
+                let final_paths = Segment::paths_with_additional_extension(&final_segment_path);
+
+                if let Err(e) = Segment::rename_files(&tmp_paths, &final_paths) {
+                    log::error!("Background recovery failed to rename segment files: {}", e);
+                    Segment::remove_files(&tmp_paths);
+                } else if let Ok(new_segment) = Segment::load(final_segment_path) {
+                    let mut base_guard = base.write().expect("failed to lock base");
+                    base_guard.add_segment(Arc::new(new_segment));
+                    log::info!("Successfully recovered WAL data to SSD Segment.");
+                }
+            }
+        }
+
+        for wal_path in frozen_wals {
+            let _ = std::fs::remove_file(wal_path);
+        }
     }
 
     fn next_op_seq(&self) -> u64 {
@@ -1270,6 +1339,12 @@ impl Drop for Index {
     fn drop(&mut self) {
         let _ = self.sync();
 
+        if let Ok(mut lock) = self.recovery.write()
+            && let Some(handle) = lock.take()
+        {
+            let _ = handle.join();
+        }
+
         if let Ok(mut flusher) = self.flusher.write()
             && let Some(flusher) = flusher.take()
         {
@@ -1338,6 +1413,7 @@ mod tests {
         // Reopen index and verify data is still there
         {
             let index = Index::open(&temp_dir)?;
+            index.wait_for_completed_recovery();
             let results = index.search("bar", 10, 0, SearchOptions::default())?;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].path, PathBuf::from(&path1));
@@ -1377,6 +1453,7 @@ mod tests {
         // Reopen and verify
         {
             let index = Index::open(&temp_dir)?;
+            index.wait_for_completed_recovery();
             let results = index.search("file_42", 10, 0, SearchOptions::default())?;
             assert_eq!(results.len(), 1);
             assert!(results[0].path.to_string_lossy().contains("file_42.txt"));
