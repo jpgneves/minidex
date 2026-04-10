@@ -4,10 +4,12 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 pub fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut compound = String::new();
     let mut prev_char: Option<char> = None;
+    let mut has_transition = false;
 
     // Helper closure to fold, strip, and lowercase the token
-    let push_token = |t: &mut Vec<String>, c: &mut String| {
+    let push_token = |t: &mut Vec<String>, c: &str| {
         if !c.is_empty() {
             // Fast path normalization to avoid unicode normalization
             if c.is_ascii() {
@@ -17,13 +19,19 @@ pub fn tokenize(input: &str) -> Vec<String> {
                 let folded: String = c.nfd().filter(|ch| !is_combining_mark(*ch)).collect();
                 t.push(folded.to_lowercase());
             }
-            c.clear();
         }
     };
 
     for c in input.chars() {
         if !c.is_alphanumeric() || c == '\u{2014}' {
             push_token(&mut tokens, &mut current);
+            current.clear();
+
+            if has_transition {
+                push_token(&mut tokens, &compound);
+            }
+            compound.clear();
+            has_transition = false;
             prev_char = Some(c);
             continue;
         }
@@ -42,36 +50,20 @@ pub fn tokenize(input: &str) -> Vec<String> {
             let is_cjk_transition = is_cjk(p) || is_cjk(c);
 
             if is_camel || is_num_transition || is_cjk_transition {
-                push_token(&mut tokens, &mut current);
+                push_token(&mut tokens, &current);
+                current.clear();
+                has_transition = true;
             }
         }
 
         current.push(c);
+        compound.push(c);
         prev_char = Some(c);
     }
 
-    push_token(&mut tokens, &mut current);
-
-    // Pre-process the (potential) path
-    let trimmed = input.trim_end_matches(std::path::MAIN_SEPARATOR);
-
-    // Find the last slash
-    let file_name = match trimmed.rfind(std::path::MAIN_SEPARATOR) {
-        Some(idx) => &trimmed[idx + 1..],
-        None => trimmed,
-    };
-
-    // Extract the filename as a token if it contains an extension
-    if file_name.contains('.') && file_name.starts_with(char::is_alphanumeric) {
-        if file_name.is_ascii() {
-            tokens.push(file_name.to_ascii_lowercase());
-        } else {
-            let folded: String = file_name
-                .nfd()
-                .filter(|ch| !is_combining_mark(*ch))
-                .collect();
-            tokens.push(folded.to_lowercase());
-        }
+    push_token(&mut tokens, &current);
+    if has_transition {
+        push_token(&mut tokens, &compound);
     }
 
     tokens.sort_unstable();
@@ -99,6 +91,28 @@ pub(crate) fn extract_all_tokens(path: &str, volume: &str) -> Vec<String> {
         .and_then(|e| e.to_str())
     {
         tokens.push(synthesize_token(SYNTH_EXT_TOKEN_TAG, ext));
+    }
+
+    // Pre-process the (potential) path
+    let trimmed = path.trim_end_matches(std::path::MAIN_SEPARATOR);
+
+    // Find the last slash
+    let file_name = match trimmed.rfind(std::path::MAIN_SEPARATOR) {
+        Some(idx) => &trimmed[idx + 1..],
+        None => trimmed,
+    };
+
+    // Extract the filename as a token if it contains an extension
+    if file_name.contains('.') && file_name.starts_with(char::is_alphanumeric) {
+        if file_name.is_ascii() {
+            tokens.push(file_name.to_ascii_lowercase());
+        } else {
+            let folded: String = file_name
+                .nfd()
+                .filter(|ch| !is_combining_mark(*ch))
+                .collect();
+            tokens.push(folded.to_lowercase());
+        }
     }
 
     tokens
@@ -156,13 +170,13 @@ mod tests {
     #[test]
     fn test_tokenize_camel_case() {
         let tokens = tokenize("MySuperFile");
-        assert_eq!(tokens, vec!["file", "my", "super"]);
+        assert_eq!(tokens, vec!["file", "my", "mysuperfile", "super"]);
     }
 
     #[test]
     fn test_tokenize_numeric_transition() {
         let tokens = tokenize("report2023.txt");
-        assert_eq!(tokens, vec!["2023", "report", "report2023.txt", "txt"]);
+        assert_eq!(tokens, vec!["2023", "report", "report2023", "txt"]);
     }
 
     #[test]
@@ -177,13 +191,19 @@ mod tests {
         // "日本語" (Japanese)
         let tokens = tokenize("日本語");
         // CJK characters should be fragmented
-        assert_eq!(tokens, vec!["日", "本", "語"]);
+        assert_eq!(tokens, vec!["日", "日本語", "本", "語"]);
 
         // "한국어" (Korean)
         let tokens2 = tokenize("한국어");
         // Korean characters are decomposed in NFD
         // "국", "어", "한" (sorted)
-        assert_eq!(tokens2, vec!["국", "어", "한"]);
+        let mut expected: Vec<String> = vec!["국", "어", "한", "한국어"]
+            .into_iter()
+            .map(|s| s.nfd().collect())
+            .collect();
+
+        expected.sort_unstable();
+        assert_eq!(tokens2, expected);
     }
 
     #[test]
@@ -192,7 +212,7 @@ mod tests {
         // Cyrillic is usually not fragmented like CJK unless there are boundaries
         // but it should be lowercased and normalized.
         // Tokens are sorted: ["txt", "документ", "документ.txt"]
-        assert_eq!(tokens, vec!["txt", "документ", "документ.txt"]);
+        assert_eq!(tokens, vec!["txt", "документ"]);
     }
 
     #[test]
@@ -214,7 +234,7 @@ mod tests {
         // "E" (upper) + l (lower) -> no split
         // "l" (lower) + L (upper) -> split
         let tokens = tokenize("hElLo");
-        assert_eq!(tokens, vec!["el", "h", "lo"]);
+        assert_eq!(tokens, vec!["el", "h", "hello", "lo"]);
 
         let tokens2 = tokenize("Hello HELLO");
         assert_eq!(tokens2, vec!["hello"]);
