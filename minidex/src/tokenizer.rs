@@ -123,9 +123,11 @@ fn is_cjk(c: char) -> bool {
     let u = c as u32;
     // Ranges cover Hiragana, Katakana, CJK Unified Ideographs, and Hangul
     (0x3040..=0x309F).contains(&u) || // Hiragana
-    (0x30A0..=0x30FF).contains(&u) || // Katakana
-    (0x4E00..=0x9FFF).contains(&u) || // CJK Unified Ideographs
-    (0xAC00..=0xD7AF).contains(&u) // Hangul Syllables
+        (0x30A0..=0x30FF).contains(&u) || // Katakana
+        (0x4E00..=0x9FFF).contains(&u) || // CJK Unified Ideographs
+        (0xAC00..=0xD7AF).contains(&u) || // Hangul Syllables
+        (0x1100..=0x11FF).contains(&u) || // Hangul Jamo
+        (0x3130..=0x318F).contains(&u) // Hangul Compatibility Jamo
 }
 
 /// Folds an entire path string for substring matching in the in-memory index
@@ -204,6 +206,10 @@ mod tests {
 
         expected.sort_unstable();
         assert_eq!(tokens2, expected);
+
+        // Korean Jamo
+        let tokens3 = tokenize("ᄆᄇ");
+        assert_eq!(tokens3, vec!["ᄆ", "ᄆᄇ", "ᄇ"]);
     }
 
     #[test]
