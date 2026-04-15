@@ -22,7 +22,7 @@ pub fn tokenize(input: &str) -> Vec<String> {
         }
     };
 
-    for c in input.chars() {
+    for c in input.nfkc() {
         if !c.is_alphanumeric() || c == '\u{2014}' {
             push_token(&mut tokens, &mut current);
             current.clear();
