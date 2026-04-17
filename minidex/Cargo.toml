@@ -1,7 +1,7 @@
 [package]
 name = "minidex"
 description = "A lightweight indexing engine for filesystem entries"
-version = "0.26.5"
+version = "0.27.0"
 edition = "2024"
 license.workspace = true
 authors.workspace = true
@@ -38,3 +38,10 @@ harness = false
 [[bench]]
 name = "compression_bench"
 harness = false
+
+[target.windows.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading"
+  ] }
