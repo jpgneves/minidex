@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.26.5"
+version = "0.27.0"
 dependencies = [
  "arc-swap",
  "bstr",
@@ -1049,12 +1049,13 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "unicode-normalization",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
 [[package]]
 name = "minidex-cli"
-version = "0.10.0+0.26.5"
+version = "0.10.0+0.27.0"
 dependencies = [
  "anyhow",
  "chrono",
