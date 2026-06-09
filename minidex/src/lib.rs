@@ -537,7 +537,7 @@ impl Index {
                         }
                     }
 
-                    if matching_arrays.is_empty() {
+                    if matching_arrays.is_empty() && prefiltered_candidates.is_empty() {
                         mem_candidates = Some(Vec::new());
                         break;
                     }
