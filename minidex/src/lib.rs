@@ -463,7 +463,9 @@ impl Index {
         let segments = self.base.load().snapshot();
 
         let required_matches = limit + offset;
-        let scoring_cap = std::cmp::max(500, required_matches * 3).min(1000);
+        let default_cap = std::cmp::max(500, required_matches * 3).min(1000);
+        let requested_cap = options.max_scoring_cap.unwrap_or(default_cap);
+        let scoring_cap = std::cmp::max(required_matches + 50, requested_cap);
 
         let active_tombstones = {
             self.prefix_tombstones
@@ -497,7 +499,7 @@ impl Index {
                         usize::MAX
                     };
                     let max_docs = if is_anchor_short_prefix {
-                        scoring_cap * 5
+                        scoring_cap.saturating_mul(5)
                     } else {
                         usize::MAX
                     };
@@ -666,7 +668,7 @@ impl Index {
                     usize::MAX
                 };
                 let max_docs = if is_anchor_short_prefix {
-                    scoring_cap * 5
+                    scoring_cap.saturating_mul(5)
                 } else {
                     usize::MAX
                 };
