@@ -205,6 +205,33 @@ impl Segment {
         }
     }
 
+    /// Stream document IDs into a closure.
+    pub(crate) fn for_each_posting_id(&self, offset: u64, mut f: impl FnMut(u32)) {
+        let start = offset as usize;
+        let post = self.post.as_ref().expect("posting should be loaded");
+
+        if start + size_of::<u32>() > post.len() {
+            return;
+        }
+
+        let byte_len = u32::from_le_bytes(
+            post[start + size_of::<u32>()..start + (2 * size_of::<u32>())]
+                .try_into()
+                .expect("invalid byte length"),
+        ) as usize;
+
+        let cursor = start + (2 * size_of::<u32>());
+        let end = cursor + byte_len;
+
+        if end > post.len() {
+            return;
+        }
+
+        for doc_id in crate::leb128::DeltaLeb128Iterator::new(&post[cursor..end]) {
+            f(doc_id);
+        }
+    }
+
     pub(crate) fn meta_map(&self) -> &Mmap {
         self.meta.as_ref().expect("meta should be loaded")
     }
