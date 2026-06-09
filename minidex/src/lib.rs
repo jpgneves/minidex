@@ -489,21 +489,69 @@ impl Index {
                     end_bound.push_str(token);
                     end_bound.push('\u{FFFF}');
 
-                    let matching_arrays: Vec<&Vec<u32>> = mem
-                        .inverted_index
-                        .range::<str, _>((
-                            Bound::Included(token.as_str()),
-                            Bound::Included(end_bound.as_str()),
-                        ))
-                        .map(|(_, ids)| ids)
-                        .collect();
+                    let is_anchor_short_prefix = mem_candidates.is_none() && token.len() <= 2;
+
+                    let max_expansions = if is_anchor_short_prefix {
+                        options.max_expansions
+                    } else {
+                        usize::MAX
+                    };
+                    let max_docs = if is_anchor_short_prefix {
+                        scoring_cap * 5
+                    } else {
+                        usize::MAX
+                    };
+
+                    let mut term_count = 0;
+                    let mut docs_accumulated = 0;
+
+                    let mut matching_arrays = Vec::new();
+                    let mut prefiltered_candidates = Vec::new();
+
+                    for (_, ids) in mem.inverted_index.range::<str, _>((
+                        Bound::Included(token.as_str()),
+                        Bound::Included(end_bound.as_str()),
+                    )) {
+                        if is_anchor_short_prefix {
+                            for &id in ids {
+                                let metadata = mem.metadata[id as usize];
+                                if let Some(sort_key) =
+                                    evaluate_candidate(metadata, &options, volume_type_mask)
+                                {
+                                    prefiltered_candidates.push((sort_key, id))
+                                }
+                            }
+
+                            if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
+                                crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
+                            }
+                        } else {
+                            matching_arrays.push(ids);
+                        }
+
+                        term_count += 1;
+                        docs_accumulated += ids.len();
+
+                        if term_count >= max_expansions || docs_accumulated >= max_docs {
+                            break;
+                        }
+                    }
 
                     if matching_arrays.is_empty() {
                         mem_candidates = Some(Vec::new());
                         break;
                     }
 
-                    let current_token_ids = if matching_arrays.len() == 1 {
+                    let current_token_ids = if is_anchor_short_prefix {
+                        crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
+                        let mut best_ids: Vec<u32> = prefiltered_candidates
+                            .into_iter()
+                            .map(|(_, id)| id)
+                            .collect();
+                        best_ids.sort_unstable();
+                        best_ids.dedup();
+                        std::borrow::Cow::Owned(best_ids)
+                    } else if matching_arrays.len() == 1 {
                         std::borrow::Cow::Borrowed(matching_arrays[0])
                     } else {
                         let mut merged = Vec::new();
@@ -594,6 +642,8 @@ impl Index {
                 }
             }
 
+            let mut is_first_text_token = true;
+
             for token in &tokens {
                 // Skip on 0 matches
                 if !first_token && current_matches.is_empty() {
@@ -607,15 +657,75 @@ impl Index {
                 let map = segment.as_ref().as_ref();
                 let mut stream = map.search(&matcher).into_stream();
 
+                let is_anchor_short_prefix = is_first_text_token && token.len() <= 2;
+                is_first_text_token = false;
+
+                let max_expansions = if is_anchor_short_prefix {
+                    options.max_expansions
+                } else {
+                    usize::MAX
+                };
+                let max_docs = if is_anchor_short_prefix {
+                    scoring_cap * 5
+                } else {
+                    usize::MAX
+                };
+
                 let mut term_count = 0;
+                let mut docs_accumulated = 0;
+                let mut prefiltered_candidates = Vec::new();
 
                 while let Some((_, post_offset)) = stream.next() {
-                    segment.append_posting_list(post_offset, &mut token_docs);
+                    if is_anchor_short_prefix {
+                        segment.for_each_posting_id(post_offset, |doc_id| {
+                            let byte_offset = (doc_id as usize) * std::mem::size_of::<u128>();
+                            let meta_mmap = segment.meta_map();
+
+                            if byte_offset + std::mem::size_of::<u128>() <= meta_mmap.len() {
+                                let packed_val = unsafe {
+                                    std::ptr::read_unaligned(
+                                        meta_mmap.as_ptr().add(byte_offset) as *const u128
+                                    )
+                                }
+                                .to_le();
+
+                                if let Some(sort_key) =
+                                    evaluate_candidate(packed_val, &options, volume_type_mask)
+                                {
+                                    prefiltered_candidates.push((sort_key, doc_id));
+
+                                    if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
+                                        crate::search::retain_top_k(
+                                            &mut prefiltered_candidates,
+                                            max_docs,
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        docs_accumulated = prefiltered_candidates.len();
+                    } else {
+                        let start_len = token_docs.len();
+                        segment.append_posting_list(post_offset, &mut token_docs);
+                        docs_accumulated += token_docs.len() - start_len;
+                    }
+
                     term_count += 1;
+
+                    if term_count >= max_expansions || docs_accumulated >= max_docs {
+                        break;
+                    }
                 }
 
-                // TODO - maybe introduce union sorted arrays
-                if term_count > 1 {
+                if is_anchor_short_prefix {
+                    crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
+                    token_docs = prefiltered_candidates
+                        .into_iter()
+                        .map(|(_, id)| id)
+                        .collect();
+                }
+
+                if term_count > 1 || is_anchor_short_prefix {
                     token_docs.sort_unstable();
                     token_docs.dedup();
                 }

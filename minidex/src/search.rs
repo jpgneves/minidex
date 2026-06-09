@@ -6,13 +6,27 @@ mod scoring;
 pub use scoring::*;
 
 /// Search options, allowing filtering and custom scoring
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SearchOptions<'a> {
     pub scoring: Option<&'a ScoringConfig>,
     pub volume_name: Option<&'a str>,
     pub category: Option<u8>,
     pub kind: Option<Kind>,
     pub volume_type: Option<&'a [VolumeType]>,
+    pub max_expansions: usize,
+}
+
+impl Default for SearchOptions<'_> {
+    fn default() -> Self {
+        Self {
+            scoring: None,
+            volume_name: None,
+            category: None,
+            kind: None,
+            volume_type: None,
+            max_expansions: usize::MAX,
+        }
+    }
 }
 
 /// A Minidex search result, containing the found metadata for
