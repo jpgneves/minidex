@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
@@ -16,6 +18,7 @@ use memmap2::Mmap;
 use thiserror::Error;
 
 pub(crate) mod compactor;
+mod utils;
 
 pub(crate) type DocumentId = u32;
 
@@ -50,8 +53,7 @@ impl Segment {
 
         let seg_file = File::open(&seg_path).map_err(SegmentedIndexError::Io)?;
         let seg = unsafe { Mmap::map(&seg_file).map_err(SegmentedIndexError::Io)? };
-        #[cfg(unix)]
-        let _ = seg.advise(memmap2::Advice::WillNeed);
+        utils::prefetch_memory(&seg);
 
         let map = Map::new(seg).map_err(SegmentedIndexError::Fst)?;
 
@@ -81,12 +83,21 @@ impl Segment {
         }
 
         // Load the postings
-        let post_file = File::open(post_path).map_err(SegmentedIndexError::Io)?;
+        let post_file =
+            Self::open_file_with_random_access(&post_path).map_err(SegmentedIndexError::Io)?;
         let post = unsafe { Mmap::map(&post_file).map_err(SegmentedIndexError::Io)? };
+        #[cfg(unix)]
+        post.advise(memmap2::Advice::Random)?;
 
         // Load the meta
-        let meta_file = File::open(meta_path).map_err(SegmentedIndexError::Io)?;
+        let meta_file =
+            Self::open_file_with_random_access(&meta_path).map_err(SegmentedIndexError::Io)?;
         let meta = unsafe { Mmap::map(&meta_file).map_err(SegmentedIndexError::Io)? };
+        #[cfg(unix)]
+        {
+            meta.advise(memmap2::Advice::WillNeed)?;
+            meta.advise(memmap2::Advice::Random)?;
+        }
 
         Ok(Self {
             map: Some(map),
@@ -97,6 +108,19 @@ impl Segment {
             path,
             deleted: AtomicBool::new(false),
         })
+    }
+
+    fn open_file_with_random_access(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_RANDOM_ACCESS;
+            options.custom_flags(FILE_FLAG_RANDOM_ACCESS);
+        }
+
+        options.open(path)
     }
 
     pub(crate) fn mark_deleted(&self) {
