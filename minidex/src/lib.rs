@@ -493,7 +493,7 @@ impl Index {
                         options.max_expansions.saturating_mul(10)
                     };
 
-                    let max_docs = if token.chars.count() <= 2 {
+                    let max_docs = if token.chars().count() <= 2 {
                         scoring_cap.saturating_mul(5)
                     } else {
                         usize::MAX
