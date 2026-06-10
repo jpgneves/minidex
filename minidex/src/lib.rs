@@ -493,7 +493,11 @@ impl Index {
                         options.max_expansions.saturating_mul(10)
                     };
 
-                    let max_docs = scoring_cap.saturating_mul(5);
+                    let max_docs = if token.chars.count() <= 2 {
+                        scoring_cap.saturating_mul(5)
+                    } else {
+                        usize::MAX
+                    };
 
                     let mut term_count = 0;
                     let mut docs_accumulated = 0;
@@ -635,7 +639,11 @@ impl Index {
                     options.max_expansions.saturating_mul(10)
                 };
 
-                let max_docs = scoring_cap.saturating_mul(5);
+                let max_docs = if token.chars().count() <= 2 {
+                    scoring_cap.saturating_mul(5)
+                } else {
+                    usize::MAX
+                };
 
                 token_docs.clear();
                 let map = segment.as_ref().as_ref();
