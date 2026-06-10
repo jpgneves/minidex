@@ -455,17 +455,6 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        let ends_with_separator = query.chars().last().is_none_or(|c| !c.is_alphanumeric());
-        let prefix_token = if !ends_with_separator {
-            let last_chunk = query
-                .split(|c: char| !c.is_alphanumeric())
-                .next_back()
-                .unwrap_or("");
-            Some(crate::tokenizer::fold_path(last_chunk))
-        } else {
-            None
-        };
-
         let query_lower = query.to_lowercase();
         let raw_query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
@@ -498,90 +487,61 @@ impl Index {
             // In-memory searches
             if !tokens.is_empty() {
                 for token in &tokens {
-                    let is_prefix_token = Some(token) == prefix_token.as_ref();
+                    let max_expansions = if token.chars().count() <= 2 {
+                        options.max_expansions
+                    } else {
+                        options.max_expansions.saturating_mul(10)
+                    };
 
-                    let max_expansions = if is_prefix_token {
-                        if token.chars().count() <= 2 {
-                            options.max_expansions
-                        } else {
-                            options.max_expansions.saturating_mul(10)
-                        }
-                    } else {
-                        usize::MAX
-                    };
-                    let max_docs = if is_prefix_token {
-                        scoring_cap.saturating_mul(5)
-                    } else {
-                        usize::MAX
-                    };
+                    let max_docs = scoring_cap.saturating_mul(5);
 
                     let mut term_count = 0;
                     let mut docs_accumulated = 0;
 
-                    let mut matching_arrays = Vec::new();
                     let mut prefiltered_candidates = Vec::new();
 
-                    if is_prefix_token {
-                        let mut end_bound = String::with_capacity(token.len() + 4);
-                        end_bound.push_str(token);
-                        end_bound.push('\u{FFFF}');
+                    let mut end_bound = String::with_capacity(token.len() + 4);
+                    end_bound.push_str(token);
+                    end_bound.push('\u{FFFF}');
 
-                        for (_, ids) in mem.inverted_index.range::<str, _>((
-                            Bound::Included(token.as_str()),
-                            Bound::Included(end_bound.as_str()),
-                        )) {
-                            for &id in ids {
-                                let metadata = mem.metadata[id as usize];
-                                if let Some(sort_key) =
-                                    evaluate_candidate(metadata, &options, volume_type_mask)
-                                {
-                                    prefiltered_candidates.push((sort_key, id))
-                                }
-
-                                if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
-                                    crate::search::retain_top_k(
-                                        &mut prefiltered_candidates,
-                                        max_docs,
-                                    );
-                                }
+                    for (_, ids) in mem.inverted_index.range::<str, _>((
+                        Bound::Included(token.as_str()),
+                        Bound::Included(end_bound.as_str()),
+                    )) {
+                        for &id in ids {
+                            let metadata = mem.metadata[id as usize];
+                            if let Some(sort_key) =
+                                evaluate_candidate(metadata, &options, volume_type_mask)
+                            {
+                                prefiltered_candidates.push((sort_key, id))
                             }
 
-                            term_count += 1;
-                            docs_accumulated += ids.len();
-
-                            if term_count >= max_expansions || docs_accumulated >= max_docs {
-                                break;
+                            if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
+                                crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
                             }
                         }
-                    } else if let Some(ids) = mem.inverted_index.get(token.as_str()) {
-                        matching_arrays.push(ids);
+
+                        term_count += 1;
+                        docs_accumulated += ids.len();
+
+                        if term_count >= max_expansions || docs_accumulated >= max_docs {
+                            break;
+                        }
                     }
 
-                    if matching_arrays.is_empty() && prefiltered_candidates.is_empty() {
+                    if prefiltered_candidates.is_empty() {
                         mem_candidates = Some(Vec::new());
                         break;
                     }
 
-                    let current_token_ids = if is_prefix_token {
-                        crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
-                        let mut best_ids: Vec<u32> = prefiltered_candidates
-                            .into_iter()
-                            .map(|(_, id)| id)
-                            .collect();
-                        best_ids.sort_unstable();
-                        best_ids.dedup();
-                        std::borrow::Cow::Owned(best_ids)
-                    } else if matching_arrays.len() == 1 {
-                        std::borrow::Cow::Borrowed(matching_arrays[0])
-                    } else {
-                        let mut merged = Vec::new();
-                        for ids in matching_arrays {
-                            merged.extend_from_slice(ids);
-                        }
-                        merged.sort_unstable();
-                        merged.dedup();
-                        std::borrow::Cow::Owned(merged)
-                    };
+                    crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
+                    let mut best_ids: Vec<u32> = prefiltered_candidates
+                        .into_iter()
+                        .map(|(_, id)| id)
+                        .collect();
+                    best_ids.sort_unstable();
+                    best_ids.dedup();
+                    let current_token_ids = std::borrow::Cow::Owned(best_ids);
 
                     match mem_candidates.as_mut() {
                         // Two point merge in the RAM path
@@ -669,82 +629,67 @@ impl Index {
                     break;
                 }
 
-                let is_prefix_token = Some(token) == prefix_token.as_ref();
+                let max_expansions = if token.chars().count() <= 2 {
+                    options.max_expansions
+                } else {
+                    options.max_expansions.saturating_mul(10)
+                };
 
-                let max_expansions = if is_prefix_token {
-                    if token.chars().count() <= 2 {
-                        options.max_expansions
-                    } else {
-                        options.max_expansions.saturating_mul(10)
-                    }
-                } else {
-                    usize::MAX
-                };
-                let max_docs = if is_prefix_token {
-                    scoring_cap.saturating_mul(5)
-                } else {
-                    usize::MAX
-                };
+                let max_docs = scoring_cap.saturating_mul(5);
 
                 token_docs.clear();
                 let map = segment.as_ref().as_ref();
                 let mut term_count = 0;
-                if is_prefix_token {
-                    let matcher = Str::new(token).starts_with();
-                    let mut stream = map.search(&matcher).into_stream();
+                let matcher = Str::new(token).starts_with();
+                let mut stream = map.search(&matcher).into_stream();
 
-                    let mut docs_accumulated;
-                    let mut prefiltered_candidates = Vec::new();
+                let mut docs_accumulated;
+                let mut prefiltered_candidates = Vec::new();
 
-                    while let Some((_, post_offset)) = stream.next() {
-                        segment.for_each_posting_id(post_offset, |doc_id| {
-                            let byte_offset = (doc_id as usize) * std::mem::size_of::<u128>();
-                            let meta_mmap = segment.meta_map();
+                while let Some((_, post_offset)) = stream.next() {
+                    segment.for_each_posting_id(post_offset, |doc_id| {
+                        let byte_offset = (doc_id as usize) * std::mem::size_of::<u128>();
+                        let meta_mmap = segment.meta_map();
 
-                            if byte_offset + std::mem::size_of::<u128>() <= meta_mmap.len() {
-                                let packed_val = unsafe {
-                                    std::ptr::read_unaligned(
-                                        meta_mmap.as_ptr().add(byte_offset) as *const u128
-                                    )
-                                }
-                                .to_le();
+                        if byte_offset + std::mem::size_of::<u128>() <= meta_mmap.len() {
+                            let packed_val = unsafe {
+                                std::ptr::read_unaligned(
+                                    meta_mmap.as_ptr().add(byte_offset) as *const u128
+                                )
+                            }
+                            .to_le();
 
-                                if let Some(sort_key) =
-                                    evaluate_candidate(packed_val, &options, volume_type_mask)
-                                {
-                                    prefiltered_candidates.push((sort_key, doc_id));
+                            if let Some(sort_key) =
+                                evaluate_candidate(packed_val, &options, volume_type_mask)
+                            {
+                                prefiltered_candidates.push((sort_key, doc_id));
 
-                                    if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
-                                        crate::search::retain_top_k(
-                                            &mut prefiltered_candidates,
-                                            max_docs,
-                                        );
-                                    }
+                                if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
+                                    crate::search::retain_top_k(
+                                        &mut prefiltered_candidates,
+                                        max_docs,
+                                    );
                                 }
                             }
-                        });
-                        docs_accumulated = prefiltered_candidates.len();
-
-                        term_count += 1;
-
-                        if term_count >= max_expansions || docs_accumulated >= max_docs {
-                            break;
                         }
+                    });
+                    docs_accumulated = prefiltered_candidates.len();
+
+                    term_count += 1;
+
+                    if term_count >= max_expansions || docs_accumulated >= max_docs {
+                        break;
                     }
-
-                    crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
-                    token_docs = prefiltered_candidates
-                        .into_iter()
-                        .map(|(_, id)| id)
-                        .collect();
-                } else if let Some(post_offset) = map.get(token) {
-                    segment.append_posting_list(post_offset, &mut token_docs);
                 }
 
-                if term_count > 1 || is_prefix_token {
-                    token_docs.sort_unstable();
-                    token_docs.dedup();
-                }
+                crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
+                token_docs = prefiltered_candidates
+                    .into_iter()
+                    .map(|(_, id)| id)
+                    .collect();
+
+                token_docs.sort_unstable();
+                token_docs.dedup();
 
                 if first_token {
                     std::mem::swap(&mut current_matches, &mut token_docs);
