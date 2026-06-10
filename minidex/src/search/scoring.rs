@@ -313,9 +313,9 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
     if inputs.raw_query_tokens.len() > 1 {
         let mut last_pos = 0;
         let mut is_ordered = true;
-        for token in inputs.query_tokens {
-            if let Some(pos) = search_target[last_pos..].find(token.as_str()) {
-                last_pos += pos + token.len();
+        for &raw_token in inputs.raw_query_tokens {
+            if let Some(pos) = find_ignore_case(&search_target[last_pos..], raw_token) {
+                last_pos += pos + raw_token.len();
             } else {
                 is_ordered = false;
                 break;
@@ -325,6 +325,16 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
             final_score *= weights.mult_ordered;
         }
     }
+
+    let mut exact_structure_bonus = 1.0;
+    for &raw in inputs.raw_query_tokens {
+        if raw.contains(|c: char| !c.is_alphanumeric())
+            && find_ignore_case(search_target, raw).is_some()
+        {
+            exact_structure_bonus += 1.0;
+        }
+    }
+    final_score *= exact_structure_bonus;
 
     final_score
 }
