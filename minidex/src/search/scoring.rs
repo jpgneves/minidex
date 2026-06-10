@@ -313,25 +313,49 @@ pub(crate) fn compute_score(weights: &ScoringWeights, inputs: &ScoringInputs) ->
     if inputs.raw_query_tokens.len() > 1 {
         let mut last_pos = 0;
         let mut is_ordered = true;
-        for &raw_token in inputs.raw_query_tokens {
-            if let Some(pos) = find_ignore_case(&search_target[last_pos..], raw_token) {
-                last_pos += pos + raw_token.len();
-            } else {
-                is_ordered = false;
+        let mut checked_tokens = 0;
+
+        for &raw in inputs.raw_query_tokens {
+            for sub_token in raw
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+            {
+                let normalized = if is_ascii {
+                    std::borrow::Cow::Borrowed(sub_token)
+                } else {
+                    std::borrow::Cow::Owned(crate::tokenizer::fold_path(sub_token))
+                };
+
+                if let Some(pos) = find_ignore_case(&search_target[last_pos..], &normalized) {
+                    last_pos += pos + normalized.len();
+                    checked_tokens += 1;
+                } else {
+                    is_ordered = false;
+                    break;
+                }
+            }
+            if !is_ordered {
                 break;
             }
         }
-        if is_ordered {
+
+        if is_ordered && checked_tokens > 1 {
             final_score *= weights.mult_ordered;
         }
     }
 
     let mut exact_structure_bonus = 1.0;
     for &raw in inputs.raw_query_tokens {
-        if raw.contains(|c: char| !c.is_alphanumeric())
-            && find_ignore_case(search_target, raw).is_some()
-        {
-            exact_structure_bonus += 1.0;
+        if raw.contains(|c: char| !c.is_alphanumeric()) {
+            let needle = if is_ascii {
+                std::borrow::Cow::Borrowed(raw)
+            } else {
+                std::borrow::Cow::Owned(crate::tokenizer::fold_path(raw))
+            };
+
+            if find_ignore_case(search_target, &needle).is_some() {
+                exact_structure_bonus += 1.0;
+            }
         }
     }
     final_score *= exact_structure_bonus;
