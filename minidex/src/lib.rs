@@ -487,10 +487,12 @@ impl Index {
             // In-memory searches
             if !tokens.is_empty() {
                 for token in &tokens {
-                    let max_expansions = if token.chars().count() <= 2 {
+                    let is_first_token = mem_candidates.is_none();
+
+                    let max_expansions = if is_first_token && token.chars().count() <= 2 {
                         options.max_expansions
                     } else {
-                        options.max_expansions.saturating_mul(10)
+                        usize::MAX
                     };
 
                     let max_docs = if token.chars().count() <= 2 {
@@ -513,6 +515,10 @@ impl Index {
                         Bound::Included(end_bound.as_str()),
                     )) {
                         for &id in ids {
+                            if let Some(existing) = mem_candidates.as_ref()
+                                && existing.binary_search(&id).is_err() {
+                                    continue;
+                                }
                             let metadata = mem.metadata[id as usize];
                             if let Some(sort_key) =
                                 evaluate_candidate(metadata, &options, volume_type_mask)
@@ -633,10 +639,10 @@ impl Index {
                     break;
                 }
 
-                let max_expansions = if token.chars().count() <= 2 {
+                let max_expansions = if first_token && token.chars().count() <= 2 {
                     options.max_expansions
                 } else {
-                    options.max_expansions.saturating_mul(10)
+                    usize::MAX
                 };
 
                 let max_docs = if token.chars().count() <= 2 {
@@ -656,6 +662,9 @@ impl Index {
 
                 while let Some((_, post_offset)) = stream.next() {
                     segment.for_each_posting_id(post_offset, |doc_id| {
+                        if !first_token && current_matches.binary_search(&doc_id).is_err() {
+                            return;
+                        }
                         let byte_offset = (doc_id as usize) * std::mem::size_of::<u128>();
                         let meta_mmap = segment.meta_map();
 
