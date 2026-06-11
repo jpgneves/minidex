@@ -516,9 +516,10 @@ impl Index {
                     )) {
                         for &id in ids {
                             if let Some(existing) = mem_candidates.as_ref()
-                                && existing.binary_search(&id).is_err() {
-                                    continue;
-                                }
+                                && existing.binary_search(&id).is_err()
+                            {
+                                continue;
+                            }
                             let metadata = mem.metadata[id as usize];
                             if let Some(sort_key) =
                                 evaluate_candidate(metadata, &options, volume_type_mask)
