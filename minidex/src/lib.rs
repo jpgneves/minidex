@@ -489,13 +489,15 @@ impl Index {
                 for token in &tokens {
                     let is_first_token = mem_candidates.is_none();
 
-                    let max_expansions = if is_first_token && token.chars().count() <= 2 {
+                    let max_expansions = if is_first_token
+                        && token.chars().count() <= options.short_prefix_threshold
+                    {
                         options.max_expansions
                     } else {
                         usize::MAX
                     };
 
-                    let max_docs = if token.chars().count() <= 2 {
+                    let max_docs = if token.chars().count() <= options.short_prefix_threshold {
                         scoring_cap.saturating_mul(5)
                     } else {
                         usize::MAX
@@ -640,13 +642,14 @@ impl Index {
                     break;
                 }
 
-                let max_expansions = if first_token && token.chars().count() <= 2 {
-                    options.max_expansions
-                } else {
-                    usize::MAX
-                };
+                let max_expansions =
+                    if first_token && token.chars().count() <= options.short_prefix_threshold {
+                        options.max_expansions
+                    } else {
+                        usize::MAX
+                    };
 
-                let max_docs = if token.chars().count() <= 2 {
+                let max_docs = if token.chars().count() <= options.short_prefix_threshold {
                     scoring_cap.saturating_mul(5)
                 } else {
                     usize::MAX

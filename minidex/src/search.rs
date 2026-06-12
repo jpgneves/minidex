@@ -15,6 +15,7 @@ pub struct SearchOptions<'a> {
     pub volume_type: Option<&'a [VolumeType]>,
     pub max_expansions: usize,
     pub max_scoring_cap: Option<usize>,
+    pub short_prefix_threshold: usize,
 }
 
 impl Default for SearchOptions<'_> {
@@ -27,6 +28,7 @@ impl Default for SearchOptions<'_> {
             volume_type: None,
             max_expansions: 50,
             max_scoring_cap: None,
+            short_prefix_threshold: 1,
         }
     }
 }
