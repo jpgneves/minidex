@@ -502,39 +502,37 @@ impl Index {
                 for token in &tokens {
                     let is_first_token = mem_candidates.is_none();
 
+                    let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
+
                     let max_expansions = if is_first_token
                         && token.chars().count() <= options.short_prefix_threshold
+                        && !is_exact
                     {
                         options.max_expansions
                     } else {
                         usize::MAX
                     };
 
-                    let max_docs = if token.chars().count() <= options.short_prefix_threshold {
-                        scoring_cap.saturating_mul(5)
-                    } else {
-                        usize::MAX
-                    };
+                    let max_docs =
+                        if token.chars().count() <= options.short_prefix_threshold && !is_exact {
+                            scoring_cap.saturating_mul(5)
+                        } else {
+                            usize::MAX
+                        };
 
                     let mut term_count = 0;
                     let mut docs_accumulated = 0;
 
                     let mut prefiltered_candidates = Vec::new();
 
-                    let mut end_bound = String::with_capacity(token.len() + 4);
-                    end_bound.push_str(token);
-                    end_bound.push('\u{FFFF}');
-
-                    for (_, ids) in mem.inverted_index.range::<str, _>((
-                        Bound::Included(token.as_str()),
-                        Bound::Included(end_bound.as_str()),
-                    )) {
+                    let mut process_ids = |ids: &[u32]| {
                         for &id in ids {
-                            if let Some(existing) = mem_candidates.as_ref()
-                                && existing.binary_search(&id).is_err()
-                            {
-                                continue;
+                            if let Some(existing) = mem_candidates.as_ref() {
+                                if existing.binary_search(&id).is_err() {
+                                    continue;
+                                }
                             }
+
                             let metadata = mem.metadata[id as usize];
                             if let Some(sort_key) =
                                 evaluate_candidate(metadata, &options, volume_type_mask)
@@ -546,12 +544,29 @@ impl Index {
                                 crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
                             }
                         }
+                    };
 
-                        term_count += 1;
-                        docs_accumulated += ids.len();
+                    if is_exact {
+                        if let Some(ids) = mem.inverted_index.get(token.as_str()) {
+                            process_ids(ids);
+                        }
+                    } else {
+                        let mut end_bound = String::with_capacity(token.len() + 4);
+                        end_bound.push_str(token);
+                        end_bound.push('\u{FFFF}');
 
-                        if term_count >= max_expansions || docs_accumulated >= max_docs {
-                            break;
+                        for (_, ids) in mem.inverted_index.range::<str, _>((
+                            Bound::Included(token.as_str()),
+                            Bound::Included(end_bound.as_str()),
+                        )) {
+                            process_ids(ids);
+
+                            term_count += 1;
+                            docs_accumulated += ids.len();
+
+                            if term_count >= max_expansions || docs_accumulated >= max_docs {
+                                break;
+                            }
                         }
                     }
 
@@ -655,29 +670,31 @@ impl Index {
                     break;
                 }
 
-                let max_expansions =
-                    if first_token && token.chars().count() <= options.short_prefix_threshold {
-                        options.max_expansions
-                    } else {
-                        usize::MAX
-                    };
+                let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
-                let max_docs = if token.chars().count() <= options.short_prefix_threshold {
-                    scoring_cap.saturating_mul(5)
+                let max_expansions = if first_token
+                    && token.chars().count() <= options.short_prefix_threshold
+                    && !is_exact
+                {
+                    options.max_expansions
                 } else {
                     usize::MAX
                 };
 
+                let max_docs =
+                    if token.chars().count() <= options.short_prefix_threshold && !is_exact {
+                        scoring_cap.saturating_mul(5)
+                    } else {
+                        usize::MAX
+                    };
+
                 token_docs.clear();
                 let map = segment.as_ref().as_ref();
                 let mut term_count = 0;
-                let matcher = Str::new(token).starts_with();
-                let mut stream = map.search(&matcher).into_stream();
 
-                let mut docs_accumulated;
                 let mut prefiltered_candidates = Vec::new();
 
-                while let Some((_, post_offset)) = stream.next() {
+                let mut process_offset = |post_offset: u64| -> usize {
                     segment.for_each_posting_id(post_offset, |doc_id| {
                         if !first_token && current_matches.binary_search(&doc_id).is_err() {
                             return;
@@ -707,12 +724,25 @@ impl Index {
                             }
                         }
                     });
-                    docs_accumulated = prefiltered_candidates.len();
+                    prefiltered_candidates.len()
+                };
 
-                    term_count += 1;
+                if is_exact {
+                    if let Some(post_offset) = map.get(token) {
+                        process_offset(post_offset);
+                    }
+                } else {
+                    let matcher = Str::new(token).starts_with();
+                    let mut stream = map.search(&matcher).into_stream();
 
-                    if term_count >= max_expansions || docs_accumulated >= max_docs {
-                        break;
+                    while let Some((_, post_offset)) = stream.next() {
+                        let current_len = process_offset(post_offset);
+
+                        term_count += 1;
+
+                        if term_count >= max_expansions || current_len >= max_docs {
+                            break;
+                        }
                     }
                 }
 
