@@ -458,6 +458,19 @@ impl Index {
         let query_lower = query.to_lowercase();
         let raw_query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
+        // Inject synthetic extension tokens so search is mmore constrained
+        for &raw in &raw_query_tokens {
+            if raw.starts_with('.')
+                && raw.len() > 1
+                && raw[1..].chars().all(|c| c.is_alphanumeric())
+            {
+                tokens.push(crate::tokenizer::synthesize_token(
+                    crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                    &raw[1..],
+                ));
+            }
+        }
+
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         let segments = self.base.load().snapshot();

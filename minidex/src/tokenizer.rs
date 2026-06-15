@@ -86,11 +86,25 @@ pub(crate) fn extract_all_tokens(path: &str, volume: &str) -> Vec<String> {
         tokens.push(synthesize_token(SYNTH_VOLUME_TOKEN_TAG, volume));
     }
 
-    if let Some(ext) = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-    {
+    let path_obj = std::path::Path::new(path);
+    let file_name_str = path_obj.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    // Extract extension token
+    if let Some(ext) = path_obj.extension().and_then(|e| e.to_str()) {
         tokens.push(synthesize_token(SYNTH_EXT_TOKEN_TAG, ext));
+    }
+
+    // Also extract extensions for Unix hidden paths
+    if file_name_str.starts_with('.') && file_name_str.len() > 1 {
+        let first_word = file_name_str[1..].split('.').next().unwrap_or("");
+
+        if !first_word.is_empty()
+            && path_obj
+                .extension()
+                .map_or(true, |e| e.to_str() != Some(first_word))
+        {
+            tokens.push(synthesize_token(SYNTH_EXT_TOKEN_TAG, first_word))
+        }
     }
 
     // Pre-process the (potential) path
@@ -141,7 +155,7 @@ pub(crate) fn fold_path(input: &str) -> String {
 
 const SYNTH_PATH_TOKEN_TAG: char = '\x00';
 pub(crate) const SYNTH_VOLUME_TOKEN_TAG: char = '\x01';
-const SYNTH_EXT_TOKEN_TAG: char = '\x02';
+pub(crate) const SYNTH_EXT_TOKEN_TAG: char = '\x02';
 
 #[inline(always)]
 pub(crate) fn synthesize_token(tag: char, orig: &str) -> String {
