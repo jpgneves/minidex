@@ -527,10 +527,10 @@ impl Index {
 
                     let mut process_ids = |ids: &[u32]| {
                         for &id in ids {
-                            if let Some(existing) = mem_candidates.as_ref() {
-                                if existing.binary_search(&id).is_err() {
-                                    continue;
-                                }
+                            if let Some(existing) = mem_candidates.as_ref()
+                                && existing.binary_search(&id).is_err()
+                            {
+                                continue;
                             }
 
                             let metadata = mem.metadata[id as usize];
