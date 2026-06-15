@@ -101,7 +101,7 @@ pub(crate) fn extract_all_tokens(path: &str, volume: &str) -> Vec<String> {
         if !first_word.is_empty()
             && path_obj
                 .extension()
-                .map_or(true, |e| e.to_str() != Some(first_word))
+                .is_none_or(|e| e.to_str() != Some(first_word))
         {
             tokens.push(synthesize_token(SYNTH_EXT_TOKEN_TAG, first_word))
         }
