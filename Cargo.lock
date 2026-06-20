@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "minidex-cli"
-version = "0.10.1+0.31.2"
+version = "0.11.0+0.31.2"
 dependencies = [
  "anyhow",
  "chrono",

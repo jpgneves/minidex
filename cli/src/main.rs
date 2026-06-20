@@ -48,6 +48,8 @@ impl Drop for IndexingGuard {
     }
 }
 
+const PAGE_SIZE: usize = 100;
+
 struct App {
     index_path: String,
     index: Option<Arc<Index>>,
@@ -64,6 +66,7 @@ struct App {
     target_cursor_position: usize,
     input_mode: InputMode,
     search_latencies_us: Vec<u128>,
+    page: usize,
 
     // Config screen state
     compactor_config: CompactorConfig,
@@ -113,6 +116,7 @@ impl App {
             target_cursor_position: target_len,
             input_mode: InputMode::Search,
             search_latencies_us: Vec::new(),
+            page: 0,
 
             compactor_config: config,
             config_selection: 0,
@@ -235,6 +239,7 @@ impl App {
             InputMode::Search => {
                 self.input.insert(self.cursor_position, new_char);
                 self.move_cursor_right();
+                self.page = 0;
                 self.update_search();
             }
             InputMode::Target => {
@@ -272,6 +277,7 @@ impl App {
                     let right_to_left = self.input.chars().skip(self.cursor_position);
                     self.input = left_to_left.chain(right_to_left).collect();
                     self.move_cursor_left();
+                    self.page = 0;
                     self.update_search();
                 }
             }
@@ -345,6 +351,8 @@ impl App {
 
         let start = std::time::Instant::now();
         let options = SearchOptions::default();
+        let offset = self.page * PAGE_SIZE;
+
         if self.input.is_empty() {
             let five_days_ago = std::time::SystemTime::now()
                 .checked_sub(Duration::from_secs(5 * 24 * 60 * 60))
@@ -353,7 +361,7 @@ impl App {
                 .unwrap_or_default()
                 .as_secs();
 
-            match index.recent_files(five_days_ago, 100, 0, options) {
+            match index.recent_files(five_days_ago, PAGE_SIZE, offset, options) {
                 Ok(results) => {
                     self.results = results;
                     if !self.results.is_empty() {
@@ -372,7 +380,7 @@ impl App {
             return;
         }
 
-        match index.search(&self.input, 100, 0, options) {
+        match index.search(&self.input, PAGE_SIZE, offset, options) {
             Ok(results) => {
                 self.results = results;
                 if !self.results.is_empty() {
@@ -422,6 +430,20 @@ impl App {
             None => 0,
         };
         self.list_state.select(Some(i));
+    }
+
+    fn next_page(&mut self) {
+        if self.results.len() == PAGE_SIZE {
+            self.page += 1;
+            self.update_search();
+        }
+    }
+
+    fn previous_page(&mut self) {
+        if self.page > 0 {
+            self.page -= 1;
+            self.update_search();
+        }
     }
 
     fn delete_selected(&mut self) {
@@ -691,6 +713,8 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> io::Result<()> {
                                     return Ok(());
                                 }
                             }
+                            (KeyCode::Left, KeyModifiers::ALT) => app.previous_page(),
+                            (KeyCode::Right, KeyModifiers::ALT) => app.next_page(),
                             (KeyCode::Char(c), _) => app.enter_char(c),
                             (KeyCode::Backspace, _) => app.delete_char(),
                             (KeyCode::Left, _) => app.move_cursor_left(),
@@ -949,9 +973,9 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let title = if app.input.is_empty() {
-        format!("Recent Files ({})", app.results.len())
+        format!("Recent Files (Page {}, {})", app.page + 1, app.results.len())
     } else {
-        format!("Results ({})", app.results.len())
+        format!("Results (Page {}, {})", app.page + 1, app.results.len())
     };
 
     let results_list = List::new(results)
@@ -1295,7 +1319,7 @@ fn ui_help(f: &mut Frame, app: &App, area: Rect) {
         InputMode::OpenIndex => "Esc: Cancel | Enter: Open Path",
         _ => match app.screen {
             Screen::Search => {
-                "Esc: Quit | Tab: Switch | Ctrl+O: Open | Ctrl+R: Index | Ctrl+K: Compact | Ctrl+D: Delete"
+                "Esc: Quit | Tab: Switch | Ctrl+O: Open | Ctrl+R: Index | Alt+←/→: Page | Ctrl+K: Compact | Ctrl+D: Delete"
             }
             Screen::Stats => "Esc: Quit | F1-F3: Switch | Ctrl+O: Open",
             Screen::Config => "Esc: Quit | Up/Down: Navigate | Enter: Apply | Ctrl+O: Open",
