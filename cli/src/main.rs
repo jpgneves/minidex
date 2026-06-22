@@ -973,7 +973,11 @@ fn ui_search(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let title = if app.input.is_empty() {
-        format!("Recent Files (Page {}, {})", app.page + 1, app.results.len())
+        format!(
+            "Recent Files (Page {}, {})",
+            app.page + 1,
+            app.results.len()
+        )
     } else {
         format!("Results (Page {}, {})", app.page + 1, app.results.len())
     };

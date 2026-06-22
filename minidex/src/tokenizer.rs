@@ -37,22 +37,36 @@ pub fn tokenize(input: &str) -> Vec<String> {
         }
 
         if let Some(p) = prev_char {
-            // Use camelCase transitions as token boundaries
-            let is_camel = p.is_lowercase() && c.is_uppercase();
+            // Use CJK to non-CJK transition as boundaries
+            let is_script_boundary = is_cjk(p) != is_cjk(c);
 
-            // Transitioning from non-numeric to numeric characters
-            let is_num_transition =
-                (p.is_alphabetic() && c.is_numeric()) || (p.is_numeric() && c.is_alphabetic());
-
-            // If the character falls into common CJK Unicode blocks, we split.
-            // This forces Japanese/Chinese characters to be heavily fragmented,
-            // allowing substring-like matching even without spaces.
-            let is_cjk_transition = is_cjk(p) || is_cjk(c);
-
-            if is_camel || is_num_transition || is_cjk_transition {
+            if is_script_boundary {
                 push_token(&mut tokens, &current);
                 current.clear();
-                has_transition = true;
+
+                if has_transition {
+                    push_token(&mut tokens, &compound);
+                }
+                compound.clear();
+                has_transition = false;
+            } else {
+                // Use camelCase transitions as token boundaries
+                let is_camel = p.is_lowercase() && c.is_uppercase();
+
+                // Transitioning from non-numeric to numeric characters
+                let is_num_transition =
+                    (p.is_alphabetic() && c.is_numeric()) || (p.is_numeric() && c.is_alphabetic());
+
+                // If the character falls into common CJK Unicode blocks, we split.
+                // This forces Japanese/Chinese characters to be heavily fragmented,
+                // allowing substring-like matching even without spaces.
+                let is_cjk_transition = is_cjk(p) || is_cjk(c);
+
+                if is_camel || is_num_transition || is_cjk_transition {
+                    push_token(&mut tokens, &current);
+                    current.clear();
+                    has_transition = true;
+                }
             }
         }
 
@@ -258,5 +272,11 @@ mod tests {
 
         let tokens2 = tokenize("Hello HELLO");
         assert_eq!(tokens2, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_script_boundaries() {
+        let tokens = tokenize("project測試.txt");
+        assert_eq!(tokens, vec!["project", "txt", "測", "測試", "試"]);
     }
 }
