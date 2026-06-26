@@ -22,14 +22,29 @@ pub fn tokenize(input: &str) -> Vec<String> {
         }
     };
 
+    // Helper closure to flush compounds and generate CJK suffixes
+    let flush_compound = |t: &mut Vec<String>, comp: &str, transition: bool| {
+        if transition && !comp.is_empty() {
+            if comp.chars().next().map_or(false, is_cjk) {
+                // Emit a suffix token
+                let chars: Vec<char> = comp.chars().collect();
+                for i in 0..chars.len() {
+                    let suffix: String = chars[i..].iter().collect();
+                    push_token(t, &suffix);
+                }
+            } else {
+                push_token(t, comp);
+            }
+        }
+    };
+
     for c in input.nfkc() {
         if !c.is_alphanumeric() || c == '\u{2014}' {
             push_token(&mut tokens, &mut current);
             current.clear();
 
-            if has_transition {
-                push_token(&mut tokens, &compound);
-            }
+            flush_compound(&mut tokens, &compound, has_transition);
+
             compound.clear();
             has_transition = false;
             prev_char = Some(c);
@@ -44,9 +59,8 @@ pub fn tokenize(input: &str) -> Vec<String> {
                 push_token(&mut tokens, &current);
                 current.clear();
 
-                if has_transition {
-                    push_token(&mut tokens, &compound);
-                }
+                flush_compound(&mut tokens, &compound, has_transition);
+
                 compound.clear();
                 has_transition = false;
             } else {
@@ -76,9 +90,7 @@ pub fn tokenize(input: &str) -> Vec<String> {
     }
 
     push_token(&mut tokens, &current);
-    if has_transition {
-        push_token(&mut tokens, &compound);
-    }
+    flush_compound(&mut tokens, &compound, has_transition);
 
     tokens.sort_unstable();
     tokens.dedup();
@@ -221,13 +233,13 @@ mod tests {
         // "日本語" (Japanese)
         let tokens = tokenize("日本語");
         // CJK characters should be fragmented
-        assert_eq!(tokens, vec!["日", "日本語", "本", "語"]);
+        assert_eq!(tokens, vec!["日", "日本語", "本", "本語", "語"]);
 
         // "한국어" (Korean)
         let tokens2 = tokenize("한국어");
         // Korean characters are decomposed in NFD
         // "국", "어", "한" (sorted)
-        let mut expected: Vec<String> = vec!["국", "어", "한", "한국어"]
+        let mut expected: Vec<String> = vec!["국", "국어", "어", "한", "한국어"]
             .into_iter()
             .map(|s| s.nfd().collect())
             .collect();
@@ -278,5 +290,14 @@ mod tests {
     fn test_script_boundaries() {
         let tokens = tokenize("project測試.txt");
         assert_eq!(tokens, vec!["project", "txt", "測", "測試", "試"]);
+    }
+
+    #[test]
+    fn test_compound_flushing() {
+        let tokens = tokenize("这是测试.txt");
+        assert_eq!(
+            tokens,
+            vec!["txt", "是", "是测试", "测", "测试", "试", "这", "这是测试"]
+        );
     }
 }
