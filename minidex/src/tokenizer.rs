@@ -25,7 +25,7 @@ pub fn tokenize(input: &str) -> Vec<String> {
     // Helper closure to flush compounds and generate CJK suffixes
     let flush_compound = |t: &mut Vec<String>, comp: &str, transition: bool| {
         if transition && !comp.is_empty() {
-            if comp.chars().next().map_or(false, is_cjk) {
+            if comp.chars().next().is_some_and(is_cjk) {
                 // Emit a suffix token
                 let chars: Vec<char> = comp.chars().collect();
                 for i in 0..chars.len() {
