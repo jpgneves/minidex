@@ -70,7 +70,7 @@ pub(crate) fn lower_thread_io_prio() {
                 libc::SYS_ioprio_set,
                 1,
                 0,
-                (3 << 13) | 0, // IOPRIO_CLASS_IDLE
+                3 << 13, // IOPRIO_CLASS_IDLE
             );
         }
     }

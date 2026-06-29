@@ -480,7 +480,7 @@ impl SegmentedIndex {
 
         let build_dict = existing_dict.is_none();
 
-        for (loop_counter, (path, volume, entry)) in (0_usize..).zip(items.into_iter()) {
+        for (loop_counter, (path, volume, entry)) in (0_usize..).zip(items) {
             if loop_counter.is_multiple_of(500) {
                 crate::sync::thread::yield_now();
             }
@@ -608,8 +608,7 @@ impl SegmentedIndex {
         let mut current_post_offset = 0u64;
         let mut compressed_buffer = Vec::new();
 
-        for (fst_loop_counter, (token, doc_offsets)) in (0_usize..).zip(inverted_index.into_iter())
-        {
+        for (fst_loop_counter, (token, doc_offsets)) in (0_usize..).zip(inverted_index) {
             if fst_loop_counter.is_multiple_of(1000) {
                 crate::sync::thread::yield_now();
             }
