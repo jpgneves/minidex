@@ -182,7 +182,6 @@ impl Index {
         base: Arc<ArcSwap<SegmentedIndex>>,
         live_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
     ) {
-        crate::sync::thread::sleep(crate::sync::time::Duration::from_secs(5));
         log::info!(
             "Starting background WAL recovery for {} files...",
             frozen_wals.len()
