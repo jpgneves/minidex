@@ -164,23 +164,38 @@ impl Wal {
                     results.inserts.push((path, volume, entry));
                 }
                 WAL_RECORD_TOMBSTONE => {
+                    let mut read_or_break = |buf: &mut [u8]| -> Result<bool, std::io::Error> {
+                        match reader.read_exact(buf) {
+                            Ok(_) => Ok(true),
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+                            Err(e) => Err(e),
+                        }
+                    };
                     let mut seq_buf = [0u8; 8];
-                    reader.read_exact(&mut seq_buf)?;
+                    if !read_or_break(&mut seq_buf)? {
+                        break;
+                    }
                     let seq = u64::from_le_bytes(seq_buf);
 
                     let mut len_buf = [0u8; 4];
 
                     let mut flag_buf = [0u8; 1];
-                    reader.read_exact(&mut flag_buf)?;
+                    if !read_or_break(&mut flag_buf)? {
+                        break;
+                    }
                     let has_volume = flag_buf[0] == 1;
 
                     let volume =
                         if has_volume {
-                            reader.read_exact(&mut len_buf)?;
+                            if !read_or_break(&mut len_buf)? {
+                                break;
+                            }
                             let len = u32::from_le_bytes(len_buf) as usize;
 
                             let mut volume_buf = vec![0u8; len];
-                            reader.read_exact(&mut volume_buf)?;
+                            if !read_or_break(&mut volume_buf)? {
+                                break;
+                            }
 
                             Some(String::from_utf8(volume_buf).map_err(|e| {
                                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
@@ -189,11 +204,15 @@ impl Wal {
                             None
                         };
 
-                    reader.read_exact(&mut len_buf)?;
+                    if !read_or_break(&mut len_buf)? {
+                        break;
+                    }
                     let len = u32::from_le_bytes(len_buf) as usize;
 
                     let mut prefix_buf = vec![0u8; len];
-                    reader.read_exact(&mut prefix_buf)?;
+                    if !read_or_break(&mut prefix_buf)? {
+                        break;
+                    }
                     let prefix = String::from_utf8(prefix_buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
