@@ -1099,13 +1099,14 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.31.5"
+version = "0.32.0"
 dependencies = [
  "arc-swap",
  "bstr",
  "criterion",
  "fs4",
  "fst",
+ "libc",
  "log",
  "memmap2",
  "rand 0.10.1",
@@ -1121,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "minidex-cli"
-version = "0.11.0+0.31.5"
+version = "0.11.0+0.32.0"
 dependencies = [
  "anyhow",
  "chrono",

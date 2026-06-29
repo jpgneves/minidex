@@ -480,7 +480,13 @@ impl SegmentedIndex {
 
         let build_dict = existing_dict.is_none();
 
+        let mut loop_counter: u64 = 0;
+
         for (path, volume, entry) in items {
+            if loop_counter % 500 == 0 {
+                crate::sync::thread::yield_now();
+            }
+            loop_counter += 1;
             if drop_deletions && entry.opstamp.is_deletion() {
                 continue; // Always drop deletions before they hit the disk segment!
             }
@@ -605,7 +611,13 @@ impl SegmentedIndex {
         let mut current_post_offset = 0u64;
         let mut compressed_buffer = Vec::new();
 
+        let mut fst_loop_counter: u64 = 0;
+
         for (token, doc_offsets) in inverted_index {
+            if fst_loop_counter % 1000 == 0 {
+                crate::sync::thread::yield_now();
+            }
+            fst_loop_counter += 1;
             compressed_buffer.clear();
             let mut last_id = 0u32;
 

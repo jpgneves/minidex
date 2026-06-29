@@ -1,7 +1,7 @@
 [package]
 name = "minidex"
 description = "A lightweight indexing engine for filesystem entries"
-version = "0.31.5"
+version = "0.32.0"
 edition = "2024"
 license.workspace = true
 authors.workspace = true
@@ -25,6 +25,7 @@ unicode-normalization = "0.1.25"
 zstd = "0.13"
 shuttle = { version = "0.8.1", optional = true }
 arc-swap = "1.9.1"
+libc = "0.2.186"
 
 [dev-dependencies]
 criterion = "0.8"

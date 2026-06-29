@@ -136,6 +136,7 @@ impl Index {
             let handle = crate::sync::thread::Builder::new()
                 .name("minidex-recovery".to_owned())
                 .spawn(move || {
+                    crate::sync::lower_thread_io_prio();
                     Self::recover_frozen_wals_to_disk(
                         recovery_path,
                         frozen_wals,
@@ -181,6 +182,7 @@ impl Index {
         base: Arc<ArcSwap<SegmentedIndex>>,
         live_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
     ) {
+        crate::sync::thread::sleep(crate::sync::time::Duration::from_secs(5));
         log::info!(
             "Starting background WAL recovery for {} files...",
             frozen_wals.len()
@@ -1243,6 +1245,7 @@ impl Index {
         let flusher = crate::sync::thread::Builder::new()
             .name("minidex-flush".to_owned())
             .spawn(move || {
+                crate::sync::lower_thread_io_prio();
                 let final_segment_path = path.join(format!("{}", next_seq));
                 let tmp_segment_path = path.join(format!("{}.tmp", next_seq));
 
@@ -1347,6 +1350,7 @@ impl Index {
         crate::sync::thread::Builder::new()
             .name("minidex-compactor".to_string())
             .spawn(move || {
+                crate::sync::lower_thread_io_prio();
                 let next_seq = next_op_seq.fetch_add(1, Ordering::SeqCst);
                 let tmp_path = path.join(format!("{}.tmp", next_seq));
 
