@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "minidex"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "arc-swap",
  "bstr",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "minidex-cli"
-version = "0.11.0+0.32.0"
+version = "0.11.0+0.32.1"
 dependencies = [
  "anyhow",
  "chrono",

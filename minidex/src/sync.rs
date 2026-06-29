@@ -48,8 +48,6 @@ pub(crate) fn lower_thread_io_prio() {
     #[cfg(target_os = "macos")]
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
-
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
     }
 
     #[cfg(target_os = "windows")]
