@@ -53,10 +53,10 @@ pub(crate) fn lower_thread_io_prio() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
         };
         unsafe {
-            SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN as i32);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL as i32);
         }
     }
     #[cfg(target_os = "linux")]
