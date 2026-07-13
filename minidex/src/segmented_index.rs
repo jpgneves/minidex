@@ -271,10 +271,14 @@ impl Segment {
         src: &(PathBuf, PathBuf, PathBuf, PathBuf),
         dst: &(PathBuf, PathBuf, PathBuf, PathBuf),
     ) -> std::io::Result<()> {
-        std::fs::rename(&src.0, &dst.0)?;
         std::fs::rename(&src.1, &dst.1)?;
         std::fs::rename(&src.2, &dst.2)?;
         std::fs::rename(&src.3, &dst.3)?;
+        // Rename the segment file last, to guarantee that the
+        // sibling files exist already in case of crash.
+        // If this happens, the temporary file cleanup will ensure
+        // we are in a consistent state.
+        std::fs::rename(&src.0, &dst.0)?;
         Ok(())
     }
 
