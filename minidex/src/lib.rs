@@ -821,13 +821,27 @@ impl Index {
 
         // Rough top-k
         if results.len() > scoring_cap {
-            results.select_nth_unstable_by(scoring_cap, |a, b| {
-                let a_recent = a.2.last_modified.max(a.2.last_accessed);
-                let b_recent = b.2.last_modified.max(b.2.last_accessed);
+            let mut keyed: Vec<_> = results
+                .into_iter()
+                .map(|doc| {
+                    let depth = doc
+                        .0
+                        .bytes()
+                        .filter(|&b| b == std::path::MAIN_SEPARATOR as u8)
+                        .count()
+                        .min(0xFF) as u64;
+                    let is_dir = (doc.2.kind == Kind::Directory) as u64;
+                    let recent = doc.2.last_modified.max(doc.2.last_accessed) / 1_000_000;
+                    let sort_key = (is_dir << 63) | ((!depth & 0xFF) << 55) | (recent << 21);
+                    (sort_key, doc)
+                })
+                .collect();
 
-                b_recent.cmp(&a_recent).then_with(|| a.0.cmp(&b.0))
+            keyed.select_nth_unstable_by(scoring_cap, |a, b| {
+                b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0))
             });
-            results.truncate(scoring_cap);
+            keyed.truncate(scoring_cap);
+            results = keyed.into_iter().map(|(_, doc)| doc).collect();
         }
 
         let now_micros = crate::sync::time::SystemTime::now()
