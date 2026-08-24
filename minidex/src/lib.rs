@@ -995,8 +995,8 @@ impl Index {
         for segment in segments.segments() {
             let meta_mmap = segment.meta_map();
 
-            for chunk in meta_mmap.chunks_exact(16) {
-                let packed = u128::from_le_bytes(chunk.try_into().unwrap());
+            for chunk in meta_mmap.as_chunks::<16>().0 {
+                let packed = u128::from_le_bytes(*chunk);
                 let (_, last_modified, last_accessed, _, is_dir, doc_category, doc_vol_type) =
                     SegmentedIndex::unpack_u128(packed);
 
