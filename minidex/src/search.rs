@@ -109,7 +109,8 @@ pub(crate) fn evaluate_candidate(
         last_modified
     };
 
-    let sort_key = (is_dir << 63) | ((!depth & 0xFF) << 55) | (recent << 21);
+    let sort_key = ((!depth & 0xFF) << 55) | (recent << 21) | is_dir;
+
     Some(sort_key)
 }
 

@@ -832,7 +832,7 @@ impl Index {
                         .min(0xFF) as u64;
                     let is_dir = (doc.2.kind == Kind::Directory) as u64;
                     let recent = doc.2.last_modified.max(doc.2.last_accessed) / 1_000_000;
-                    let sort_key = (is_dir << 63) | ((!depth & 0xFF) << 55) | (recent << 21);
+                    let sort_key = ((!depth & 0xFF) << 55) | (recent << 21) | is_dir;
                     (sort_key, doc)
                 })
                 .collect();
