@@ -6,6 +6,8 @@ use std::{
 
 use crate::entry::IndexEntry;
 
+use thiserror::Error;
+
 const WAL_RECORD_INSERT: u8 = 0;
 const WAL_RECORD_TOMBSTONE: u8 = 1;
 
@@ -15,7 +17,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub(crate) fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
@@ -30,8 +32,8 @@ impl Wal {
         path: &str,
         volume: &str,
         entry: &IndexEntry,
-    ) -> std::io::Result<()> {
-        let writer = self.writer.as_mut().expect("WAL writer missing");
+    ) -> Result<(), WalError> {
+        let writer = self.writer.as_mut().ok_or(WalError::WriterMissing)?;
 
         let path_bytes = path.as_bytes();
         let path_len = path_bytes.len() as u32;
@@ -53,8 +55,8 @@ impl Wal {
         volume: Option<&str>,
         prefix: &str,
         seq: u64,
-    ) -> std::io::Result<()> {
-        let writer = self.writer.as_mut().expect("WAL writer missing");
+    ) -> Result<(), WalError> {
+        let writer = self.writer.as_mut().ok_or(WalError::WriterMissing)?;
         let prefix_bytes = prefix.as_bytes();
 
         writer.write_all(&[WAL_RECORD_TOMBSTONE])?;
@@ -78,7 +80,7 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn flush(&mut self) -> std::io::Result<()> {
+    pub(crate) fn flush(&mut self) -> Result<(), WalError> {
         if let Some(writer) = self.writer.as_mut() {
             writer.flush()?;
             writer.get_ref().sync_all()?;
@@ -87,11 +89,11 @@ impl Wal {
         Ok(())
     }
 
-    pub(crate) fn replay<P: AsRef<Path>>(path: P) -> std::io::Result<ReplayData> {
+    pub(crate) fn replay<P: AsRef<Path>>(path: P) -> Result<ReplayData, WalError> {
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ReplayData::new()),
-            Err(e) => return Err(e),
+            Err(e) => return Err(WalError::Io(e)),
         };
 
         let mut reader = BufReader::new(file);
@@ -105,7 +107,7 @@ impl Wal {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     break; // Reached the end of the WAL normally
                 }
-                return Err(e);
+                return Err(WalError::Io(e));
             }
 
             match type_buf[0] {
@@ -113,7 +115,7 @@ impl Wal {
                     match reader.read_exact(&mut len_buf) {
                         Ok(_) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(WalError::Io(e)),
                     }
                     let len = u32::from_le_bytes(len_buf) as usize;
                     let mut path_buf = vec![0u8; len];
@@ -122,7 +124,7 @@ impl Wal {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             break;
                         }
-                        return Err(e);
+                        return Err(WalError::Io(e));
                     }
                     let path = String::from_utf8_lossy(&path_buf).to_string();
 
@@ -134,7 +136,7 @@ impl Wal {
                             );
                             break;
                         }
-                        return Err(e);
+                        return Err(WalError::Io(e));
                     }
                     let len = u32::from_le_bytes(len_buf) as usize;
                     let mut vol_buf = vec![0u8; len];
@@ -143,7 +145,7 @@ impl Wal {
                         if e.kind() == std::io::ErrorKind::UnexpectedEof {
                             break;
                         }
-                        return Err(e);
+                        return Err(WalError::Io(e));
                     }
 
                     let volume = String::from_utf8_lossy(&vol_buf).to_string();
@@ -157,18 +159,18 @@ impl Wal {
                             );
                             break;
                         }
-                        return Err(e);
+                        return Err(WalError::Io(e));
                     }
                     let entry = IndexEntry::from_bytes(&entry_buf);
 
                     results.inserts.push((path, volume, entry));
                 }
                 WAL_RECORD_TOMBSTONE => {
-                    let mut read_or_break = |buf: &mut [u8]| -> Result<bool, std::io::Error> {
+                    let mut read_or_break = |buf: &mut [u8]| -> Result<bool, WalError> {
                         match reader.read_exact(buf) {
                             Ok(_) => Ok(true),
                             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-                            Err(e) => Err(e),
+                            Err(e) => Err(WalError::Io(e)),
                         }
                     };
                     let mut seq_buf = [0u8; 8];
@@ -219,10 +221,10 @@ impl Wal {
                     results.tombstones.push((volume, prefix, seq));
                 }
                 _ => {
-                    return Err(std::io::Error::new(
+                    return Err(WalError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "Corrupted WAL",
-                    ));
+                    )));
                 }
             }
         }
@@ -234,8 +236,8 @@ impl Wal {
         Ok(results)
     }
 
-    pub(crate) fn rotate<P: AsRef<Path>>(&mut self, path: P) -> std::io::Result<()> {
-        if let Some(mut writer) = self.writer.take() {
+    pub(crate) fn rotate<P: AsRef<Path>>(&mut self, path: P) -> Result<(), WalError> {
+        if let Some(writer) = self.writer.as_mut() {
             writer.flush()?;
             writer.get_ref().sync_all()?;
         }
@@ -267,6 +269,20 @@ impl ReplayData {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum WalError {
+    #[error("WAL writer missing")]
+    WriterMissing,
+    #[error(transparent)]
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for WalError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,7 +290,7 @@ mod tests {
     use crate::opstamp::Opstamp;
 
     #[test]
-    fn test_wal_append_and_replay() -> std::io::Result<()> {
+    fn test_wal_append_and_replay() -> Result<(), WalError> {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_wal_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
         let wal_path = temp_dir.join("test.wal");
@@ -315,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_rotation() -> std::io::Result<()> {
+    fn test_wal_rotation() -> Result<(), WalError> {
         let temp_dir = std::env::temp_dir().join(format!("minidex_test_wal_rot_{}", rand_id()));
         std::fs::create_dir_all(&temp_dir)?;
         let wal_path = temp_dir.join("journal.wal");

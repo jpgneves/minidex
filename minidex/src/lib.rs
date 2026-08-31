@@ -32,7 +32,7 @@ pub use segmented_index::compactor::*;
 use segmented_index::*;
 pub mod opstamp;
 use opstamp::*;
-use wal::Wal;
+use wal::{Wal, WalError};
 mod search;
 mod simd;
 mod tokenizer;
@@ -126,7 +126,7 @@ impl Index {
         let next_op_seq = Arc::new(AtomicU64::new(safe_seq));
 
         let wal_path = path.as_ref().join("journal.wal");
-        let wal = Wal::open(&wal_path).map_err(IndexError::Io)?;
+        let wal = Wal::open(&wal_path)?;
 
         let recovery = if !frozen_wals.is_empty() {
             let recovery_base = Arc::clone(&base);
@@ -278,8 +278,7 @@ impl Index {
 
         {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-            wal.append(&path_str, &volume, &entry)
-                .map_err(IndexError::Io)?;
+            wal.append(&path_str, &volume, &entry)?;
         }
 
         {
@@ -290,7 +289,7 @@ impl Index {
                 .insert_with_tokens(path_str, volume, entry, tokens);
         }
 
-        if self.should_flush() {
+        if self.should_flush()? {
             let _ = self.trigger_flush();
         }
 
@@ -353,7 +352,7 @@ impl Index {
 
             crate::sync::thread::yield_now();
 
-            if self.should_flush() {
+            if self.should_flush()? {
                 self.trigger_flush()?;
             }
         }
@@ -376,7 +375,7 @@ impl Index {
 
         {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-            wal.append(&path_str, "", &entry).map_err(IndexError::Io)?;
+            wal.append(&path_str, "", &entry)?;
         }
 
         {
@@ -386,7 +385,7 @@ impl Index {
                 .insert(path_str, "".to_owned(), entry);
         }
 
-        if self.should_flush() {
+        if self.should_flush()? {
             let _ = self.trigger_flush();
         }
 
@@ -411,6 +410,12 @@ impl Index {
             .replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR)
             .to_lowercase();
         {
+            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
+
+            wal.write_prefix_tombstone(volume, &normalized_prefix, seq)?;
+        }
+
+        {
             let mut tombstones = self
                 .prefix_tombstones
                 .write()
@@ -423,12 +428,6 @@ impl Index {
             ));
         }
 
-        {
-            let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-
-            wal.write_prefix_tombstone(volume, &normalized_prefix, seq)?;
-        }
-
         Ok(())
     }
 
@@ -436,7 +435,7 @@ impl Index {
     /// This method can fail if the disk is not writable.
     pub fn sync(&self) -> Result<(), IndexError> {
         let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
-        wal.flush().map_err(IndexError::Io)?;
+        wal.flush()?;
 
         Ok(())
     }
@@ -1153,7 +1152,10 @@ impl Index {
         let final_path = self.path.join(format!("{}", compactor_seq));
 
         let snapshot_tombstones = {
-            let guard = self.prefix_tombstones.read().expect("lock poisoned");
+            let guard = self
+                .prefix_tombstones
+                .read()
+                .map_err(|_| IndexError::ReadLock)?;
             guard.clone()
         };
 
@@ -1196,15 +1198,15 @@ impl Index {
         Ok(())
     }
 
-    fn should_flush(&self) -> bool {
-        self.mem_idx.read().expect("mem_idx lock poisoned").len()
+    fn should_flush(&self) -> Result<bool, IndexError> {
+        Ok(self.mem_idx.read().map_err(|_| IndexError::ReadLock)?.len()
             > self.compactor_config.flush_threshold
             || self
                 .prefix_tombstones
                 .read()
-                .expect("prefix_tombstones lock poisoned")
+                .map_err(|_| IndexError::ReadLock)?
                 .len()
-                > self.compactor_config.tombstone_threshold
+                > self.compactor_config.tombstone_threshold)
     }
 
     fn trigger_flush(&self) -> Result<(), IndexError> {
@@ -1221,23 +1223,22 @@ impl Index {
         let snapshot = {
             let mut wal = self.wal.write().map_err(|_| IndexError::WriteLock)?;
 
-            let (snapshot, tombstones_cow) = {
-                let mut mem = self.mem_idx.write().map_err(|_| IndexError::WriteLock)?;
+            if self
+                .mem_idx
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .is_empty()
+            {
+                return Ok(());
+            }
 
-                if mem.is_empty() {
-                    return Ok(());
-                }
+            let tombstones_cow: Arc<Vec<Tombstone>> = self
+                .prefix_tombstones
+                .read()
+                .map_err(|_| IndexError::ReadLock)?
+                .clone();
 
-                let snapshot = std::mem::take(&mut *mem);
-                let tombstones_cow: Arc<Vec<Tombstone>> = self
-                    .prefix_tombstones
-                    .read()
-                    .map_err(|_| IndexError::ReadLock)?
-                    .clone();
-                (snapshot, tombstones_cow)
-            };
-
-            wal.rotate(&flushing_path).map_err(IndexError::Io)?;
+            wal.rotate(&flushing_path)?;
 
             // Re-write tombstones to the WAL until a full compaction runs.
 
@@ -1245,7 +1246,7 @@ impl Index {
                 wal.write_prefix_tombstone(volume.as_deref(), prefix, *seq)?;
             }
 
-            snapshot
+            std::mem::take(&mut *self.mem_idx.write().map_err(|_| IndexError::WriteLock)?)
         };
 
         let base = Arc::clone(&self.base);
@@ -1532,6 +1533,14 @@ pub enum IndexError {
     Regex(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Wal(WalError),
+}
+
+impl From<WalError> for IndexError {
+    fn from(value: WalError) -> Self {
+        Self::Wal(value)
+    }
 }
 
 #[cfg(all(test, feature = "shuttle"))]
