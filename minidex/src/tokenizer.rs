@@ -187,16 +187,23 @@ pub(crate) const SYNTH_EXT_TOKEN_TAG: char = '\x02';
 pub(crate) fn synthesize_token(tag: char, orig: &str) -> String {
     // Exactly 1 byte for the tag + the byte length of the string
     let mut token = String::with_capacity(1 + orig.len());
-    token.push(tag);
+    write_synthesized_token(&mut token, tag, orig);
+    token
+}
+
+#[inline(always)]
+pub(crate) fn write_synthesized_token(buffer: &mut String, tag: char, orig: &str) {
+    buffer.clear();
+    buffer.reserve(1 + orig.len());
+    buffer.push(tag);
 
     if orig.is_ascii() {
         for &b in orig.as_bytes() {
-            token.push(b.to_ascii_lowercase() as char);
+            buffer.push(b.to_ascii_lowercase() as char);
         }
     } else {
-        token.extend(orig.chars().flat_map(|c| c.to_lowercase()));
+        buffer.extend(orig.chars().flat_map(|c| c.to_lowercase()));
     }
-    token
 }
 
 #[cfg(test)]

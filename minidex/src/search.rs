@@ -5,6 +5,8 @@ use crate::{Kind, common::VolumeType};
 mod scoring;
 pub use scoring::*;
 
+pub(crate) const EXACT_TERM_MATCH_BIT: u64 = 1 << 63;
+
 /// Search options, allowing filtering and custom scoring
 #[derive(Debug)]
 pub struct SearchOptions<'a> {
@@ -109,6 +111,7 @@ pub(crate) fn evaluate_candidate(
         last_modified
     };
 
+    // Bit 63 is left clear for `EXACT_TERM_MATCH_BIT`, which callers OR in for candidates the query matched exactly
     let sort_key = ((!depth & 0xFF) << 55) | (recent << 21) | is_dir;
 
     Some(sort_key)

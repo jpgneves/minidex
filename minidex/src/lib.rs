@@ -473,6 +473,9 @@ impl Index {
 
         tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
+        // Scratch buffer for the extension term looked up per query token
+        let mut extension_term = String::new();
+
         let segments = self.base.load().snapshot();
 
         let required_matches = limit + offset;
@@ -496,6 +499,8 @@ impl Index {
             let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
             let mut mem_candidates: Option<Vec<u32>> = None;
             let mut mem_intersect_buf = Vec::new();
+            // Store if we've found an exact term match
+            let mut mem_exact_matches = ExactMatches::new(mem.metadata.len());
 
             // In-memory searches
             if !tokens.is_empty() {
@@ -503,6 +508,26 @@ impl Index {
                     let is_first_token = mem_candidates.is_none();
 
                     let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
+
+                    // Skip exact matches that are due to extension
+                    // (e.g. do not treat `.doc` matching `doc` as an exact
+                    // term match)
+                    let extension_only = if is_exact {
+                        None
+                    } else {
+                        crate::tokenizer::write_synthesized_token(
+                            &mut extension_term,
+                            crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                            token,
+                        );
+                        mem.inverted_index.get(&extension_term).map(|ids| {
+                            let mut docs = ExactMatches::new(mem.metadata.len());
+                            for &id in ids {
+                                docs.set(id);
+                            }
+                            docs
+                        })
+                    };
 
                     let max_expansions = if is_first_token
                         && token.chars().count() <= options.short_prefix_threshold
@@ -525,7 +550,7 @@ impl Index {
 
                     let mut prefiltered_candidates = Vec::new();
 
-                    let mut process_ids = |ids: &[u32]| {
+                    let mut process_ids = |ids: &[u32], exact_term: bool| {
                         for &id in ids {
                             if let Some(existing) = mem_candidates.as_ref()
                                 && existing.binary_search(&id).is_err()
@@ -534,9 +559,15 @@ impl Index {
                             }
 
                             let metadata = mem.metadata[id as usize];
-                            if let Some(sort_key) =
+                            if let Some(mut sort_key) =
                                 evaluate_candidate(metadata, &options, volume_type_mask)
                             {
+                                if exact_term
+                                    && !extension_only.as_ref().is_some_and(|d| d.contains(id))
+                                {
+                                    sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                                    mem_exact_matches.set(id);
+                                }
                                 prefiltered_candidates.push((sort_key, id))
                             }
 
@@ -548,18 +579,18 @@ impl Index {
 
                     if is_exact {
                         if let Some(ids) = mem.inverted_index.get(token.as_str()) {
-                            process_ids(ids);
+                            process_ids(ids, true);
                         }
                     } else {
                         let mut end_bound = String::with_capacity(token.len() + 4);
                         end_bound.push_str(token);
                         end_bound.push('\u{FFFF}');
 
-                        for (_, ids) in mem.inverted_index.range::<str, _>((
+                        for (term, ids) in mem.inverted_index.range::<str, _>((
                             Bound::Included(token.as_str()),
                             Bound::Included(end_bound.as_str()),
                         )) {
-                            process_ids(ids);
+                            process_ids(ids, term == token);
 
                             term_count += 1;
                             docs_accumulated += ids.len();
@@ -620,6 +651,16 @@ impl Index {
                     }
                 }
 
+                // Rebuild the sort key from cached information if we've found
+                // this via an exact match term.
+                if mem_sortable.len() > scoring_cap {
+                    for (sort_key, id) in mem_sortable.iter_mut() {
+                        if mem_exact_matches.contains(*id) {
+                            *sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                        }
+                    }
+                }
+
                 // Top-K truncation in memory
                 crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
 
@@ -653,6 +694,10 @@ impl Index {
             let mut first_token = true;
             let mut valid_matches = true;
 
+            let segment_documents = segment.meta_map().len() / size_of::<u128>();
+            let mut segment_exact_matches = ExactMatches::new(segment_documents);
+            let map = segment.as_ref().as_ref();
+
             if let Some(ref vol_token) = vol_token {
                 let map = segment.as_ref().as_ref();
                 if let Some(post_offset) = map.get(vol_token) {
@@ -672,6 +717,23 @@ impl Index {
 
                 let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
+                // Same exclusion of exact matches from extensions as in
+                // the memory path
+                let extension_only = if is_exact {
+                    None
+                } else {
+                    crate::tokenizer::write_synthesized_token(
+                        &mut extension_term,
+                        crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                        token,
+                    );
+                    map.get(&extension_term).map(|offset| {
+                        let mut docs = ExactMatches::new(segment_documents);
+                        segment.for_each_posting_id(offset, |doc_id| docs.set(doc_id));
+                        docs
+                    })
+                };
+
                 let max_expansions = if first_token
                     && token.chars().count() <= options.short_prefix_threshold
                     && !is_exact
@@ -689,12 +751,11 @@ impl Index {
                     };
 
                 token_docs.clear();
-                let map = segment.as_ref().as_ref();
                 let mut term_count = 0;
 
                 let mut prefiltered_candidates = Vec::new();
 
-                let mut process_offset = |post_offset: u64| -> usize {
+                let mut process_offset = |post_offset: u64, exact_term: bool| -> usize {
                     segment.for_each_posting_id(post_offset, |doc_id| {
                         if !first_token && current_matches.binary_search(&doc_id).is_err() {
                             return;
@@ -710,9 +771,15 @@ impl Index {
                             }
                             .to_le();
 
-                            if let Some(sort_key) =
+                            if let Some(mut sort_key) =
                                 evaluate_candidate(packed_val, &options, volume_type_mask)
                             {
+                                if exact_term
+                                    && !extension_only.as_ref().is_some_and(|d| d.contains(doc_id))
+                                {
+                                    sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                                    segment_exact_matches.set(doc_id);
+                                }
                                 prefiltered_candidates.push((sort_key, doc_id));
 
                                 if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
@@ -729,14 +796,14 @@ impl Index {
 
                 if is_exact {
                     if let Some(post_offset) = map.get(token) {
-                        process_offset(post_offset);
+                        process_offset(post_offset, true);
                     }
                 } else {
                     let matcher = Str::new(token).starts_with();
                     let mut stream = map.search(&matcher).into_stream();
 
-                    while let Some((_, post_offset)) = stream.next() {
-                        let current_len = process_offset(post_offset);
+                    while let Some((term, post_offset)) = stream.next() {
+                        let current_len = process_offset(post_offset, term == token.as_bytes());
 
                         term_count += 1;
 
@@ -788,9 +855,12 @@ impl Index {
                     }
                     .to_le();
 
-                    if let Some(sort_key) =
+                    if let Some(mut sort_key) =
                         evaluate_candidate(packed_val, &options, volume_type_mask)
                     {
+                        if segment_exact_matches.contains(doc_id) {
+                            sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                        }
                         sortable_docs.push((sort_key, packed_val));
                     }
                 }
@@ -831,7 +901,12 @@ impl Index {
                         .min(0xFF) as u64;
                     let is_dir = (doc.2.kind == Kind::Directory) as u64;
                     let recent = doc.2.last_modified.max(doc.2.last_accessed) / 1_000_000;
-                    let sort_key = ((!depth & 0xFF) << 55) | (recent << 21) | is_dir;
+                    let mut sort_key = ((!depth & 0xFF) << 55) | (recent << 21) | is_dir;
+                    // This prune has the path rather than the matched terms, so exactness is
+                    // recovered by re-tokenizing it.
+                    if matches_a_query_token_exactly(&doc.0, &tokens) {
+                        sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                    }
                     (sort_key, doc)
                 })
                 .collect();
@@ -1519,6 +1594,56 @@ impl Drop for Index {
     }
 }
 
+/// Bitmap over document ids marking those an exactly-matching term reached.
+struct ExactMatches {
+    words: Vec<u64>,
+}
+
+impl ExactMatches {
+    fn new(documents: usize) -> Self {
+        Self {
+            words: vec![0; documents.div_ceil(64)],
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, doc_id: u32) {
+        let index = doc_id as usize;
+        if let Some(word) = self.words.get_mut(index / 64) {
+            *word |= 1 << (index % 64);
+        }
+    }
+
+    #[inline(always)]
+    fn contains(&self, doc_id: u32) -> bool {
+        let index = doc_id as usize;
+        self.words
+            .get(index / 64)
+            .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+}
+
+/// Whether any of `query_tokens` equals one of the path's own tokens outright, as opposed to merely
+/// prefixing a longer one.
+///
+/// A token matched only as the path's extension does not count: it describes the kind of file rather
+/// than what it is called, so `doc` is not an exact hit for every `.doc` in the index.
+///
+/// `query_tokens` may include the synthetic tokens the search appends; they need no filtering, since
+/// they are tagged with a leading control character and the path tokenizes to alphanumeric runs only,
+/// so they can never compare equal.
+fn matches_a_query_token_exactly(path: &str, query_tokens: &[String]) -> bool {
+    let path_tokens = crate::tokenizer::tokenize(path);
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase);
+
+    query_tokens.iter().any(|query| {
+        path_tokens.binary_search(query).is_ok() && extension.as_deref() != Some(query.as_str())
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("failed to open index on disk: {0}")]
@@ -1550,6 +1675,307 @@ mod concurrency_tests;
 mod tests {
     use super::*;
     use crate::common::{VolumeType, category};
+
+    /// A query that also prefixes an ancestor directory's name must still surface the files it names
+    /// exactly.
+    ///
+    /// The reported case: a home folder named `lennartuecker` searched for `LEN`. Every path beneath
+    /// the home folder matches, so the pre-scoring prune — which orders by depth — spends the whole
+    /// candidate budget on shallow folders. The photos tokenize to a whole `len` (the tokenizer splits
+    /// the alphabetic-to-numeric transition), so they match *exactly* where the folders only match by
+    /// prefix, and that is what has to keep them in contention. Exercised against both the in-memory
+    /// and the on-disk path, which prune separately.
+    #[test]
+    fn test_search_surfaces_exact_matches_under_prefix_matching_ancestor() -> Result<(), IndexError>
+    {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_exact_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let home = format!("{sep}Users{sep}lennartuecker");
+
+        let dir = |path: &str| FilesystemEntry {
+            path: PathBuf::from(path),
+            volume: "vol1".to_string(),
+            kind: Kind::Directory,
+            last_modified: 2_000_000_000,
+            last_accessed: 2_000_000_000,
+            category: category::OTHER,
+            volume_type: VolumeType::Local,
+        };
+
+        // Comfortably more shallow folders than the budget below can hold, so the prune has to choose
+        // between them and the photos.
+        let mut entries = vec![dir(&home)];
+        for i in 0..200 {
+            entries.push(dir(&format!("{home}{sep}Folder{i}")));
+        }
+
+        let photos: Vec<String> = ["LEN06139", "LEN06240", "LEN06284"]
+            .iter()
+            .map(|name| format!("{home}{sep}Pictures{sep}2026{sep}Utrecht{sep}{name}.jpg"))
+            .collect();
+        for photo in &photos {
+            entries.push(FilesystemEntry {
+                path: PathBuf::from(photo),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 2_000_000_000,
+                last_accessed: 2_000_000_000,
+                category: category::IMAGE,
+                volume_type: VolumeType::Local,
+            });
+        }
+
+        let index = Index::open(&temp_dir)?;
+        index.insert_batch(entries, 1000)?;
+
+        // The tight budget an unfiltered File Search query asks for.
+        let search = |index: &Index| -> Result<Vec<String>, IndexError> {
+            let options = SearchOptions {
+                max_scoring_cap: Some(50),
+                short_prefix_threshold: 1,
+                ..SearchOptions::default()
+            };
+            Ok(index
+                .search("LEN", 50, 0, options)?
+                .into_iter()
+                .map(|r| r.path.to_string_lossy().into_owned())
+                .collect())
+        };
+
+        let in_memory = search(&index)?;
+        index.flush()?;
+        let on_disk = search(&index)?;
+
+        // Both stages are reported together: they prune independently, so a fix reaching only one of
+        // them should not look like a pass.
+        let pruned: Vec<String> = [("in-memory", in_memory), ("on-disk", on_disk)]
+            .iter()
+            .flat_map(|(stage, found)| {
+                photos
+                    .iter()
+                    .filter(|p| !found.contains(p))
+                    .map(move |p| format!("{stage}: {p}"))
+            })
+            .collect();
+        assert!(
+            pruned.is_empty(),
+            "exact matches were pruned before scoring: {pruned:?}"
+        );
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// Promoting exact matches must not cost a *directory* its place: it is the query's relationship
+    /// to the token that matters, not whether the entry is a file.
+    #[test]
+    fn test_search_keeps_an_exactly_matching_directory_first() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_exactdir_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let root = format!("{sep}Users{sep}joao");
+        let wanted = format!("{root}{sep}Reports");
+
+        let mut entries = vec![FilesystemEntry {
+            path: PathBuf::from(&wanted),
+            volume: "vol1".to_string(),
+            kind: Kind::Directory,
+            last_modified: 2_000_000_000,
+            last_accessed: 2_000_000_000,
+            category: category::OTHER,
+            volume_type: VolumeType::Local,
+        }];
+        // Deep files that also match `reports` exactly, and outnumber the budget.
+        for i in 0..300 {
+            entries.push(FilesystemEntry {
+                path: PathBuf::from(format!(
+                    "{root}{sep}Archive{sep}Deep{sep}Nested{sep}reports_{i}.txt"
+                )),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 2_000_000_000,
+                last_accessed: 2_000_000_000,
+                category: category::TEXT,
+                volume_type: VolumeType::Local,
+            });
+        }
+
+        let index = Index::open(&temp_dir)?;
+        index.insert_batch(entries, 1000)?;
+        index.flush()?;
+
+        let options = SearchOptions {
+            max_scoring_cap: Some(50),
+            short_prefix_threshold: 1,
+            ..SearchOptions::default()
+        };
+        let found: Vec<String> = index
+            .search("reports", 50, 0, options)?
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some(wanted.as_str()),
+            "the exactly-matching directory lost its place"
+        );
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// An extension is not a name: matching it must not spend the candidate budget.
+    ///
+    /// Searching `doc` with a few hundred `.doc` files indexed, every one of them matches the token
+    /// `doc` exactly — via its extension. Treating those as exact hits fills the budget and prunes the
+    /// `Documents` folder, which matches only by prefix but is far more likely what was meant. The
+    /// `.doc` files still match and are still returned; they simply do not win the promotion.
+    #[test]
+    fn test_search_does_not_treat_an_extension_as_an_exact_name_match() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_ext_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let root = format!("{sep}Users{sep}joao");
+        let wanted = format!("{root}{sep}Documents");
+
+        let mut entries = vec![FilesystemEntry {
+            path: PathBuf::from(&wanted),
+            volume: "vol1".to_string(),
+            kind: Kind::Directory,
+            last_modified: 2_000_000_000,
+            last_accessed: 2_000_000_000,
+            category: category::OTHER,
+            volume_type: VolumeType::Local,
+        }];
+        for i in 0..400 {
+            entries.push(FilesystemEntry {
+                path: PathBuf::from(format!(
+                    "{root}{sep}Archive{sep}Deep{sep}Nested{sep}file{i}.doc"
+                )),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 2_000_000_000,
+                last_accessed: 2_000_000_000,
+                category: category::DOCUMENT,
+                volume_type: VolumeType::Local,
+            });
+        }
+
+        let index = Index::open(&temp_dir)?;
+        index.insert_batch(entries, 1000)?;
+        index.flush()?;
+
+        let options = SearchOptions {
+            max_scoring_cap: Some(50),
+            short_prefix_threshold: 1,
+            ..SearchOptions::default()
+        };
+        let found: Vec<String> = index
+            .search("doc", 50, 0, options)?
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some(wanted.as_str()),
+            "the folder the query more plausibly meant was pruned by extension matches"
+        );
+        assert!(
+            found.iter().any(|p| p.ends_with(".doc")),
+            "the extension matches should still be returned, just not promoted"
+        );
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// Discounting extensions must stay precise: a *stem* that happens to equal a common extension is
+    /// still the file's name, and still an exact match.
+    #[test]
+    fn test_search_promotes_a_stem_that_equals_a_common_extension() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_stem_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let root = format!("{sep}Users{sep}joao");
+        let nested = format!("{root}{sep}Archive{sep}Deep{sep}Nested");
+        let wanted = format!("{nested}{sep}doc.txt");
+
+        let mut entries = Vec::new();
+        for i in 0..400 {
+            entries.push(FilesystemEntry {
+                path: PathBuf::from(format!("{nested}{sep}file{i}.doc")),
+                volume: "vol1".to_string(),
+                kind: Kind::File,
+                last_modified: 2_000_000_000,
+                last_accessed: 2_000_000_000,
+                category: category::DOCUMENT,
+                volume_type: VolumeType::Local,
+            });
+        }
+        entries.push(FilesystemEntry {
+            path: PathBuf::from(&wanted),
+            volume: "vol1".to_string(),
+            kind: Kind::File,
+            last_modified: 2_000_000_000,
+            last_accessed: 2_000_000_000,
+            category: category::TEXT,
+            volume_type: VolumeType::Local,
+        });
+
+        let index = Index::open(&temp_dir)?;
+        index.insert_batch(entries, 1000)?;
+        index.flush()?;
+
+        let options = SearchOptions {
+            max_scoring_cap: Some(50),
+            short_prefix_threshold: 1,
+            ..SearchOptions::default()
+        };
+        let found: Vec<String> = index
+            .search("doc", 50, 0, options)?
+            .into_iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some(wanted.as_str()),
+            "a file actually named `doc` lost to files that merely end in `.doc`"
+        );
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// The exactness check is handed the query's whole token list, synthetic tokens included, on the
+    /// grounds that a tagged token can never equal one produced by tokenizing a path. Guard it.
+    #[test]
+    fn test_synthetic_tokens_never_match_a_path_token() {
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let path = format!("{sep}Users{sep}joao{sep}report.doc");
+
+        let extension_token =
+            crate::tokenizer::synthesize_token(crate::tokenizer::SYNTH_EXT_TOKEN_TAG, "doc");
+        assert!(
+            !matches_a_query_token_exactly(&path, &[extension_token]),
+            "a tagged token compared equal to a path token, so the token list needs filtering"
+        );
+
+        // The untagged spelling of the same term is still subject to the extension rule.
+        assert!(!matches_a_query_token_exactly(&path, &["doc".to_string()]));
+        // ...while the stem is a genuine exact match.
+        assert!(matches_a_query_token_exactly(
+            &path,
+            &["report".to_string()]
+        ));
+    }
 
     #[test]
     fn test_index_basic_lifecycle() -> Result<(), IndexError> {
