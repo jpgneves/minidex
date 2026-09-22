@@ -53,10 +53,33 @@ pub(crate) fn lower_thread_io_prio() {
     #[cfg(target_os = "windows")]
     {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            GetCurrentThread, SetThreadInformation, SetThreadPriority,
+            THREAD_MODE_BACKGROUND_BEGIN, THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            THREAD_POWER_THROTTLING_EXECUTION_SPEED, THREAD_POWER_THROTTLING_STATE,
+            ThreadPowerThrottling,
         };
         unsafe {
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL as i32);
+            let thread = GetCurrentThread();
+
+            if SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) == 0 {
+                let err = std::io::Error::last_os_error();
+                log::warn!("failed to set background thread priority: {err}");
+            }
+            let state = THREAD_POWER_THROTTLING_STATE {
+                Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+                StateMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            };
+            if SetThreadInformation(
+                thread,
+                ThreadPowerThrottling,
+                &state as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+            ) == 0
+            {
+                let err = std::io::Error::last_os_error();
+                log::warn!("failed to set EcoQoS thread state: {err}");
+            }
         }
     }
     #[cfg(target_os = "linux")]
