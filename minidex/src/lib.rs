@@ -1212,8 +1212,22 @@ impl Index {
         let snapshot = {
             let segments = self.base.load().snapshot();
 
-            // If we have 1 or 0 segments, the database is already perfectly compacted!
-            if segments.len() <= 1 {
+            // If we have 0 segments, we can clear the tombstones as the preceding flush already cleared the memtable
+            if segments.is_empty() {
+                *self
+                    .prefix_tombstones
+                    .write()
+                    .map_err(|_| IndexError::WriteLock)? = Arc::new(Vec::new());
+                return Ok(());
+            }
+            // If we have 1 segment, and no tombstones recorded, the database is already perfectly compacted
+            if segments.len() == 1
+                && self
+                    .prefix_tombstones
+                    .read()
+                    .map_err(|_| IndexError::ReadLock)?
+                    .is_empty()
+            {
                 log::debug!("Database is already fully compacted.");
                 return Ok(());
             }

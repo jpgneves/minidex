@@ -20,8 +20,6 @@ use thiserror::Error;
 pub(crate) mod compactor;
 mod utils;
 
-pub(crate) type DocumentId = u32;
-
 const LOCK_FILE: &str = ".minidex.lock";
 
 /// FTS mapping tokens to posting offsets
@@ -476,13 +474,117 @@ impl SegmentedIndex {
         let mut seg_writer = BufWriter::with_capacity(capacity, File::create(&seg_path)?);
         let mut meta_writer = BufWriter::new(File::create(&meta_path)?);
 
-        let mut inverted_index: BTreeMap<String, Vec<DocumentId>> = BTreeMap::new();
+        let mut inverted_index: BTreeMap<String, (u32, u32, Vec<u8>)> = BTreeMap::new();
 
-        let mut items_vec = Vec::new();
+        const SAMPLE_WINDOW: usize = 100 * 1000;
+        let mut pending: Vec<(String, String, IndexEntry, Vec<u8>)> = Vec::new();
         let mut samples = Vec::new();
         let mut sample_sizes = Vec::new();
 
-        let build_dict = existing_dict.is_none();
+        let mut current_dat_offset = 0u64;
+        let mut doc_id_counter: u32 = 0;
+        let mut compressor: Option<zstd::bulk::Compressor<'static>> = None;
+        let mut dict_ready = false;
+
+        let start = |dict: Vec<u8>,
+                     dat_writer: &mut BufWriter<File>,
+                     current_dat_offset: &mut u64,
+                     compressor: &mut Option<zstd::bulk::Compressor<'static>>|
+         -> Result<(), SegmentedIndexError> {
+            dat_writer.write_all(DATA_MAGIC)?;
+            dat_writer.write_all(&(dict.len() as u32).to_le_bytes())?;
+            dat_writer.write_all(&dict)?;
+
+            *current_dat_offset = (DATA_MAGIC.len() + size_of::<u32>() + dict.len()) as u64;
+            *compressor = if !dict.is_empty() {
+                Some(
+                    zstd::bulk::Compressor::with_dictionary(0, &dict)
+                        .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?,
+                )
+            } else {
+                None
+            };
+            Ok(())
+        };
+
+        let write_record = |path_ref: &str,
+                            volume_ref: &str,
+                            entry: &IndexEntry,
+                            serialized: &[u8],
+                            dat_writer: &mut BufWriter<File>,
+                            meta_writer: &mut BufWriter<File>,
+                            compressor: &mut Option<zstd::bulk::Compressor<'static>>,
+                            inverted_index: &mut BTreeMap<String, (u32, u32, Vec<u8>)>,
+                            current_dat_offset: &mut u64,
+                            doc_id_counter: &mut u32|
+         -> Result<(), SegmentedIndexError> {
+            let compressed = if let Some(comp) = compressor.as_mut() {
+                let max_size = serialized.len() + (serialized.len() / 16) + 64;
+                let mut out = vec![0u8; max_size];
+                let size = comp
+                    .compress_to_buffer(serialized, &mut out)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?;
+                out.truncate(size);
+                out
+            } else {
+                zstd::encode_all(serialized, 0)
+                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?
+            };
+
+            dat_writer.write_all(&(compressed.len() as u32).to_le_bytes())?;
+            dat_writer.write_all(&compressed)?;
+
+            // Pack u128 metadata
+            let depth = path_ref
+                .as_bytes()
+                .iter()
+                .filter(|&&b| b == std::path::MAIN_SEPARATOR as u8)
+                .count() as u16;
+            let is_dir = entry.kind == Kind::Directory;
+
+            let packed_meta = Self::pack_u128(
+                *current_dat_offset,
+                entry.last_modified / 1_000_000,
+                entry.last_accessed / 1_000_000,
+                depth,
+                is_dir,
+                entry.category,
+                entry.volume_type as u8,
+            );
+
+            meta_writer.write_all(&packed_meta.to_le_bytes())?;
+            for token in crate::tokenizer::extract_all_tokens(path_ref, volume_ref) {
+                let (count, last, bytes) = inverted_index.entry(token).or_default();
+                let mut val = *doc_id_counter - *last;
+                *last = *doc_id_counter;
+                *count += 1;
+                loop {
+                    let mut byte = (val & 0x7F) as u8;
+                    val >>= 7;
+                    if val != 0 {
+                        byte |= 0x80;
+                        bytes.push(byte);
+                    } else {
+                        bytes.push(byte);
+                        break;
+                    }
+                }
+            }
+
+            *current_dat_offset += (size_of::<u32>() + compressed.len()) as u64;
+            *doc_id_counter += 1;
+            Ok(())
+        };
+
+        if let Some(d) = existing_dict {
+            start(
+                d.to_vec(),
+                &mut dat_writer,
+                &mut current_dat_offset,
+                &mut compressor,
+            )?;
+            dict_ready = true;
+        }
 
         for (loop_counter, (path, volume, entry)) in (0_usize..).zip(items) {
             if loop_counter.is_multiple_of(500) {
@@ -512,93 +614,87 @@ impl SegmentedIndex {
             serialized.extend_from_slice(volume_bytes);
             serialized.extend_from_slice(&entry_bytes);
 
-            // Sample records only if we need to build a new dictionary
-            if build_dict && items_vec.len() % 100 == 0 && sample_sizes.len() < 1000 {
+            // If the dictionary is ready we can skip sampling
+            if dict_ready {
+                write_record(
+                    path_ref,
+                    volume_ref,
+                    &entry,
+                    &serialized,
+                    &mut dat_writer,
+                    &mut meta_writer,
+                    &mut compressor,
+                    &mut inverted_index,
+                    &mut current_dat_offset,
+                    &mut doc_id_counter,
+                )?;
+                continue;
+            }
+            if pending.len().is_multiple_of(100) && sample_sizes.len() < 1000 {
                 samples.extend_from_slice(&serialized);
                 sample_sizes.push(serialized.len());
             }
 
-            items_vec.push((
+            pending.push((
                 path_ref.to_owned(),
                 volume_ref.to_owned(),
                 entry,
                 serialized,
             ));
+
+            if pending.len() == SAMPLE_WINDOW {
+                let dict = zstd::dict::from_continuous(&samples, &sample_sizes, 40 * 1024)
+                    .unwrap_or_default();
+                start(
+                    dict,
+                    &mut dat_writer,
+                    &mut current_dat_offset,
+                    &mut compressor,
+                )?;
+                dict_ready = true;
+                for (p, v, e, ser) in pending.drain(..) {
+                    write_record(
+                        &p,
+                        &v,
+                        &e,
+                        &ser,
+                        &mut dat_writer,
+                        &mut meta_writer,
+                        &mut compressor,
+                        &mut inverted_index,
+                        &mut current_dat_offset,
+                        &mut doc_id_counter,
+                    )?;
+                }
+            }
         }
 
-        let dict = if let Some(d) = existing_dict {
-            d.to_vec()
-        } else if !samples.is_empty() {
-            // Use a smaller dictionary size to speed up training
-            zstd::dict::from_continuous(&samples, &sample_sizes, 40 * 1024).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        dat_writer.write_all(DATA_MAGIC)?;
-        dat_writer.write_all(&(dict.len() as u32).to_le_bytes())?;
-        dat_writer.write_all(&dict)?;
-
-        let mut current_dat_offset = (DATA_MAGIC.len() + size_of::<u32>() + dict.len()) as u64;
-        let mut doc_id_counter: u32 = 0;
-
-        let mut compressor = if !dict.is_empty() {
-            Some(
-                zstd::bulk::Compressor::with_dictionary(0, &dict)
-                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?,
-            )
-        } else {
-            None
-        };
-
-        for (path_ref, volume_ref, entry, serialized) in items_vec {
-            let compressed = if let Some(ref mut comp) = compressor {
-                // Use a safe bound for compression
-                let max_size = serialized.len() + (serialized.len() / 16) + 64;
-                let mut out = vec![0u8; max_size];
-                let size = comp
-                    .compress_to_buffer(&serialized, &mut out)
-                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?;
-                out.truncate(size);
-                out
+        if !dict_ready {
+            let dict = if !samples.is_empty() {
+                zstd::dict::from_continuous(&samples, &sample_sizes, 40 * 1024).unwrap_or_default()
             } else {
-                zstd::encode_all(&serialized[..], 0)
-                    .map_err(|e| SegmentedIndexError::Io(std::io::Error::other(e)))?
+                Vec::new()
             };
-
-            dat_writer.write_all(&(compressed.len() as u32).to_le_bytes())?;
-            dat_writer.write_all(&compressed)?;
-
-            // Pack u128 metadata
-            let depth = path_ref
-                .as_bytes()
-                .iter()
-                .filter(|&&b| b == std::path::MAIN_SEPARATOR as u8)
-                .count() as u16;
-            let is_dir = entry.kind == Kind::Directory;
-
-            let packed_meta = Self::pack_u128(
-                current_dat_offset,
-                entry.last_modified / 1_000_000,
-                entry.last_accessed / 1_000_000,
-                depth,
-                is_dir,
-                entry.category,
-                entry.volume_type as u8,
-            );
-
-            meta_writer.write_all(&packed_meta.to_le_bytes())?;
-
-            let tokens = crate::tokenizer::extract_all_tokens(&path_ref, &volume_ref);
-            for token in tokens {
-                inverted_index
-                    .entry(token)
-                    .or_default()
-                    .push(doc_id_counter);
+            start(
+                dict,
+                &mut dat_writer,
+                &mut current_dat_offset,
+                &mut compressor,
+            )?;
+            for (p, v, e, ser) in pending.drain(..) {
+                write_record(
+                    &p,
+                    &v,
+                    &e,
+                    &ser,
+                    &mut dat_writer,
+                    &mut meta_writer,
+                    &mut compressor,
+                    &mut inverted_index,
+                    &mut current_dat_offset,
+                    &mut doc_id_counter,
+                )?;
             }
-
-            current_dat_offset += (size_of::<u32>() + compressed.len()) as u64;
-            doc_id_counter += 1
         }
 
         dat_writer
@@ -610,35 +706,14 @@ impl SegmentedIndex {
             fst::MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
 
         let mut current_post_offset = 0u64;
-        let mut compressed_buffer = Vec::new();
 
-        for (fst_loop_counter, (token, doc_offsets)) in (0_usize..).zip(inverted_index) {
+        for (fst_loop_counter, (token, (count, _, compressed_buffer))) in
+            (0_usize..).zip(inverted_index)
+        {
             if fst_loop_counter.is_multiple_of(1000) {
                 crate::sync::thread::yield_now();
             }
-
-            compressed_buffer.clear();
-            let mut last_id = 0u32;
-
-            for &offset in &doc_offsets {
-                let delta = offset - last_id;
-                last_id = offset;
-                let mut val = delta;
-
-                loop {
-                    let mut byte = (val & 0x7F) as u8;
-                    val >>= 7;
-                    if val != 0 {
-                        byte |= 0x80;
-                        compressed_buffer.push(byte);
-                    } else {
-                        compressed_buffer.push(byte);
-                        break;
-                    }
-                }
-            }
-
-            post_writer.write_all(&(doc_offsets.len() as u32).to_le_bytes())?;
+            post_writer.write_all(&count.to_le_bytes())?;
             post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
             post_writer.write_all(&compressed_buffer)?;
 
