@@ -1361,7 +1361,7 @@ impl Index {
         let flusher = crate::sync::thread::Builder::new()
             .name("minidex-flush".to_owned())
             .spawn(move || {
-                crate::sync::lower_thread_io_prio();
+                crate::sync::flush_thread_prio();
                 let final_segment_path = path.join(format!("{}", next_seq));
                 let tmp_segment_path = path.join(format!("{}.tmp", next_seq));
 
