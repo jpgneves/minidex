@@ -1,5 +1,11 @@
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
+/// Tokenizer version, must be bumped when the tokenization changes, as
+/// the merging now reuses postings of segments with the current version
+/// and re-tokenizes all other segments, otherwise existing documents
+/// will not be visible.
+pub(crate) const TOKENIZER_VERSION: u32 = 1;
+
 /// A basic Unicode-aware tokenizer.
 pub fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();

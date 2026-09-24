@@ -5,6 +5,8 @@ use crate::{entry::IndexEntry, is_tombstoned, segmented_index::SegmentedIndexErr
 
 use super::{Segment, SegmentedIndex};
 
+type Source = (usize, (String, String, IndexEntry));
+
 /// Configuration for compaction
 #[derive(Debug, Clone, Copy)]
 pub struct CompactorConfig {
@@ -88,10 +90,12 @@ pub(crate) fn merge_segments(
     prefix_tombstones: Arc<Vec<(Option<String>, String, u64)>>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
-    let mut iterators: Vec<_> = segments.iter().map(|seg| seg.documents()).collect();
+    let mut iterators: Vec<_> = segments
+        .iter()
+        .map(|seg| seg.documents().enumerate())
+        .collect();
 
-    let mut currents: Vec<Option<(String, String, IndexEntry)>> =
-        iterators.iter_mut().map(|iter| iter.next()).collect();
+    let mut currents: Vec<Option<Source>> = iterators.iter_mut().map(|iter| iter.next()).collect();
 
     let merged_iterator = std::iter::from_fn(move || {
         loop {
@@ -99,11 +103,11 @@ pub(crate) fn merge_segments(
             let mut min_idx = None;
 
             for i in 0..currents.len() {
-                if let Some((path_i, _, _)) = &currents[i] {
+                if let Some((_, (path_i, _, _))) = &currents[i] {
                     min_idx = match min_idx {
                         None => Some(i), // We're the first
                         Some(idx) => {
-                            let (path_min, _, _) = currents[idx].as_ref().unwrap();
+                            let (_, (path_min, _, _)) = currents[idx].as_ref().unwrap();
                             if path_i < path_min {
                                 Some(i)
                             } else {
@@ -117,7 +121,8 @@ pub(crate) fn merge_segments(
             // If we've exhausted all iterators, merge completed.
             let target_idx = min_idx?;
 
-            let mut best_item = currents[target_idx].take().unwrap();
+            let (best_old_id, mut best_item) = currents[target_idx].take().unwrap();
+            let mut best_source = (target_idx, best_old_id);
 
             // Refill the head with the next one.
             currents[target_idx] = iterators[target_idx].next();
@@ -125,9 +130,9 @@ pub(crate) fn merge_segments(
             // Check all other heads for the exact same path.
             // If they are the same, consume and resolve opstamp ties.
             for i in 0..currents.len() {
-                while let Some((path, _, _)) = &currents[i] {
+                while let Some((_, (path, _, _))) = &currents[i] {
                     if *path == best_item.0 {
-                        let item = currents[i].take().unwrap();
+                        let (old_id, item) = currents[i].take().unwrap();
 
                         // Check for tombstones
                         let path_bytes = item.0.as_bytes();
@@ -140,6 +145,7 @@ pub(crate) fn merge_segments(
 
                         if !is_dead && item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
                             best_item = item;
+                            best_source = (i, old_id);
                         }
 
                         // Refill the head on the consumed iterator
@@ -162,7 +168,8 @@ pub(crate) fn merge_segments(
                 continue;
             }
 
-            break Some(best_item);
+            let (path, volume, entry) = best_item;
+            break Some((path, volume, entry, Some(best_source)));
         }
     });
 
@@ -172,7 +179,20 @@ pub(crate) fn merge_segments(
     // avoids expensive training on every compaction.
     let existing_dict = segments.first().and_then(|s| s.dict.as_deref());
 
-    SegmentedIndex::build_segment_files(&out, merged_iterator, true, existing_dict)
+    // Remap postings when the source tokenizer version matches the
+    // current one, otherwise retokenize.
+    let merge_sources = segments
+        .iter()
+        .all(|seg| seg.has_current_tokens())
+        .then_some(segments);
+
+    SegmentedIndex::build_segment_files_with(
+        &out,
+        merged_iterator,
+        true,
+        existing_dict,
+        merge_sources,
+    )
 }
 
 #[cfg(test)]

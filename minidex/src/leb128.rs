@@ -41,3 +41,17 @@ impl Iterator for DeltaLeb128Iterator<'_> {
         Some(self.current_doc_id)
     }
 }
+
+pub(crate) fn push_leb128(out: &mut Vec<u8>, mut val: u32) {
+    loop {
+        let mut byte = (val & 0x7F) as u8;
+        val >>= 7;
+        if val != 0 {
+            byte |= 0x80;
+            out.push(byte);
+        } else {
+            out.push(byte);
+            break;
+        }
+    }
+}

@@ -6,14 +6,17 @@ use std::{
     io::{BufWriter, Write},
 };
 
-use crate::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use crate::{
+    Kind, Path, PathBuf,
+    entry::IndexEntry,
+    leb128::DeltaLeb128Iterator,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
-
-use crate::{Kind, Path, PathBuf, entry::IndexEntry, leb128::DeltaLeb128Iterator};
 use fs4::fs_std::FileExt;
-use fst::Map;
+use fst::{Map, Streamer};
 use memmap2::Mmap;
 use thiserror::Error;
 
@@ -31,7 +34,15 @@ const POST_EXT: &str = "post";
 /// Flat array of 16-byte u128 integers containing document IDs
 const META_EXT: &str = "meta";
 
+/// Data files magic number
 const DATA_MAGIC: &[u8; 4] = b"zMDX";
+
+/// Postings file magic number
+const POSTINGS_HEADER_MAGIC: &[u8; 4] = b"mDXP";
+/// Postings header length, which includes the tokenizer version
+const POSTINGS_HEADER_LEN: u64 = 2 * size_of::<u32>() as u64;
+
+type PendingEntry = (String, String, IndexEntry, Vec<u8>, Option<(usize, usize)>);
 
 /// A live index segment
 pub(crate) struct Segment {
@@ -42,6 +53,7 @@ pub(crate) struct Segment {
     meta: Option<Mmap>,
     path: PathBuf,
     deleted: AtomicBool,
+    tokenizer_version: Option<u32>,
 }
 
 impl Segment {
@@ -97,6 +109,8 @@ impl Segment {
             meta.advise(memmap2::Advice::Random)?;
         }
 
+        let tokenizer_version = Self::read_postings_header(&post);
+
         Ok(Self {
             map: Some(map),
             data: Some(data),
@@ -105,7 +119,24 @@ impl Segment {
             meta: Some(meta),
             path,
             deleted: AtomicBool::new(false),
+            tokenizer_version,
         })
+    }
+
+    fn read_postings_header(post: &[u8]) -> Option<u32> {
+        let header = post.get(..POSTINGS_HEADER_LEN as usize)?;
+        let (magic, version) = header.split_at(size_of::<u32>());
+        (magic == POSTINGS_HEADER_MAGIC).then(|| {
+            u32::from_le_bytes(
+                version
+                    .try_into()
+                    .expect("failed to parse tokenizer version from header"),
+            )
+        })
+    }
+
+    pub(crate) fn has_current_tokens(&self) -> bool {
+        self.tokenizer_version == Some(crate::tokenizer::TOKENIZER_VERSION)
     }
 
     fn open_file_with_random_access(path: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -465,6 +496,31 @@ impl SegmentedIndex {
         I: IntoIterator<Item = (S, S, IndexEntry)>,
         S: AsRef<str>,
     {
+        let items = items
+            .into_iter()
+            .map(|(path, volume, entry)| (path, volume, entry, None));
+        Self::build_segment_files_with(out_path, items, drop_deletions, existing_dict, None)
+    }
+
+    pub(crate) fn build_segment_files_with<I, S>(
+        out_path: &Path,
+        items: I,
+        drop_deletions: bool,
+        existing_dict: Option<&[u8]>,
+        merge_sources: Option<&[Arc<Segment>]>,
+    ) -> Result<u64, SegmentedIndexError>
+    where
+        I: IntoIterator<Item = (S, S, IndexEntry, Option<(usize, usize)>)>,
+        S: AsRef<str>,
+    {
+        let tokenize = merge_sources.is_none();
+        let mut remap: Vec<Vec<u32>> = merge_sources.map_or_else(Vec::new, |sources| {
+            sources
+                .iter()
+                .map(|seg| vec![u32::MAX; seg.meta_map().len() / 16])
+                .collect()
+        });
+
         let (seg_path, dat_path, post_path, meta_path) =
             Segment::paths_with_additional_extension(out_path);
 
@@ -477,7 +533,7 @@ impl SegmentedIndex {
         let mut inverted_index: BTreeMap<String, (u32, u32, Vec<u8>)> = BTreeMap::new();
 
         const SAMPLE_WINDOW: usize = 100 * 1000;
-        let mut pending: Vec<(String, String, IndexEntry, Vec<u8>)> = Vec::new();
+        let mut pending: Vec<PendingEntry> = Vec::new();
         let mut samples = Vec::new();
         let mut sample_sizes = Vec::new();
 
@@ -516,7 +572,9 @@ impl SegmentedIndex {
                             compressor: &mut Option<zstd::bulk::Compressor<'static>>,
                             inverted_index: &mut BTreeMap<String, (u32, u32, Vec<u8>)>,
                             current_dat_offset: &mut u64,
-                            doc_id_counter: &mut u32|
+                            doc_id_counter: &mut u32,
+                            source: Option<(usize, usize)>,
+                            remap: &mut Vec<Vec<u32>>|
          -> Result<(), SegmentedIndexError> {
             let compressed = if let Some(comp) = compressor.as_mut() {
                 let max_size = serialized.len() + (serialized.len() / 16) + 64;
@@ -553,22 +611,24 @@ impl SegmentedIndex {
             );
 
             meta_writer.write_all(&packed_meta.to_le_bytes())?;
-            for token in crate::tokenizer::extract_all_tokens(path_ref, volume_ref) {
+
+            let tokens = if tokenize {
+                crate::tokenizer::extract_all_tokens(path_ref, volume_ref)
+            } else {
+                Vec::new()
+            };
+
+            for token in tokens {
                 let (count, last, bytes) = inverted_index.entry(token).or_default();
-                let mut val = *doc_id_counter - *last;
+                crate::leb128::push_leb128(bytes, *doc_id_counter - *last);
                 *last = *doc_id_counter;
                 *count += 1;
-                loop {
-                    let mut byte = (val & 0x7F) as u8;
-                    val >>= 7;
-                    if val != 0 {
-                        byte |= 0x80;
-                        bytes.push(byte);
-                    } else {
-                        bytes.push(byte);
-                        break;
-                    }
-                }
+            }
+
+            if let Some((segment, old_id)) = source
+                && let Some(table) = remap.get_mut(segment)
+            {
+                table[old_id] = *doc_id_counter
             }
 
             *current_dat_offset += (size_of::<u32>() + compressed.len()) as u64;
@@ -586,7 +646,7 @@ impl SegmentedIndex {
             dict_ready = true;
         }
 
-        for (loop_counter, (path, volume, entry)) in (0_usize..).zip(items) {
+        for (loop_counter, (path, volume, entry, source)) in (0_usize..).zip(items) {
             if loop_counter.is_multiple_of(500) {
                 crate::sync::thread::yield_now();
             }
@@ -627,6 +687,8 @@ impl SegmentedIndex {
                     &mut inverted_index,
                     &mut current_dat_offset,
                     &mut doc_id_counter,
+                    source,
+                    &mut remap,
                 )?;
                 continue;
             }
@@ -640,6 +702,7 @@ impl SegmentedIndex {
                 volume_ref.to_owned(),
                 entry,
                 serialized,
+                source,
             ));
 
             if pending.len() == SAMPLE_WINDOW {
@@ -652,7 +715,7 @@ impl SegmentedIndex {
                     &mut compressor,
                 )?;
                 dict_ready = true;
-                for (p, v, e, ser) in pending.drain(..) {
+                for (p, v, e, ser, src) in pending.drain(..) {
                     write_record(
                         &p,
                         &v,
@@ -664,6 +727,8 @@ impl SegmentedIndex {
                         &mut inverted_index,
                         &mut current_dat_offset,
                         &mut doc_id_counter,
+                        src,
+                        &mut remap,
                     )?;
                 }
             }
@@ -681,7 +746,7 @@ impl SegmentedIndex {
                 &mut current_dat_offset,
                 &mut compressor,
             )?;
-            for (p, v, e, ser) in pending.drain(..) {
+            for (p, v, e, ser, src) in pending.drain(..) {
                 write_record(
                     &p,
                     &v,
@@ -693,6 +758,8 @@ impl SegmentedIndex {
                     &mut inverted_index,
                     &mut current_dat_offset,
                     &mut doc_id_counter,
+                    src,
+                    &mut remap,
                 )?;
             }
         }
@@ -705,23 +772,104 @@ impl SegmentedIndex {
         let mut seg_builder =
             fst::MapBuilder::new(&mut seg_writer).map_err(SegmentedIndexError::Fst)?;
 
-        let mut current_post_offset = 0u64;
+        post_writer.write_all(POSTINGS_HEADER_MAGIC)?;
+        post_writer.write_all(&crate::tokenizer::TOKENIZER_VERSION.to_le_bytes())?;
+        let mut current_post_offset = POSTINGS_HEADER_LEN;
 
-        for (fst_loop_counter, (token, (count, _, compressed_buffer))) in
-            (0_usize..).zip(inverted_index)
-        {
-            if fst_loop_counter.is_multiple_of(1000) {
-                crate::sync::thread::yield_now();
+        if let Some(sources) = merge_sources {
+            let mut op = fst::map::OpBuilder::new();
+
+            for seg in sources {
+                op = op.add(seg.map.as_ref().expect("segment map loaded"));
             }
-            post_writer.write_all(&count.to_le_bytes())?;
-            post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
-            post_writer.write_all(&compressed_buffer)?;
+            // Tokens are yielded in byte order, same ordering as the BTreeMap
+            // path writes
+            let mut union = op.union();
+            let mut ids: Vec<u32> = Vec::new();
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut loop_counter: usize = 0;
 
-            seg_builder
-                .insert(token, current_post_offset)
-                .map_err(SegmentedIndexError::Fst)?;
+            while let Some((token, hits)) = union.next() {
+                loop_counter += 1;
+                if loop_counter.is_multiple_of(1000) {
+                    crate::sync::thread::yield_now();
+                }
+                ids.clear();
+                for hit in hits {
+                    let post = sources[hit.index].post.as_ref().expect("postings loaded");
+                    let offset = hit.value as usize;
+                    let len = post
+                        .get(offset + size_of::<u32>()..offset + 2 * size_of::<u32>())
+                        .ok_or_else(|| {
+                            SegmentedIndexError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "postings out of bounds in a merge source",
+                            ))
+                        })?;
+                    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+                    let start = offset + 2 * size_of::<u32>();
+                    let encoded = post.get(start..start + len).ok_or_else(|| {
+                        SegmentedIndexError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "postings out of bounds in a merge source",
+                        ))
+                    })?;
+                    let table = &remap[hit.index];
 
-            current_post_offset += (2 * size_of::<u32>() as u64) + compressed_buffer.len() as u64;
+                    for old in DeltaLeb128Iterator::new(encoded) {
+                        match table.get(old as usize) {
+                            Some(&new) if new != u32::MAX => ids.push(new),
+                            Some(_) => {}
+                            None => {
+                                return Err(SegmentedIndexError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "postings mapped to a missing posting",
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                // Every document with this token was dropped by the merge
+                if ids.is_empty() {
+                    continue;
+                }
+
+                // K-way merge of sources via ascending source IDs
+                ids.sort_unstable();
+                bytes.clear();
+                let mut last: u32 = 0;
+
+                for &id in &ids {
+                    crate::leb128::push_leb128(&mut bytes, id - last);
+                    last = id;
+                }
+                post_writer.write_all(&(ids.len() as u32).to_le_bytes())?;
+                post_writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                post_writer.write_all(&bytes)?;
+                seg_builder
+                    .insert(token, current_post_offset)
+                    .map_err(SegmentedIndexError::Fst)?;
+                current_post_offset += (2 * size_of::<u32>() as u64) + bytes.len() as u64;
+            }
+        } else {
+            for (fst_loop_counter, (token, (count, _, compressed_buffer))) in
+                (0_usize..).zip(inverted_index)
+            {
+                if fst_loop_counter.is_multiple_of(1000) {
+                    crate::sync::thread::yield_now();
+                }
+                post_writer.write_all(&count.to_le_bytes())?;
+                post_writer.write_all(&(compressed_buffer.len() as u32).to_le_bytes())?;
+                post_writer.write_all(&compressed_buffer)?;
+
+                seg_builder
+                    .insert(token, current_post_offset)
+                    .map_err(SegmentedIndexError::Fst)?;
+
+                current_post_offset +=
+                    (2 * size_of::<u32>() as u64) + compressed_buffer.len() as u64;
+            }
         }
 
         meta_writer
@@ -941,6 +1089,165 @@ mod tests {
         let packed1 = u128::from_le_bytes(meta_map[16..32].try_into()?);
         let (_, _, _, _, is_dir, _, _) = SegmentedIndex::unpack_u128(packed1);
         assert!(is_dir);
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    fn entry(opstamp: Opstamp) -> IndexEntry {
+        IndexEntry {
+            opstamp,
+            kind: Kind::File,
+            last_modified: 100,
+            last_accessed: 100,
+            category: 0,
+            volume_type: VolumeType::Local,
+        }
+    }
+
+    fn doc(path: String, opstamp: Opstamp) -> (String, String, IndexEntry) {
+        (path, "vol1".to_string(), entry(opstamp))
+    }
+
+    fn assert_same_segment_files(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+        let a = Segment::to_paths(a);
+        let b = Segment::to_paths(b);
+        for (a, b) in [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)] {
+            assert_eq!(
+                std::fs::read(&a)?,
+                std::fs::read(&b)?,
+                "{} differs",
+                a.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_tokenizer_version_is_read_from_the_postings_header() {
+        let current = crate::tokenizer::TOKENIZER_VERSION;
+        let stamped = [
+            POSTINGS_HEADER_MAGIC.as_slice(),
+            &current.to_le_bytes(),
+            &[3, 0, 0, 0],
+        ]
+        .concat();
+        assert_eq!(Segment::read_postings_header(&stamped), Some(current));
+        // A segment from before the header starts with its first token's posting count.
+        let legacy = [3u32.to_le_bytes(), 2u32.to_le_bytes()].concat();
+        assert_eq!(Segment::read_postings_header(&legacy), None);
+        assert_eq!(Segment::read_postings_header(&[]), None);
+    }
+
+    /// The merge remaps the sources' postings instead of re-tokenizing, so its output must match a segment built
+    /// from scratch out of the surviving documents: newer duplicates win, deletions and tombstoned paths drop out.
+    #[test]
+    fn test_merge_postings_match_a_fresh_build() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_merge_post_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let seg1_path = temp_dir.join("1");
+        SegmentedIndex::build_segment_files(
+            &seg1_path,
+            vec![
+                doc(format!("/bar{sep}e.txt"), Opstamp::insertion(1)),
+                doc(format!("/baz{sep}x.txt"), Opstamp::insertion(1)),
+                doc(format!("/foo{sep}a.txt"), Opstamp::insertion(1)),
+                doc(format!("/foo{sep}b.txt"), Opstamp::insertion(1)),
+            ],
+            false,
+            None,
+        )?;
+        let seg2_path = temp_dir.join("2");
+        SegmentedIndex::build_segment_files(
+            &seg2_path,
+            vec![
+                doc(format!("/foo{sep}a.txt"), Opstamp::insertion(2)),
+                doc(format!("/foo{sep}b.txt"), Opstamp::deletion(2)),
+                doc(format!("/foo{sep}d report.pdf"), Opstamp::insertion(2)),
+            ],
+            false,
+            None,
+        )?;
+        let s1 = Arc::new(Segment::load(seg1_path)?);
+        let s2 = Arc::new(Segment::load(seg2_path)?);
+        assert!(s1.has_current_tokens() && s2.has_current_tokens());
+
+        let merged_path = temp_dir.join("merged");
+        let tombstones = vec![(Some("vol1".to_string()), "/baz".to_string(), 50)];
+        compactor::merge_segments(&[s1.clone(), s2], Arc::new(tombstones), merged_path.clone())?;
+
+        let fresh_path = temp_dir.join("fresh");
+        SegmentedIndex::build_segment_files(
+            &fresh_path,
+            vec![
+                doc(format!("/bar{sep}e.txt"), Opstamp::insertion(1)),
+                doc(format!("/foo{sep}a.txt"), Opstamp::insertion(2)),
+                doc(format!("/foo{sep}d report.pdf"), Opstamp::insertion(2)),
+            ],
+            true,
+            s1.dict.as_deref(),
+        )?;
+        assert_same_segment_files(&merged_path, &fresh_path)?;
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// A source stamped with another tokenizer version must be re-tokenized, never remapped. Its postings are zeroed
+    /// here, so reusing them would lose documents from the merged postings.
+    #[test]
+    fn test_merge_retokenizes_sources_of_another_tokenizer_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_merge_stamp_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let seg1_path = temp_dir.join("1");
+        SegmentedIndex::build_segment_files(
+            &seg1_path,
+            vec![doc(format!("/bar{sep}e.txt"), Opstamp::insertion(1))],
+            false,
+            None,
+        )?;
+        let seg2_path = temp_dir.join("2");
+        SegmentedIndex::build_segment_files(
+            &seg2_path,
+            vec![doc(
+                format!("/foo{sep}old tokens.txt"),
+                Opstamp::insertion(2),
+            )],
+            false,
+            None,
+        )?;
+        let post_path = Segment::to_paths(&seg2_path).2;
+        let mut post = std::fs::read(&post_path)?;
+        let header = POSTINGS_HEADER_LEN as usize;
+        post[size_of::<u32>()..header]
+            .copy_from_slice(&(crate::tokenizer::TOKENIZER_VERSION - 1).to_le_bytes());
+        post[header..].fill(0);
+        std::fs::write(&post_path, post)?;
+
+        let s1 = Arc::new(Segment::load(seg1_path)?);
+        let s2 = Arc::new(Segment::load(seg2_path)?);
+        assert!(s1.has_current_tokens());
+        assert!(!s2.has_current_tokens());
+
+        let merged_path = temp_dir.join("merged");
+        compactor::merge_segments(&[s1.clone(), s2], Arc::new(vec![]), merged_path.clone())?;
+
+        let fresh_path = temp_dir.join("fresh");
+        SegmentedIndex::build_segment_files(
+            &fresh_path,
+            vec![
+                doc(format!("/bar{sep}e.txt"), Opstamp::insertion(1)),
+                doc(format!("/foo{sep}old tokens.txt"), Opstamp::insertion(2)),
+            ],
+            true,
+            s1.dict.as_deref(),
+        )?;
+        assert_same_segment_files(&merged_path, &fresh_path)?;
 
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())
