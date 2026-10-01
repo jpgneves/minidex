@@ -1,7 +1,7 @@
-use crate::sync::Arc;
+use crate::{sync::Arc, tombstones::TombstoneSet};
 use std::path::PathBuf;
 
-use crate::{entry::IndexEntry, is_tombstoned, segmented_index::SegmentedIndexError};
+use crate::{entry::IndexEntry, segmented_index::SegmentedIndexError};
 
 use super::{Segment, SegmentedIndex};
 
@@ -87,7 +87,7 @@ impl CompactorConfigBuilder {
 /// Note: atomic replacement of old segment files is done by the caller
 pub(crate) fn merge_segments(
     segments: &[Arc<Segment>],
-    prefix_tombstones: Arc<Vec<(Option<String>, String, u64)>>,
+    prefix_tombstones: Arc<TombstoneSet>,
     out: PathBuf,
 ) -> Result<u64, SegmentedIndexError> {
     let mut iterators: Vec<_> = segments
@@ -136,11 +136,10 @@ pub(crate) fn merge_segments(
 
                         // Check for tombstones
                         let path_bytes = item.0.as_bytes();
-                        let is_dead = is_tombstoned(
+                        let is_dead = prefix_tombstones.is_tombstoned(
                             &item.1,
                             path_bytes,
                             item.2.opstamp.sequence(),
-                            &prefix_tombstones,
                         );
 
                         if !is_dead && item.2.opstamp.sequence() > best_item.2.opstamp.sequence() {
@@ -157,11 +156,10 @@ pub(crate) fn merge_segments(
             }
 
             let best_bytes = best_item.0.as_bytes();
-            let best_is_dead = is_tombstoned(
+            let best_is_dead = prefix_tombstones.is_tombstoned(
                 &best_item.1,
                 best_bytes,
                 best_item.2.opstamp.sequence(),
-                &prefix_tombstones,
             );
 
             if best_is_dead {
@@ -269,7 +267,11 @@ mod tests {
         let s2 = Arc::new(Segment::load(seg2_path)?);
 
         let out_path = temp_dir.join("merged");
-        merge_segments(&[s1, s2], Arc::new(vec![]), out_path.clone())?;
+        merge_segments(
+            &[s1, s2],
+            Arc::new(TombstoneSet::default()),
+            out_path.clone(),
+        )?;
 
         let merged_seg = Segment::load(out_path)?;
         let docs: Vec<_> = merged_seg.documents().collect();
@@ -330,6 +332,7 @@ mod tests {
         let out_path = temp_dir.join("merged");
         // Tombstone for /foo on vol1
         let tombstones = vec![(Some("vol1".to_string()), "/foo".to_string(), 50)];
+        let tombstones = TombstoneSet::from(tombstones);
         merge_segments(&[s1], Arc::new(tombstones), out_path.clone())?;
 
         let merged_seg = Segment::load(out_path)?;

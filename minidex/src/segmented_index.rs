@@ -226,6 +226,13 @@ impl Segment {
         DocumentIterator::new(self, cursor)
     }
 
+    /// Reads the document with the given id
+    pub(crate) fn document_at(&self, id: usize) -> Option<(String, String, IndexEntry)> {
+        let record = self.meta_map().get(id * 16..id * 16 + 16)?;
+        let packed = u128::from_le_bytes(record.try_into().ok()?);
+        self.read_document((packed & 0x0000_00FF_FFFF_FFFF) as u64)
+    }
+
     /// Reads document data for the given offset.
     pub(crate) fn read_document(&self, offset: u64) -> Option<(String, String, IndexEntry)> {
         let cursor = offset as usize;
@@ -1013,6 +1020,7 @@ mod tests {
     use super::*;
     use crate::VolumeType;
     use crate::opstamp::Opstamp;
+    use crate::tombstones::TombstoneSet;
 
     #[test]
     fn test_pack_unpack_u128() {
@@ -1176,7 +1184,11 @@ mod tests {
 
         let merged_path = temp_dir.join("merged");
         let tombstones = vec![(Some("vol1".to_string()), "/baz".to_string(), 50)];
-        compactor::merge_segments(&[s1.clone(), s2], Arc::new(tombstones), merged_path.clone())?;
+        compactor::merge_segments(
+            &[s1.clone(), s2],
+            Arc::new(TombstoneSet::from(tombstones)),
+            merged_path.clone(),
+        )?;
 
         let fresh_path = temp_dir.join("fresh");
         SegmentedIndex::build_segment_files(
@@ -1235,7 +1247,11 @@ mod tests {
         assert!(!s2.has_current_tokens());
 
         let merged_path = temp_dir.join("merged");
-        compactor::merge_segments(&[s1.clone(), s2], Arc::new(vec![]), merged_path.clone())?;
+        compactor::merge_segments(
+            &[s1.clone(), s2],
+            Arc::new(TombstoneSet::default()),
+            merged_path.clone(),
+        )?;
 
         let fresh_path = temp_dir.join("fresh");
         SegmentedIndex::build_segment_files(

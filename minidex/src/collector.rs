@@ -1,14 +1,14 @@
 use std::{borrow::Cow, collections::HashMap};
 
-use crate::{common::is_tombstoned, entry::IndexEntry};
+use crate::{entry::IndexEntry, tombstones::TombstoneSet};
 
 pub(crate) struct LsmCollector<'a> {
     candidates: HashMap<Cow<'a, str>, (Cow<'a, str>, IndexEntry)>,
-    active_tombstones: &'a [(Option<String>, String, u64)],
+    active_tombstones: &'a TombstoneSet,
 }
 
 impl<'a> LsmCollector<'a> {
-    pub(crate) fn new(active_tombstones: &'a [(Option<String>, String, u64)]) -> Self {
+    pub(crate) fn new(active_tombstones: &'a TombstoneSet) -> Self {
         Self {
             candidates: HashMap::new(),
             active_tombstones,
@@ -23,11 +23,10 @@ impl<'a> LsmCollector<'a> {
     {
         let path_cow = path.into();
         let volume_cow = volume.into();
-        if is_tombstoned(
+        if self.active_tombstones.is_tombstoned(
             &volume_cow,
             path_cow.as_bytes(),
             entry.opstamp.sequence(),
-            self.active_tombstones,
         ) {
             return;
         }
@@ -62,7 +61,8 @@ mod tests {
     #[test]
     fn test_collector_basic_insertion() {
         let sep = std::path::MAIN_SEPARATOR_STR;
-        let mut collector = LsmCollector::new(&[]);
+        let tombstones = TombstoneSet::default();
+        let mut collector = LsmCollector::new(&tombstones);
         let entry = IndexEntry {
             opstamp: Opstamp::insertion(10),
             kind: Kind::File,
@@ -83,7 +83,8 @@ mod tests {
     #[test]
     fn test_collector_version_resolution() {
         let sep = std::path::MAIN_SEPARATOR_STR;
-        let mut collector = LsmCollector::new(&[]);
+        let tombstones = TombstoneSet::default();
+        let mut collector = LsmCollector::new(&tombstones);
         let entry1 = IndexEntry {
             opstamp: Opstamp::insertion(10),
             kind: Kind::File,
@@ -114,6 +115,7 @@ mod tests {
     fn test_collector_prefix_tombstone() {
         let sep = std::path::MAIN_SEPARATOR_STR;
         let tombstones = vec![(None, format!("{}foo", sep), 50)];
+        let tombstones = TombstoneSet::from(tombstones);
         let mut collector = LsmCollector::new(&tombstones);
 
         let entry_dead = IndexEntry {
@@ -158,7 +160,8 @@ mod tests {
     #[test]
     fn test_collector_deletion_resolution() {
         let sep = std::path::MAIN_SEPARATOR_STR;
-        let mut collector = LsmCollector::new(&[]);
+        let tombstones = TombstoneSet::default();
+        let mut collector = LsmCollector::new(&tombstones);
         let entry1 = IndexEntry {
             opstamp: Opstamp::insertion(10),
             kind: Kind::File,

@@ -20,7 +20,6 @@ use thiserror::Error;
 
 mod collector;
 mod common;
-use common::is_tombstoned;
 mod leb128;
 use collector::*;
 pub use common::{Kind, VolumeType, category};
@@ -37,10 +36,11 @@ mod search;
 mod simd;
 mod tokenizer;
 pub use tokenizer::tokenize;
+mod tombstones;
+pub use tombstones::Tombstone;
+use tombstones::TombstoneSet;
 mod wal;
 pub use search::{ScoringConfig, ScoringInputs, ScoringWeights, SearchOptions, SearchResult};
-
-pub type Tombstone = (Option<String>, String, u64);
 
 /// A Minidex Index, managing both the in-memory and disk data.
 /// Insertions and deletions auto-commit to the Write-Ahead Log
@@ -54,7 +54,7 @@ pub struct Index {
     compactor_config: segmented_index::compactor::CompactorConfig,
     compactor: Arc<RwLock<Option<JoinHandle<()>>>>,
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
-    prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+    prefix_tombstones: Arc<RwLock<Arc<TombstoneSet>>>,
     recovery: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
@@ -81,7 +81,7 @@ impl Index {
         let base = Arc::new(ArcSwap::from_pointee(base));
 
         let mem_idx = MemTable::default();
-        let prefix_tombstones = Arc::new(RwLock::new(Arc::new(Vec::new())));
+        let prefix_tombstones = Arc::new(RwLock::new(Arc::new(TombstoneSet::default())));
 
         let entries = path.as_ref().read_dir().map_err(IndexError::Io)?;
         let mut frozen_wals = Vec::new();
@@ -180,7 +180,7 @@ impl Index {
         path: PathBuf,
         frozen_wals: Vec<PathBuf>,
         base: Arc<ArcSwap<SegmentedIndex>>,
-        live_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+        live_tombstones: Arc<RwLock<Arc<TombstoneSet>>>,
     ) {
         log::info!(
             "Starting background WAL recovery for {} files...",
@@ -421,7 +421,7 @@ impl Index {
                 .write()
                 .map_err(|_| IndexError::WriteLock)?;
 
-            Arc::make_mut(&mut tombstones).push((
+            Arc::make_mut(&mut tombstones).insert((
                 volume.map(|s| s.to_string()),
                 normalized_prefix.clone(),
                 seq,
@@ -965,6 +965,119 @@ impl Index {
         Ok(paginated_results)
     }
 
+    /// Indexed paths under prefix for a given volume (or all volumes).
+    /// `prefix` matches the path itself and paths under it, bytewise and
+    /// case-sensitively.
+    /// Returns `None` when more than `limit` live entries match, or when the
+    /// scan reads more than `4 x limit` stored versions.
+    pub fn with_prefix(
+        &self,
+        volume: Option<&str>,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<FilesystemEntry>>, IndexError> {
+        let segments = self.base.load();
+        let tombstones = self
+            .prefix_tombstones
+            .read()
+            .map_err(|_| IndexError::ReadLock)?
+            .clone();
+
+        let children = format!("{prefix}{}", std::path::MAIN_SEPARATOR);
+        let mut latest: std::collections::HashMap<String, (String, IndexEntry)> =
+            std::collections::HashMap::new();
+
+        let max_versions = limit.saturating_mul(4);
+        let mut versions: usize = 0;
+        let mut offer = |path: String, volume: String, entry: IndexEntry| -> bool {
+            versions += 1;
+            match latest.get(&path) {
+                Some((_, existing)) if existing.opstamp.sequence() >= entry.opstamp.sequence() => {}
+                _ => {
+                    let _ = latest.insert(path, (volume, entry));
+                }
+            }
+            versions <= max_versions
+        };
+
+        let mut within_budget = true;
+        {
+            let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+            if let Some((volume, entry)) = mem.entries.get(prefix) {
+                within_budget &= offer(prefix.to_string(), volume.clone(), *entry);
+            }
+            let range = (Bound::Included(children.as_str()), Bound::Unbounded);
+            for (path, (volume, entry)) in mem.entries.range::<str, _>(range) {
+                if !within_budget || !path.starts_with(&children) {
+                    break;
+                }
+                within_budget &= offer(path.clone(), volume.clone(), *entry);
+            }
+        }
+
+        for segment in segments.segments() {
+            if !within_budget {
+                break;
+            }
+
+            let doc_count = segment.meta_map().len() / 16;
+            let path_at = |id: usize| segment.document_at(id).map(|(path, _, _)| path);
+            if let Some(id) = lower_bound(doc_count, path_at, prefix)
+                && let Some((path, volume, entry)) = segment.document_at(id)
+                && path == prefix
+            {
+                within_budget &= offer(path, volume, entry);
+            }
+
+            let Some(start) = lower_bound(doc_count, path_at, &children) else {
+                continue;
+            };
+
+            for id in start..doc_count {
+                let Some((path, volume, entry)) = segment.document_at(id) else {
+                    break;
+                };
+                if !within_budget || !path.starts_with(&children) {
+                    break;
+                }
+                within_budget &= offer(path, volume, entry);
+            }
+        }
+
+        if !within_budget {
+            return Ok(None);
+        }
+
+        let mut live = Vec::new();
+        for (path, (entry_volume, entry)) in latest {
+            if entry.opstamp.is_deletion()
+                || volume.is_some_and(|v| v != entry_volume)
+                || tombstones.is_tombstoned(
+                    &entry_volume,
+                    path.as_bytes(),
+                    entry.opstamp.sequence(),
+                )
+            {
+                continue;
+            }
+
+            if live.len() == limit {
+                return Ok(None);
+            }
+            live.push(FilesystemEntry {
+                path: PathBuf::from(path),
+                volume: entry_volume,
+                kind: entry.kind,
+                last_modified: entry.last_modified,
+                last_accessed: entry.last_accessed,
+                category: entry.category,
+                volume_type: entry.volume_type,
+            });
+        }
+
+        Ok(Some(live))
+    }
+
     /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
     pub fn recent_files(
         &self,
@@ -1217,7 +1330,7 @@ impl Index {
                 *self
                     .prefix_tombstones
                     .write()
-                    .map_err(|_| IndexError::WriteLock)? = Arc::new(Vec::new());
+                    .map_err(|_| IndexError::WriteLock)? = Arc::new(TombstoneSet::default());
                 return Ok(());
             }
             // If we have 1 segment, and no tombstones recorded, the database is already perfectly compacted
@@ -1282,7 +1395,7 @@ impl Index {
                 .write()
                 .map_err(|_| IndexError::WriteLock)?;
             if Arc::ptr_eq(&*tombstones, &applied_snapshot) {
-                *tombstones = Arc::new(Vec::new());
+                *tombstones = Arc::new(TombstoneSet::default());
             } else {
                 drop(tombstones);
                 let applied: std::collections::HashSet<u64> =
@@ -1334,7 +1447,7 @@ impl Index {
                 return Ok(());
             }
 
-            let tombstones_cow: Arc<Vec<Tombstone>> = self
+            let tombstones_cow: Arc<TombstoneSet> = self
                 .prefix_tombstones
                 .read()
                 .map_err(|_| IndexError::ReadLock)?
@@ -1456,7 +1569,7 @@ impl Index {
         base: Arc<ArcSwap<SegmentedIndex>>,
         path: PathBuf,
         snapshot: Vec<Arc<Segment>>,
-        prefix_tombstones: Arc<RwLock<Arc<Vec<Tombstone>>>>,
+        prefix_tombstones: Arc<RwLock<Arc<TombstoneSet>>>,
         next_op_seq: Arc<AtomicU64>,
     ) -> Option<JoinHandle<()>> {
         if snapshot.is_empty() {
@@ -1511,7 +1624,7 @@ impl Index {
                                 .write()
                                 .expect("failed to acquire prefix tombstones write lock");
                             if Arc::ptr_eq(&*tombstones, &applied_snapshot) {
-                                *tombstones = Arc::new(Vec::new());
+                                *tombstones = Arc::new(TombstoneSet::default());
                             } else {
                                 drop(tombstones);
                                 let applied: std::collections::HashSet<u64> =
@@ -1681,6 +1794,25 @@ fn matches_a_query_token_exactly(path: &str, query_tokens: &[String]) -> bool {
     query_tokens.iter().any(|query| {
         path_tokens.binary_search(query).is_ok() && extension.as_deref() != Some(query.as_str())
     })
+}
+
+/// The first id in `0..len` whose path is not less than `target`, for a segment
+/// whose documents are stored in path order.
+fn lower_bound(
+    len: usize,
+    path_at: impl Fn(usize) -> Option<String>,
+    target: &str,
+) -> Option<usize> {
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if path_at(mid)?.as_str() < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo < len).then_some(lo)
 }
 
 #[derive(Debug, Error)]
