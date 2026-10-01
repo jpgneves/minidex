@@ -4,6 +4,8 @@ use crate::{Kind, common::VolumeType};
 
 mod scoring;
 pub use scoring::*;
+mod scratch;
+pub(crate) use scratch::*;
 
 pub(crate) const EXACT_TERM_MATCH_BIT: u64 = 1 << 63;
 
@@ -123,4 +125,11 @@ pub(crate) fn retain_top_k<T>(candidates: &mut Vec<(u64, T)>, cap: usize) {
         candidates.select_nth_unstable_by(cap, |a, b| b.0.cmp(&a.0));
         candidates.truncate(cap);
     }
+}
+
+#[inline(always)]
+pub(crate) fn retain_top_k_distinct(candidates: &mut Vec<(u64, u32)>, cap: usize) {
+    candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
+    candidates.dedup_by_key(|candidate| candidate.1);
+    retain_top_k(candidates, cap);
 }

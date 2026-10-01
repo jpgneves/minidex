@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
 use memtable::MemTable;
-use search::evaluate_candidate;
+use search::{ScratchPool, evaluate_candidate};
 use thiserror::Error;
 
 mod collector;
@@ -56,6 +56,7 @@ pub struct Index {
     flusher: Arc<RwLock<Option<JoinHandle<()>>>>,
     prefix_tombstones: Arc<RwLock<Arc<TombstoneSet>>>,
     recovery: Arc<RwLock<Option<JoinHandle<()>>>>,
+    search_scratch: search::ScratchPool,
 }
 
 impl Index {
@@ -162,6 +163,7 @@ impl Index {
             flusher: Arc::new(RwLock::new(None)),
             prefix_tombstones,
             recovery: Arc::new(RwLock::new(recovery)),
+            search_scratch: ScratchPool::default(),
         };
 
         Ok(index)
@@ -494,167 +496,187 @@ impl Index {
 
         let volume_type_mask = Self::compile_allowed_volume_mask(options.volume_type);
 
+        let search::SearchScratch {
+            prefiltered: mut prefiltered_candidates,
+            mut token_docs,
+            mut current_matches,
+            intersect: mut intersect_buf,
+            sortable: mut sortable_docs,
+            mut exact_words,
+            mut extension_words,
+        } = self.search_scratch.take();
+
         let mut mem_materialized = Vec::new();
         {
             let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
-            let mut mem_candidates: Option<Vec<u32>> = None;
-            let mut mem_intersect_buf = Vec::new();
+            let mem_documents = mem.metadata.len();
+            let mut have_candidates = false;
+            current_matches.clear();
             // Store if we've found an exact term match
-            let mut mem_exact_matches = ExactMatches::new(mem.metadata.len());
+            let mut mem_exact_matches =
+                ExactMatches::reuse(std::mem::take(&mut exact_words), mem_documents);
 
             // In-memory searches
-            if !tokens.is_empty() {
-                for token in &tokens {
-                    let is_first_token = mem_candidates.is_none();
+            for (token_index, token) in tokens.iter().enumerate() {
+                let is_first_token = !have_candidates;
+                let is_last = token_index + 1 == tokens.len();
 
-                    let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
+                let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
-                    // Skip exact matches that are due to extension
-                    // (e.g. do not treat `.doc` matching `doc` as an exact
-                    // term match)
-                    let extension_only = if is_exact {
-                        None
-                    } else {
-                        crate::tokenizer::write_synthesized_token(
-                            &mut extension_term,
-                            crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
-                            token,
+                // Skip exact matches that are due to extension
+                // (e.g. do not treat `.doc` matching `doc` as an exact
+                // term match)
+                let extension_only = if is_exact {
+                    None
+                } else {
+                    crate::tokenizer::write_synthesized_token(
+                        &mut extension_term,
+                        crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                        token,
+                    );
+                    mem.inverted_index.get(&extension_term).map(|ids| {
+                        let mut docs = ExactMatches::reuse(
+                            std::mem::take(&mut extension_words),
+                            mem_documents,
                         );
-                        mem.inverted_index.get(&extension_term).map(|ids| {
-                            let mut docs = ExactMatches::new(mem.metadata.len());
-                            for &id in ids {
-                                docs.set(id);
-                            }
-                            docs
-                        })
-                    };
+                        for &id in ids {
+                            docs.set(id);
+                        }
+                        docs
+                    })
+                };
 
-                    let max_expansions = if is_first_token
-                        && token.chars().count() <= options.short_prefix_threshold
-                        && !is_exact
-                    {
-                        options.max_expansions
+                let max_expansions = if is_first_token
+                    && token.chars().count() <= options.short_prefix_threshold
+                    && !is_exact
+                {
+                    options.max_expansions
+                } else {
+                    usize::MAX
+                };
+
+                let max_docs =
+                    if token.chars().count() <= options.short_prefix_threshold && !is_exact {
+                        scoring_cap.saturating_mul(5)
                     } else {
                         usize::MAX
                     };
 
-                    let max_docs =
-                        if token.chars().count() <= options.short_prefix_threshold && !is_exact {
-                            scoring_cap.saturating_mul(5)
-                        } else {
-                            usize::MAX
-                        };
+                let keep_docs = last_token_bound(is_last, max_docs, scoring_cap);
 
-                    let mut term_count = 0;
-                    let mut docs_accumulated = 0;
+                let mut term_count = 0;
+                let mut docs_accumulated = 0;
 
-                    let mut prefiltered_candidates = Vec::new();
+                prefiltered_candidates.clear();
 
-                    let mut process_ids = |ids: &[u32], exact_term: bool| {
-                        for &id in ids {
-                            if let Some(existing) = mem_candidates.as_ref()
-                                && existing.binary_search(&id).is_err()
+                let mut process_ids = |ids: &[u32], exact_term: bool| {
+                    for &id in ids {
+                        if have_candidates && current_matches.binary_search(&id).is_err() {
+                            continue;
+                        }
+
+                        let metadata = mem.metadata[id as usize];
+                        if let Some(mut sort_key) =
+                            evaluate_candidate(metadata, &options, volume_type_mask)
+                        {
+                            if exact_term
+                                && !extension_only.as_ref().is_some_and(|d| d.contains(id))
                             {
-                                continue;
+                                sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                                mem_exact_matches.set(id);
                             }
 
-                            let metadata = mem.metadata[id as usize];
-                            if let Some(mut sort_key) =
-                                evaluate_candidate(metadata, &options, volume_type_mask)
-                            {
-                                if exact_term
-                                    && !extension_only.as_ref().is_some_and(|d| d.contains(id))
-                                {
-                                    sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
-                                    mem_exact_matches.set(id);
-                                }
-                                prefiltered_candidates.push((sort_key, id))
+                            if is_last && mem_exact_matches.contains(id) {
+                                sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
                             }
-
-                            if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
-                                crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
-                            }
+                            prefiltered_candidates.push((sort_key, id))
                         }
-                    };
 
-                    if is_exact {
-                        if let Some(ids) = mem.inverted_index.get(token.as_str()) {
-                            process_ids(ids, true);
-                        }
-                    } else {
-                        let mut end_bound = String::with_capacity(token.len() + 4);
-                        end_bound.push_str(token);
-                        end_bound.push('\u{FFFF}');
-
-                        for (term, ids) in mem.inverted_index.range::<str, _>((
-                            Bound::Included(token.as_str()),
-                            Bound::Included(end_bound.as_str()),
-                        )) {
-                            process_ids(ids, term == token);
-
-                            term_count += 1;
-                            docs_accumulated += ids.len();
-
-                            if term_count >= max_expansions || docs_accumulated >= max_docs {
-                                break;
-                            }
-                        }
-                    }
-
-                    if prefiltered_candidates.is_empty() {
-                        mem_candidates = Some(Vec::new());
-                        break;
-                    }
-
-                    crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
-                    let mut best_ids: Vec<u32> = prefiltered_candidates
-                        .into_iter()
-                        .map(|(_, id)| id)
-                        .collect();
-                    best_ids.sort_unstable();
-                    best_ids.dedup();
-                    let current_token_ids = std::borrow::Cow::Owned(best_ids);
-
-                    match mem_candidates.as_mut() {
-                        // Two point merge in the RAM path
-                        Some(existing) => {
-                            mem_intersect_buf.clear();
-                            crate::simd::intersect_arrays(
-                                existing,
-                                &current_token_ids,
-                                &mut mem_intersect_buf,
+                        if prefiltered_candidates.len() > keep_docs.saturating_mul(4) {
+                            retain_token_candidates(
+                                &mut prefiltered_candidates,
+                                keep_docs,
+                                is_last,
                             );
-                            std::mem::swap(existing, &mut mem_intersect_buf);
                         }
-                        None => mem_candidates = Some(current_token_ids.into_owned()),
                     }
+                };
 
-                    if let Some(c) = &mem_candidates
-                        && c.is_empty()
-                    {
-                        break;
+                if is_exact {
+                    if let Some(ids) = mem.inverted_index.get(token.as_str()) {
+                        process_ids(ids, true);
+                    }
+                } else {
+                    let mut end_bound = String::with_capacity(token.len() + 4);
+                    end_bound.push_str(token);
+                    end_bound.push('\u{FFFF}');
+
+                    for (term, ids) in mem.inverted_index.range::<str, _>((
+                        Bound::Included(token.as_str()),
+                        Bound::Included(end_bound.as_str()),
+                    )) {
+                        process_ids(ids, term == token);
+
+                        term_count += 1;
+                        docs_accumulated += ids.len();
+
+                        if term_count >= max_expansions || docs_accumulated >= max_docs {
+                            break;
+                        }
                     }
                 }
-            } else {
-                mem_candidates = Some(mem.id_to_data.keys().copied().collect());
+
+                if let Some(docs) = extension_only {
+                    extension_words = docs.into_words();
+                }
+
+                if prefiltered_candidates.is_empty() {
+                    have_candidates = true;
+                    current_matches.clear();
+                    break;
+                }
+
+                retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last);
+                token_docs.clear();
+                token_docs.extend(prefiltered_candidates.iter().map(|&(_, id)| id));
+                token_docs.sort_unstable();
+                token_docs.dedup();
+
+                if have_candidates {
+                    // Two point merge in the RAM path
+                    intersect_buf.clear();
+                    crate::simd::intersect_arrays(
+                        &current_matches,
+                        &token_docs,
+                        &mut intersect_buf,
+                    );
+                    std::mem::swap(&mut current_matches, &mut intersect_buf);
+                } else {
+                    std::mem::swap(&mut current_matches, &mut token_docs);
+                    have_candidates = true;
+                }
+
+                if current_matches.is_empty() {
+                    break;
+                }
             }
 
-            if let Some(candidates) = mem_candidates {
-                let mut mem_sortable = Vec::with_capacity(candidates.len());
+            if have_candidates {
+                sortable_docs.clear();
 
-                for id in candidates {
+                for &id in &current_matches {
                     let metadata = mem.metadata[id as usize];
 
                     if let Some(sort_key) = evaluate_candidate(metadata, &options, volume_type_mask)
                     {
-                        mem_sortable.push((sort_key, id));
+                        sortable_docs.push((sort_key, id));
                     }
                 }
 
                 // Rebuild the sort key from cached information if we've found
                 // this via an exact match term.
-                if mem_sortable.len() > scoring_cap {
-                    for (sort_key, id) in mem_sortable.iter_mut() {
+                if sortable_docs.len() > scoring_cap {
+                    for (sort_key, id) in sortable_docs.iter_mut() {
                         if mem_exact_matches.contains(*id) {
                             *sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
                         }
@@ -662,9 +684,9 @@ impl Index {
                 }
 
                 // Top-K truncation in memory
-                crate::search::retain_top_k(&mut mem_sortable, scoring_cap);
+                crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
 
-                for (_, id) in mem_sortable {
+                for &(_, id) in &sortable_docs {
                     if let Some((path, volume, entry)) = mem.id_to_data.get(&id) {
                         if let Some(filter) = options.volume_name
                             && volume != filter
@@ -675,15 +697,13 @@ impl Index {
                     }
                 }
             }
+            exact_words = mem_exact_matches.into_words();
         }
         for (path, volume, entry) in &mem_materialized {
             collector.insert(path.as_str(), volume.as_str(), *entry);
         }
 
         // Disk searches
-        let mut token_docs = Vec::new();
-        let mut current_matches = Vec::new();
-        let mut disk_intersect_buf = Vec::new();
 
         let vol_token = options.volume_name.map(|vol| {
             crate::tokenizer::synthesize_token(crate::tokenizer::SYNTH_VOLUME_TOKEN_TAG, vol)
@@ -695,11 +715,9 @@ impl Index {
             let mut valid_matches = true;
 
             let segment_documents = segment.meta_map().len() / size_of::<u128>();
-            let mut segment_exact_matches = ExactMatches::new(segment_documents);
             let map = segment.as_ref().as_ref();
 
             if let Some(ref vol_token) = vol_token {
-                let map = segment.as_ref().as_ref();
                 if let Some(post_offset) = map.get(vol_token) {
                     segment.append_posting_list(post_offset, &mut current_matches);
                     first_token = false;
@@ -707,13 +725,17 @@ impl Index {
                     continue;
                 }
             }
+            let mut segment_exact_matches =
+                ExactMatches::reuse(std::mem::take(&mut exact_words), segment_documents);
 
-            for token in &tokens {
+            for (token_index, token) in tokens.iter().enumerate() {
                 // Skip on 0 matches
                 if !first_token && current_matches.is_empty() {
                     valid_matches = false;
                     break;
                 }
+
+                let is_last = token_index + 1 == tokens.len();
 
                 let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
@@ -728,7 +750,10 @@ impl Index {
                         token,
                     );
                     map.get(&extension_term).map(|offset| {
-                        let mut docs = ExactMatches::new(segment_documents);
+                        let mut docs = ExactMatches::reuse(
+                            std::mem::take(&mut extension_words),
+                            segment_documents,
+                        );
                         segment.for_each_posting_id(offset, |doc_id| docs.set(doc_id));
                         docs
                     })
@@ -750,10 +775,18 @@ impl Index {
                         usize::MAX
                     };
 
+                let keep_docs = last_token_bound(is_last, max_docs, scoring_cap);
+
+                // An unbounded token that is not the last one only feeds intersection.
+                // Its IDs are all that is needed, so we skip the candidate buffer
+                let ids_only = !is_last && max_docs == usize::MAX;
+
                 token_docs.clear();
                 let mut term_count = 0;
 
-                let mut prefiltered_candidates = Vec::new();
+                prefiltered_candidates.clear();
+
+                let mut gathered: usize = 0;
 
                 let mut process_offset = |post_offset: u64, exact_term: bool| -> usize {
                     segment.for_each_posting_id(post_offset, |doc_id| {
@@ -780,18 +813,30 @@ impl Index {
                                     sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
                                     segment_exact_matches.set(doc_id);
                                 }
+
+                                if is_last && segment_exact_matches.contains(doc_id) {
+                                    sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
+                                }
+
+                                gathered += 1;
+                                if ids_only {
+                                    token_docs.push(doc_id);
+                                    return;
+                                }
+
                                 prefiltered_candidates.push((sort_key, doc_id));
 
-                                if prefiltered_candidates.len() > max_docs.saturating_mul(4) {
-                                    crate::search::retain_top_k(
+                                if prefiltered_candidates.len() > keep_docs.saturating_mul(4) {
+                                    retain_token_candidates(
                                         &mut prefiltered_candidates,
-                                        max_docs,
+                                        keep_docs,
+                                        is_last,
                                     );
                                 }
                             }
                         }
                     });
-                    prefiltered_candidates.len()
+                    gathered
                 };
 
                 if is_exact {
@@ -813,11 +858,15 @@ impl Index {
                     }
                 }
 
-                crate::search::retain_top_k(&mut prefiltered_candidates, max_docs);
-                token_docs = prefiltered_candidates
-                    .into_iter()
-                    .map(|(_, id)| id)
-                    .collect();
+                if !ids_only {
+                    retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last);
+                    token_docs.clear();
+                    token_docs.extend(prefiltered_candidates.iter().map(|&(_, id)| id));
+                }
+
+                if let Some(docs) = extension_only {
+                    extension_words = docs.into_words();
+                }
 
                 token_docs.sort_unstable();
                 token_docs.dedup();
@@ -826,19 +875,19 @@ impl Index {
                     std::mem::swap(&mut current_matches, &mut token_docs);
                     first_token = false;
                 } else {
-                    disk_intersect_buf.clear();
+                    intersect_buf.clear();
                     crate::simd::intersect_arrays(
                         &current_matches,
                         &token_docs,
-                        &mut disk_intersect_buf,
+                        &mut intersect_buf,
                     );
-                    std::mem::swap(&mut current_matches, &mut disk_intersect_buf);
+                    std::mem::swap(&mut current_matches, &mut intersect_buf);
                 }
             }
 
             if valid_matches && !current_matches.is_empty() {
                 let valid_docs = &current_matches;
-                let mut sortable_docs: Vec<(u64, u128)> = Vec::with_capacity(valid_docs.len());
+                sortable_docs.clear();
                 let meta_mmap = segment.meta_map();
                 let meta_ptr = meta_mmap.as_ptr();
                 let meta_len = meta_mmap.len();
@@ -861,17 +910,28 @@ impl Index {
                         if segment_exact_matches.contains(doc_id) {
                             sort_key |= crate::search::EXACT_TERM_MATCH_BIT;
                         }
-                        sortable_docs.push((sort_key, packed_val));
+                        sortable_docs.push((sort_key, doc_id));
                     }
                 }
 
                 crate::search::retain_top_k(&mut sortable_docs, scoring_cap);
 
-                // Re-sort by dat_offset ascending to align with in-disk layout
-                sortable_docs
-                    .sort_unstable_by_key(|&(_, packed)| (packed & 0x0000_00FF_FFFF_FFFF) as u64);
+                // Re-sort by document ID ascending to align with in-disk layout
+                sortable_docs.sort_unstable_by_key(|&(_, doc_id)| doc_id);
 
-                for (_, packed_val) in sortable_docs {
+                for &(_, doc_id) in &sortable_docs {
+                    let byte_offset = doc_id as usize * size_of::<u128>();
+
+                    let Some(packed) = meta_mmap.get(byte_offset..byte_offset + size_of::<u128>())
+                    else {
+                        continue;
+                    };
+
+                    let packed_val = u128::from_le_bytes(
+                        packed
+                            .try_into()
+                            .expect("expected to read packed value from offset"),
+                    );
                     let dat_offset = (packed_val & 0x0000_00FF_FFFF_FFFF) as u64;
 
                     if let Some((path, volume, entry)) = segment.read_document(dat_offset) {
@@ -884,7 +944,18 @@ impl Index {
                     }
                 }
             }
+            exact_words = segment_exact_matches.into_words();
         }
+
+        self.search_scratch.give(search::SearchScratch {
+            prefiltered: prefiltered_candidates,
+            token_docs,
+            current_matches,
+            intersect: intersect_buf,
+            sortable: sortable_docs,
+            exact_words,
+            extension_words,
+        });
 
         let mut results: Vec<_> = collector.finish().collect();
 
@@ -1752,10 +1823,15 @@ struct ExactMatches {
 }
 
 impl ExactMatches {
-    fn new(documents: usize) -> Self {
-        Self {
-            words: vec![0; documents.div_ceil(64)],
-        }
+    fn reuse(mut buf: Vec<u64>, documents: usize) -> Self {
+        buf.clear();
+        buf.resize(documents.div_ceil(64), 0);
+        Self { words: buf }
+    }
+
+    #[inline(always)]
+    fn into_words(self) -> Vec<u64> {
+        self.words
     }
 
     #[inline(always)]
@@ -1813,6 +1889,29 @@ fn lower_bound(
         }
     }
     (lo < len).then_some(lo)
+}
+
+/// How many candidates to keep for a token. The last token's candidates are not
+/// intersected and the final stage only keeps the top `scoring_cap` with the
+/// same key, so it's bounded to that while gathering.
+/// The other tokens keep `max_docs`.
+fn last_token_bound(is_last: bool, max_docs: usize, scoring_cap: usize) -> usize {
+    if is_last {
+        max_docs.min(scoring_cap)
+    } else {
+        max_docs
+    }
+}
+
+/// Trim a token's candidates to `keep`. The last token's candidates are trimmed
+/// over distinct documents, so the documents it keeps are the ones that the
+/// final stage would as well with deduplication.
+fn retain_token_candidates(candidates: &mut Vec<(u64, u32)>, keep: usize, is_last: bool) {
+    if is_last {
+        crate::search::retain_top_k_distinct(candidates, keep);
+    } else {
+        crate::search::retain_top_k(candidates, keep);
+    }
 }
 
 #[derive(Debug, Error)]
