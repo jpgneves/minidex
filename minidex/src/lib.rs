@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    ops::Bound,
+    ops::{Bound, ControlFlow},
     path::{Path, PathBuf},
 };
 
@@ -1039,6 +1039,7 @@ impl Index {
     /// Indexed paths under prefix for a given volume (or all volumes).
     /// `prefix` matches the path itself and paths under it, bytewise and
     /// case-sensitively.
+    /// Entries come in ascending path order.
     /// Returns `None` when more than `limit` live entries match, or when the
     /// scan reads more than `4 x limit` stored versions.
     pub fn with_prefix(
@@ -1047,6 +1048,42 @@ impl Index {
         prefix: &str,
         limit: usize,
     ) -> Result<Option<Vec<FilesystemEntry>>, IndexError> {
+        let mut live = Vec::new();
+        let end = self.scan_prefix(volume, prefix, limit.saturating_mul(4), &mut |entry| {
+            if live.len() == limit {
+                return ControlFlow::Break(());
+            }
+            live.push(entry);
+            ControlFlow::Continue(())
+        })?;
+        Ok(matches!(end, PrefixScanEnd::Exhausted).then_some(live))
+    }
+
+    /// Visits the matching live entries in ascending path order.
+    /// `visit` may stop the scan by returning [`ControlFlow::Break`].
+    /// Returns whether every matching entry was visited.
+    pub fn for_each_with_prefix(
+        &self,
+        volume: Option<&str>,
+        prefix: &str,
+        mut visit: impl FnMut(FilesystemEntry) -> ControlFlow<()>,
+    ) -> Result<bool, IndexError> {
+        let end = self.scan_prefix(volume, prefix, usize::MAX, &mut visit)?;
+        Ok(matches!(end, PrefixScanEnd::Exhausted))
+    }
+
+    /// Merges the memory table and every loaded segment into one
+    /// stream of entries holding only the latest version of each path.
+    fn scan_prefix(
+        &self,
+        volume: Option<&str>,
+        prefix: &str,
+        max_versions: usize,
+        mut visit: impl FnMut(FilesystemEntry) -> ControlFlow<()>,
+    ) -> Result<PrefixScanEnd, IndexError> {
+        type PeekableVersions<'a> =
+            Vec<std::iter::Peekable<Box<dyn Iterator<Item = (String, String, IndexEntry)> + 'a>>>;
+
         let segments = self.base.load();
         let tombstones = self
             .prefix_tombstones
@@ -1055,72 +1092,83 @@ impl Index {
             .clone();
 
         let children = format!("{prefix}{}", std::path::MAIN_SEPARATOR);
-        let mut latest: std::collections::HashMap<String, (String, IndexEntry)> =
-            std::collections::HashMap::new();
 
-        let max_versions = limit.saturating_mul(4);
-        let mut versions: usize = 0;
-        let mut offer = |path: String, volume: String, entry: IndexEntry| -> bool {
-            versions += 1;
-            match latest.get(&path) {
-                Some((_, existing)) if existing.opstamp.sequence() >= entry.opstamp.sequence() => {}
-                _ => {
-                    let _ = latest.insert(path, (volume, entry));
-                }
-            }
-            versions <= max_versions
+        let in_memory: Vec<(String, String, IndexEntry)> = {
+            let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
+            let own = mem
+                .entries
+                .get(prefix)
+                .map(|(volume, entry)| (prefix.to_string(), volume.clone(), *entry));
+
+            let range = (Bound::Included(children.as_str()), Bound::Unbounded);
+
+            own.into_iter()
+                .chain(
+                    mem.entries
+                        .range::<str, _>(range)
+                        .take_while(|(path, _)| path.starts_with(&children))
+                        .map(|(path, (volume, entry))| (path.clone(), volume.clone(), *entry)),
+                )
+                .collect()
         };
 
-        let mut within_budget = true;
-        {
-            let mem = self.mem_idx.read().map_err(|_| IndexError::ReadLock)?;
-            if let Some((volume, entry)) = mem.entries.get(prefix) {
-                within_budget &= offer(prefix.to_string(), volume.clone(), *entry);
-            }
-            let range = (Bound::Included(children.as_str()), Bound::Unbounded);
-            for (path, (volume, entry)) in mem.entries.range::<str, _>(range) {
-                if !within_budget || !path.starts_with(&children) {
-                    break;
-                }
-                within_budget &= offer(path.clone(), volume.clone(), *entry);
-            }
-        }
+        let mut sources: PeekableVersions<'_> = vec![
+            (Box::new(in_memory.into_iter())
+                as Box<dyn Iterator<Item = (String, String, IndexEntry)>>)
+                .peekable(),
+        ];
 
         for segment in segments.segments() {
-            if !within_budget {
-                break;
-            }
-
             let doc_count = segment.meta_map().len() / 16;
             let path_at = |id: usize| segment.document_at(id).map(|(path, _, _)| path);
-            if let Some(id) = lower_bound(doc_count, path_at, prefix)
-                && let Some((path, volume, entry)) = segment.document_at(id)
-                && path == prefix
-            {
-                within_budget &= offer(path, volume, entry);
+            let own = lower_bound(doc_count, path_at, prefix)
+                .and_then(|id| segment.document_at(id))
+                .filter(|(path, _, _)| path == prefix);
+
+            let start = lower_bound(doc_count, path_at, &children).unwrap_or(doc_count);
+            let children = children.clone();
+            let under = (start..doc_count)
+                .map_while(move |id| segment.document_at(id))
+                .take_while(move |(path, _, _)| path.starts_with(&children));
+
+            sources.push(
+                (Box::new(own.into_iter().chain(under))
+                    as Box<dyn Iterator<Item = (String, String, IndexEntry)>>)
+                    .peekable(),
+            );
+        }
+
+        let mut versions: usize = 0;
+        loop {
+            let Some(next) = sources
+                .iter_mut()
+                .filter_map(|source| source.peek().map(|(path, _, _)| path.clone()))
+                .min()
+            else {
+                return Ok(PrefixScanEnd::Exhausted);
+            };
+
+            let mut newest: Option<(String, String, IndexEntry)> = None;
+
+            for source in &mut sources {
+                while let Some(version) = source.next_if(|(path, _, _)| *path == next) {
+                    versions += 1;
+                    if newest.as_ref().is_none_or(|(_, _, kept)| {
+                        version.2.opstamp.sequence() > kept.opstamp.sequence()
+                    }) {
+                        newest = Some(version);
+                    }
+                }
             }
 
-            let Some(start) = lower_bound(doc_count, path_at, &children) else {
+            if versions > max_versions {
+                return Ok(PrefixScanEnd::VersionBudgetExceeded);
+            }
+
+            let Some((path, entry_volume, entry)) = newest else {
                 continue;
             };
 
-            for id in start..doc_count {
-                let Some((path, volume, entry)) = segment.document_at(id) else {
-                    break;
-                };
-                if !within_budget || !path.starts_with(&children) {
-                    break;
-                }
-                within_budget &= offer(path, volume, entry);
-            }
-        }
-
-        if !within_budget {
-            return Ok(None);
-        }
-
-        let mut live = Vec::new();
-        for (path, (entry_volume, entry)) in latest {
             if entry.opstamp.is_deletion()
                 || volume.is_some_and(|v| v != entry_volume)
                 || tombstones.is_tombstoned(
@@ -1132,10 +1180,7 @@ impl Index {
                 continue;
             }
 
-            if live.len() == limit {
-                return Ok(None);
-            }
-            live.push(FilesystemEntry {
+            let flow = visit(FilesystemEntry {
                 path: PathBuf::from(path),
                 volume: entry_volume,
                 kind: entry.kind,
@@ -1144,9 +1189,11 @@ impl Index {
                 category: entry.category,
                 volume_type: entry.volume_type,
             });
-        }
 
-        Ok(Some(live))
+            if flow.is_break() {
+                return Ok(PrefixScanEnd::Stopped);
+            }
+        }
     }
 
     /// Retrieve all indexed files last accessed until the given timestamp (in seconds).
@@ -1938,6 +1985,12 @@ impl From<WalError> for IndexError {
     }
 }
 
+enum PrefixScanEnd {
+    Exhausted,
+    Stopped,
+    VersionBudgetExceeded,
+}
+
 #[cfg(all(test, feature = "shuttle"))]
 mod concurrency_tests;
 
@@ -2624,6 +2677,108 @@ mod tests {
         assert_eq!(res_dir.len(), 0);
 
         std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// A prefix scan merges the memtable and every segment into one stream that
+    /// holds the newest version of each path and nothing a deletion, a prefix
+    /// tombstone or another volume hides, in ascending path order. Siblings that
+    /// share the prefix's spelling (`dir.txt`, `dirx`) do not match it.
+    #[test]
+    fn test_prefix_scan_streams_newest_live_entries_in_path_order() -> Result<(), IndexError> {
+        let temp_dir = std::env::temp_dir().join(format!("minidex_test_prefix_{}", rand_id()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let root = format!("{sep}home{sep}dir");
+        let path = |name: &str| format!("{root}{sep}{name}");
+        let entry = |path: &str, volume: &str, modified: u64| FilesystemEntry {
+            path: PathBuf::from(path),
+            volume: volume.to_string(),
+            kind: Kind::File,
+            last_modified: modified,
+            last_accessed: modified,
+            category: category::OTHER,
+            volume_type: VolumeType::Local,
+        };
+
+        let index = Index::open(&temp_dir)?;
+        // First segment: the root, a sibling spelled like it, and files that later
+        // change, vanish or get tombstoned.
+        index.insert_batch(
+            [
+                entry(&root, "vol1", 1),
+                entry(&format!("{root}.txt"), "vol1", 1),
+                entry(&format!("{root}x"), "vol1", 1),
+                entry(&path("kept"), "vol1", 1),
+                entry(&path("edited"), "vol1", 1),
+                entry(&path("deleted"), "vol1", 1),
+                entry(&path(&format!("gone{sep}a")), "vol1", 1),
+                entry(&path("other-volume"), "vol2", 1),
+            ],
+            100,
+        )?;
+        index.flush()?;
+        // Second segment: an edit, a point deletion and a prefix tombstone.
+        index.insert(entry(&path("edited"), "vol1", 2))?;
+        index.delete(Path::new(&path("deleted")))?;
+        index.delete_prefix(&path("gone"))?;
+        index.flush()?;
+        // Memtable: a newer edit and an entry that only exists in memory.
+        index.insert(entry(&path("edited"), "vol1", 3))?;
+        index.insert(entry(&path(&format!("new{sep}b")), "vol1", 3))?;
+        let mut visited = Vec::new();
+        let complete = index.for_each_with_prefix(Some("vol1"), &root, |found| {
+            visited.push((
+                found.path.to_string_lossy().into_owned(),
+                found.last_modified,
+            ));
+            ControlFlow::Continue(())
+        })?;
+        assert!(complete);
+        let expected = vec![
+            (root.clone(), 1),
+            (path("edited"), 3),
+            (path("kept"), 1),
+            (path(&format!("new{sep}b")), 3),
+        ];
+        assert_eq!(visited, expected);
+
+        let listed: Vec<_> = index
+            .with_prefix(Some("vol1"), &root, 10)?
+            .expect("within the limit")
+            .into_iter()
+            .map(|found| {
+                (
+                    found.path.to_string_lossy().into_owned(),
+                    found.last_modified,
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "with_prefix returns the same entries in the same order"
+        );
+        assert!(
+            index.with_prefix(Some("vol1"), &root, 3)?.is_none(),
+            "over the limit"
+        );
+        assert_eq!(
+            index.with_prefix(None, &root, 10)?.map(|all| all.len()),
+            Some(5),
+            "every volume"
+        );
+
+        let mut seen = 0;
+        let complete = index.for_each_with_prefix(None, &root, |_| {
+            seen += 1;
+            if seen == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        assert!(!complete && seen == 2, "the visitor stops the scan");
+
         Ok(())
     }
 
