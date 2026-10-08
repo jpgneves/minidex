@@ -107,7 +107,7 @@ fn bench_index_search(c: &mut Criterion) {
     for size in sizes {
         let dir = tempdir().expect("failed to create temp dir");
         let config = CompactorConfigBuilder::new().flush_threshold(2000).build();
-        let index = Index::open_with_config(dir.path(), config).expect("failed to open index");
+        let index = Index::open_with_config(dir.path(), config, 4).expect("failed to open index");
 
         populate_index(&index, size);
 

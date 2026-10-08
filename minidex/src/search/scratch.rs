@@ -11,7 +11,7 @@
 use crate::sync::Mutex;
 
 pub(crate) const RETAINED_BYTES_PER_BUFFER: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_POOLED_BUFFERS: usize = 4;
+pub(crate) const DEFAULT_MAX_SCRATCH_POOL_SIZE: usize = 4;
 
 /// The working buffers for one search, used across in-memory and on-disk
 /// paths.
@@ -46,12 +46,18 @@ impl SearchScratch {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct ScratchPool {
+    max_pooled_buffers: usize,
     pooled: Mutex<Vec<SearchScratch>>,
 }
 
 impl ScratchPool {
+    pub(crate) fn new(max_pooled_buffers: usize) -> Self {
+        Self {
+            max_pooled_buffers,
+            ..Default::default()
+        }
+    }
     pub(crate) fn take(&self) -> SearchScratch {
         self.pooled
             .lock()
@@ -63,7 +69,7 @@ impl ScratchPool {
     pub(crate) fn give(&self, mut scratch: SearchScratch) {
         scratch.trim();
         if let Ok(mut pooled) = self.pooled.lock()
-            && pooled.len() < MAX_POOLED_BUFFERS
+            && pooled.len() < self.max_pooled_buffers
         {
             pooled.push(scratch);
         }
@@ -72,6 +78,15 @@ impl ScratchPool {
     #[cfg(test)]
     pub(crate) fn pooled(&self) -> usize {
         self.pooled.lock().map(|pooled| pooled.len()).unwrap_or(0)
+    }
+}
+
+impl Default for ScratchPool {
+    fn default() -> Self {
+        Self {
+            max_pooled_buffers: DEFAULT_MAX_SCRATCH_POOL_SIZE,
+            pooled: Default::default(),
+        }
     }
 }
 
@@ -98,10 +113,12 @@ mod tests {
     #[test]
     fn pool_keeps_a_bounded_number_of_scratches() {
         let pool = ScratchPool::default();
-        let taken: Vec<_> = (0..MAX_POOLED_BUFFERS + 3).map(|_| pool.take()).collect();
+        let taken: Vec<_> = (0..DEFAULT_MAX_SCRATCH_POOL_SIZE + 3)
+            .map(|_| pool.take())
+            .collect();
         for scratch in taken {
             pool.give(scratch);
         }
-        assert_eq!(pool.pooled(), MAX_POOLED_BUFFERS);
+        assert_eq!(pool.pooled(), DEFAULT_MAX_SCRATCH_POOL_SIZE);
     }
 }

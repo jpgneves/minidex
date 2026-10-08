@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use fst::{Automaton as _, IntoStreamer as _, Streamer, automaton::Str};
 
 use memtable::MemTable;
-use search::{ScratchPool, evaluate_candidate};
+use search::{DEFAULT_MAX_SCRATCH_POOL_SIZE, ScratchPool, evaluate_candidate};
 use thiserror::Error;
 
 mod collector;
@@ -66,7 +66,11 @@ impl Index {
     /// 2. Try to obtain a lock on the directory
     /// 3. Load the discovered segments, data and posting
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IndexError> {
-        Self::open_with_config(path, CompactorConfig::default())
+        Self::open_with_config(
+            path,
+            CompactorConfig::default(),
+            DEFAULT_MAX_SCRATCH_POOL_SIZE,
+        )
     }
 
     /// Open the index on disk with a custom compactor configuration.
@@ -77,6 +81,7 @@ impl Index {
     pub fn open_with_config<P: AsRef<Path>>(
         path: P,
         compactor_config: CompactorConfig,
+        scratch_pool_size: usize,
     ) -> Result<Self, IndexError> {
         let base = SegmentedIndex::open(&path).map_err(IndexError::SegmentedIndex)?;
         let base = Arc::new(ArcSwap::from_pointee(base));
@@ -163,7 +168,7 @@ impl Index {
             flusher: Arc::new(RwLock::new(None)),
             prefix_tombstones,
             recovery: Arc::new(RwLock::new(recovery)),
-            search_scratch: ScratchPool::default(),
+            search_scratch: ScratchPool::new(scratch_pool_size),
         };
 
         Ok(index)
@@ -2418,7 +2423,7 @@ mod tests {
 
         let sep = std::path::MAIN_SEPARATOR_STR;
 
-        let index = Index::open_with_config(&temp_dir, config)?;
+        let index = Index::open_with_config(&temp_dir, config, 4)?;
         index.insert(FilesystemEntry {
             path: PathBuf::from(format!("{}foo{}a.txt", sep, sep)),
             volume: "vol1".to_string(),
@@ -2539,7 +2544,7 @@ mod tests {
 
         let sep = std::path::MAIN_SEPARATOR_STR;
 
-        let index = Index::open_with_config(&temp_dir, config)?;
+        let index = Index::open_with_config(&temp_dir, config, 4)?;
 
         // Create 4 items to trigger 2 flushes (with flush_threshold=1)
         for i in 0..4 {

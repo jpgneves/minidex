@@ -95,7 +95,11 @@ impl App {
 
         let index_exists = std::path::Path::new(&abs_index_path).exists();
         let index = if index_exists {
-            Some(Arc::new(Index::open_with_config(&abs_index_path, config)?))
+            Some(Arc::new(Index::open_with_config(
+                &abs_index_path,
+                config,
+                4,
+            )?))
         } else {
             None
         };
@@ -146,7 +150,7 @@ impl App {
             .tombstone_threshold(self.edit_tombstone_threshold.parse().unwrap_or(2500))
             .build();
 
-        let index = Arc::new(Index::open_with_config(&self.index_path, config)?);
+        let index = Arc::new(Index::open_with_config(&self.index_path, config, 4)?);
         self.index = Some(Arc::clone(&index));
         Ok(index)
     }
@@ -174,7 +178,7 @@ impl App {
         self.edit_index_path = self.index_path.clone();
 
         // Index handles its own drop (sync + join threads)
-        let index = Arc::new(Index::open_with_config(&self.index_path, config)?);
+        let index = Arc::new(Index::open_with_config(&self.index_path, config, 4)?);
         self.index = Some(Arc::clone(&index));
         self.results.clear();
         self.search_latencies_us.clear();
