@@ -13,7 +13,7 @@ mod _concurrency_tests {
             min_merge_count: 2,
             ..Default::default()
         };
-        let index = Index::open_with_config(temp_dir.path(), config).unwrap();
+        let index = Index::open_with_config(temp_dir.path(), config, 4).unwrap();
         (temp_dir, index)
     }
 
