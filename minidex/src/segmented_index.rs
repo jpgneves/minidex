@@ -176,6 +176,17 @@ impl Segment {
         )
     }
 
+    /// Read the list cardinality without decoding document IDs. The on-disk header already stores it.
+    pub(crate) fn posting_count(&self, offset: u64) -> usize {
+        let Ok(start) = usize::try_from(offset) else {
+            return 0;
+        };
+        let post = self.post.as_ref().expect("posting should be loaded");
+        post.get(start..start.saturating_add(size_of::<u32>()))
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+            .unwrap_or(0)
+    }
+
     /// Helper to append a posting list directly to an existing Vec
     pub(crate) fn append_posting_list(&self, offset: u64, out: &mut Vec<u32>) {
         let start = offset as usize;
@@ -399,6 +410,7 @@ impl Drop for Segment {
 pub struct SegmentedIndex {
     segments: Vec<Arc<Segment>>,
     _lockfile: Arc<File>,
+    generation: usize,
 }
 
 impl SegmentedIndex {
@@ -424,6 +436,7 @@ impl SegmentedIndex {
         let mut result = Self {
             segments: Vec::new(),
             _lockfile: Arc::new(lockfile),
+            generation: 0,
         };
 
         for entry in entries.flatten() {
@@ -468,6 +481,11 @@ impl SegmentedIndex {
     /// Add segment to the index
     pub(crate) fn add_segment(&mut self, segment: Arc<Segment>) {
         self.segments.push(segment);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub(crate) fn generation(&self) -> usize {
+        self.generation
     }
 
     /// Atomically swaps out old segments for a newly compacted segment,
@@ -485,6 +503,7 @@ impl SegmentedIndex {
         let was_full = self.segments.is_empty();
 
         self.segments.push(new_segment);
+        self.generation = self.generation.wrapping_add(1);
 
         for old_seg in old_segments {
             old_seg.mark_deleted();
