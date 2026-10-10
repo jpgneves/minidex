@@ -8,6 +8,16 @@ pub(crate) const TOKENIZER_VERSION: u32 = 1;
 
 /// A basic Unicode-aware tokenizer.
 pub fn tokenize(input: &str) -> Vec<String> {
+    // NFKC leaves every ASCII code point unchanged. Avoid its per-character state machine for
+    // ordinary paths, while retaining one implementation of the boundary and folding rules.
+    if input.is_ascii() {
+        tokenize_chars(input.chars())
+    } else {
+        tokenize_chars(input.nfkc())
+    }
+}
+
+fn tokenize_chars(chars: impl Iterator<Item = char>) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut compound = String::new();
@@ -44,7 +54,7 @@ pub fn tokenize(input: &str) -> Vec<String> {
         }
     };
 
-    for c in input.nfkc() {
+    for c in chars {
         if !c.is_alphanumeric() || c == '\u{2014}' {
             push_token(&mut tokens, &mut current);
             current.clear();
@@ -215,6 +225,19 @@ pub(crate) fn write_synthesized_token(buffer: &mut String, tag: char, orig: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_fast_path_preserves_every_character_and_boundary() {
+        let mut seed = 42u64;
+        for _ in 0..2000 {
+            let mut text = String::new();
+            for _ in 0..128 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push(((seed >> 32) as u8 & 127) as char);
+            }
+            assert_eq!(tokenize(&text), tokenize_chars(text.nfkc()));
+        }
+    }
 
     #[test]
     fn test_tokenize_basic() {

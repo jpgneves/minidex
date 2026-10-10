@@ -128,8 +128,18 @@ pub(crate) fn retain_top_k<T>(candidates: &mut Vec<(u64, T)>, cap: usize) {
 }
 
 #[inline(always)]
-pub(crate) fn retain_top_k_distinct(candidates: &mut Vec<(u64, u32)>, cap: usize) {
+pub(crate) fn retain_top_k_distinct(candidates: &mut Vec<(u64, u32)>, cap: usize) -> bool {
     candidates.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
     candidates.dedup_by_key(|candidate| candidate.1);
-    retain_top_k(candidates, cap);
+    if candidates.len() > cap {
+        candidates.select_nth_unstable_by(cap, |a, b| b.0.cmp(&a.0));
+        let boundary = candidates[cap].0;
+        let tied = candidates[..cap]
+            .iter()
+            .any(|candidate| candidate.0 == boundary);
+        candidates.truncate(cap);
+        tied
+    } else {
+        false
+    }
 }

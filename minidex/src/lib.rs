@@ -174,6 +174,22 @@ impl Index {
         Ok(index)
     }
 
+    /// An opaque identity for the current search state, for bounded caller-side query reuse.
+    /// Recovery publishes segments independently of writes, so reuse is disabled until it finishes.
+    /// A monotonic base revision changes on each publication, even without a new operation sequence.
+    /// Tokens are comparable only within the same Index instance.
+    pub fn search_generation(&self) -> Option<(u64, usize)> {
+        let recovery = self.recovery.try_read().ok()?;
+        if recovery
+            .as_ref()
+            .is_some_and(|handle| !handle.is_completed())
+        {
+            return None;
+        }
+        let base = self.base.load();
+        Some((self.next_op_seq.load(Ordering::Acquire), base.generation()))
+    }
+
     pub fn wait_for_completed_recovery(&self) {
         if let Ok(mut lock) = self.recovery.write()
             && let Some(handle) = lock.take()
@@ -456,6 +472,17 @@ impl Index {
         offset: usize,
         options: SearchOptions<'_>,
     ) -> Result<Vec<SearchResult>, IndexError> {
+        self.search_with_planning(query, limit, offset, options, true)
+    }
+
+    fn search_with_planning(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        options: SearchOptions<'_>,
+        planning: bool,
+    ) -> Result<Vec<SearchResult>, IndexError> {
         let mut tokens = crate::tokenizer::tokenize(query);
 
         if tokens.is_empty() {
@@ -510,6 +537,7 @@ impl Index {
             mut exact_words,
             mut extension_words,
         } = self.search_scratch.take();
+        let mut ambiguous_cutoff = false;
 
         let mut mem_materialized = Vec::new();
         {
@@ -521,10 +549,54 @@ impl Index {
             let mut mem_exact_matches =
                 ExactMatches::reuse(std::mem::take(&mut exact_words), mem_documents);
 
+            // Only unbounded conjunctions are reordered: the short-prefix candidate policy is
+            // intentionally order-sensitive. Keep the scorer's original token order unchanged.
+            let plan = planning && mem_documents >= 16_384;
+            let token_order = plan_token_order(&tokens, &options, plan, |token| {
+                if token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG) {
+                    return mem.inverted_index.get(token).map_or(0, Vec::len);
+                }
+                let end = format!("{token}\u{FFFF}");
+                let mut count = 0usize;
+                for (i, (_, ids)) in mem
+                    .inverted_index
+                    .range::<str, _>((Bound::Included(token), Bound::Included(end.as_str())))
+                    .enumerate()
+                {
+                    if i == 64 {
+                        return count;
+                    }
+                    count = count.saturating_add(ids.len());
+                }
+                count
+            });
+            let reordered = token_order.iter().enumerate().any(|(i, &(j, _))| i != j);
             // In-memory searches
-            for (token_index, token) in tokens.iter().enumerate() {
+            for (order_index, &(token_index, estimated_cost)) in token_order.iter().enumerate() {
+                let token = &tokens[token_index];
+                if plan
+                    && have_candidates
+                    && current_matches.len() <= 16
+                    && estimated_cost > current_matches.len().saturating_mul(4)
+                    && unbounded_terms(&tokens, &options)
+                {
+                    current_matches.retain(|&id| {
+                        let Some((path, volume, _)) = mem.id_to_data.get(&id) else {
+                            return false;
+                        };
+                        let Some(exact) = matches_indexed_tokens(path, volume, &tokens, true)
+                        else {
+                            return false;
+                        };
+                        if exact {
+                            mem_exact_matches.set(id);
+                        }
+                        true
+                    });
+                    break;
+                }
                 let is_first_token = !have_candidates;
-                let is_last = token_index + 1 == tokens.len();
+                let is_last = order_index + 1 == tokens.len();
 
                 let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
@@ -598,11 +670,11 @@ impl Index {
                         }
 
                         if prefiltered_candidates.len() > keep_docs.saturating_mul(4) {
-                            retain_token_candidates(
+                            ambiguous_cutoff |= retain_token_candidates(
                                 &mut prefiltered_candidates,
                                 keep_docs,
                                 is_last,
-                            );
+                            ) && reordered;
                         }
                     }
                 };
@@ -641,7 +713,9 @@ impl Index {
                     break;
                 }
 
-                retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last);
+                ambiguous_cutoff |=
+                    retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last)
+                        && reordered;
                 token_docs.clear();
                 token_docs.extend(prefiltered_candidates.iter().map(|&(_, id)| id));
                 token_docs.sort_unstable();
@@ -733,14 +807,63 @@ impl Index {
             let mut segment_exact_matches =
                 ExactMatches::reuse(std::mem::take(&mut exact_words), segment_documents);
 
-            for (token_index, token) in tokens.iter().enumerate() {
+            let plan = planning && segment_documents >= 16_384;
+            let token_order = plan_token_order(&tokens, &options, plan, |token| {
+                if token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG) {
+                    return map
+                        .get(token)
+                        .map_or(0, |offset| segment.posting_count(offset));
+                }
+                let mut prefix_end = token.as_bytes().to_vec();
+                prefix_end.push(0xff);
+                let mut stream = map
+                    .range()
+                    .ge(token.as_bytes())
+                    .lt(&prefix_end)
+                    .into_stream();
+                let mut count = 0usize;
+                let mut expansions = 0;
+                while let Some((_, offset)) = stream.next() {
+                    if expansions == 64 {
+                        return count;
+                    }
+                    count = count.saturating_add(segment.posting_count(offset));
+                    expansions += 1;
+                }
+                count
+            });
+            let reordered = token_order.iter().enumerate().any(|(i, &(j, _))| i != j);
+            for (order_index, &(token_index, estimated_cost)) in token_order.iter().enumerate() {
+                let token = &tokens[token_index];
+                if plan
+                    && !first_token
+                    && current_matches.len() <= 16
+                    && estimated_cost > current_matches.len().saturating_mul(4)
+                    && segment.has_current_tokens()
+                    && unbounded_terms(&tokens, &options)
+                {
+                    current_matches.retain(|&id| {
+                        let Some((path, volume, _)) = segment.document_at(id as usize) else {
+                            return false;
+                        };
+                        let Some(exact) = matches_indexed_tokens(&path, &volume, &tokens, false)
+                        else {
+                            return false;
+                        };
+                        if exact {
+                            segment_exact_matches.set(id);
+                        }
+                        true
+                    });
+                    break;
+                }
                 // Skip on 0 matches
                 if !first_token && current_matches.is_empty() {
                     valid_matches = false;
                     break;
                 }
 
-                let is_last = token_index + 1 == tokens.len();
+                let is_last = order_index + 1 == tokens.len();
 
                 let is_exact = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
 
@@ -832,11 +955,11 @@ impl Index {
                                 prefiltered_candidates.push((sort_key, doc_id));
 
                                 if prefiltered_candidates.len() > keep_docs.saturating_mul(4) {
-                                    retain_token_candidates(
+                                    ambiguous_cutoff |= retain_token_candidates(
                                         &mut prefiltered_candidates,
                                         keep_docs,
                                         is_last,
-                                    );
+                                    ) && reordered;
                                 }
                             }
                         }
@@ -848,9 +971,16 @@ impl Index {
                     if let Some(post_offset) = map.get(token) {
                         process_offset(post_offset, true);
                     }
-                } else {
-                    let matcher = Str::new(token).starts_with();
-                    let mut stream = map.search(&matcher).into_stream();
+                } else if planning {
+                    // Valid UTF-8 terms starting with this prefix are exactly this byte range.
+                    // Range traversal keeps the original FST order and candidate cutoff behavior.
+                    let mut prefix_end = token.as_bytes().to_vec();
+                    prefix_end.push(0xff);
+                    let mut stream = map
+                        .range()
+                        .ge(token.as_bytes())
+                        .lt(&prefix_end)
+                        .into_stream();
 
                     while let Some((term, post_offset)) = stream.next() {
                         let current_len = process_offset(post_offset, term == token.as_bytes());
@@ -861,10 +991,22 @@ impl Index {
                             break;
                         }
                     }
+                } else {
+                    let matcher = Str::new(token).starts_with();
+                    let mut stream = map.search(&matcher).into_stream();
+                    while let Some((term, post_offset)) = stream.next() {
+                        let current_len = process_offset(post_offset, term == token.as_bytes());
+                        term_count += 1;
+                        if term_count >= max_expansions || current_len >= max_docs {
+                            break;
+                        }
+                    }
                 }
 
                 if !ids_only {
-                    retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last);
+                    ambiguous_cutoff |=
+                        retain_token_candidates(&mut prefiltered_candidates, keep_docs, is_last)
+                            && reordered;
                     token_docs.clear();
                     token_docs.extend(prefiltered_candidates.iter().map(|&(_, id)| id));
                 }
@@ -961,6 +1103,15 @@ impl Index {
             exact_words,
             extension_words,
         });
+
+        // The legacy prefilter chooses arbitrary IDs when cheap keys tie at its cutoff. Reordering
+        // posting traversal can choose a different page in that case. Preserve that historical
+        // selection by rerunning without the planner, after releasing the scratch and RAM lock.
+        if ambiguous_cutoff {
+            drop(collector);
+            drop(mem_materialized);
+            return self.search_with_planning(query, limit, offset, options, false);
+        }
 
         let mut results: Vec<_> = collector.finish().collect();
 
@@ -1947,6 +2098,151 @@ fn lower_bound(
 /// intersected and the final stage only keeps the top `scoring_cap` with the
 /// same key, so it's bounded to that while gathering.
 /// The other tokens keep `max_docs`.
+fn unbounded_terms(tokens: &[String], options: &SearchOptions<'_>) -> bool {
+    tokens.iter().all(|t| {
+        t.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG)
+            || t.chars().count() > options.short_prefix_threshold
+    })
+}
+
+/// Once a conjunction has at most sixteen IDs left, probe their indexed tokens instead of
+/// enumerating thousands of expansions of a common prefix/extension. Reads index records only.
+/// Recompute exactly the same extension exclusion and exact-term boost as the posting path.
+fn matches_indexed_tokens(
+    path: &str,
+    volume: &str,
+    tokens: &[String],
+    mem_range: bool,
+) -> Option<bool> {
+    if path.is_ascii() && tokens.iter().all(|t| t.is_ascii()) {
+        let mut exact = false;
+        for token in tokens {
+            let (matched, term_exact) = matches_ascii_indexed_term(path, token);
+            if !matched {
+                return None;
+            }
+            exact |= term_exact;
+        }
+        return Some(exact);
+    }
+    let indexed = crate::tokenizer::extract_all_tokens(path, volume);
+    let mut exact_match = false;
+    for token in tokens {
+        let synthetic = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
+        let upper = mem_range.then(|| format!("{token}\u{FFFF}"));
+        let matched = indexed.iter().any(|term| {
+            if synthetic {
+                term == token
+            } else {
+                term.starts_with(token) && upper.as_ref().is_none_or(|end| term <= end)
+            }
+        });
+        if !matched {
+            return None;
+        }
+        let extension_only = !synthetic
+            && indexed.contains(&crate::tokenizer::synthesize_token(
+                crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                token,
+            ));
+        exact_match |= indexed.contains(token) && !extension_only;
+    }
+    Some(exact_match)
+}
+
+/// The ASCII tokenizer emits every alphanumeric run and its camel/numeric pieces. Inspect those
+/// slices directly, including the full filename and extension tokens, without allocating strings.
+/// Non-ASCII paths retain the tokenizer path above, including normalization and CJK suffixes.
+fn matches_ascii_indexed_term(path: &str, token: &str) -> (bool, bool) {
+    let path_obj = std::path::Path::new(path);
+    let filename = path_obj.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let has_extension = |needle: &str| {
+        path_obj
+            .extension()
+            .and_then(|n| n.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case(needle))
+            || filename.strip_prefix('.').is_some_and(|hidden| {
+                let first = hidden.split('.').next().unwrap_or("");
+                !first.is_empty() && first.eq_ignore_ascii_case(needle)
+            })
+    };
+    if let Some(ext) = token.strip_prefix(crate::tokenizer::SYNTH_EXT_TOKEN_TAG) {
+        let matched = has_extension(ext);
+        return (matched, matched);
+    }
+    let mut matched = false;
+    let mut exact = false;
+    let mut check = |term: &str| {
+        if term.len() >= token.len() && term[..token.len()].eq_ignore_ascii_case(token) {
+            matched = true;
+            exact |= term.len() == token.len();
+        }
+    };
+    for run in path
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        check(run);
+        let bytes = run.as_bytes();
+        let mut start = 0;
+        for i in 1..bytes.len() {
+            let p = bytes[i - 1];
+            let c = bytes[i];
+            if (p.is_ascii_lowercase() && c.is_ascii_uppercase())
+                || (p.is_ascii_alphabetic() && c.is_ascii_digit())
+                || (p.is_ascii_digit() && c.is_ascii_alphabetic())
+            {
+                check(&run[start..i]);
+                start = i;
+            }
+        }
+        check(&run[start..]);
+    }
+    let trimmed = path.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let full_filename = trimmed
+        .rsplit(std::path::MAIN_SEPARATOR)
+        .next()
+        .unwrap_or("");
+    if full_filename.contains('.') && full_filename.starts_with(char::is_alphanumeric) {
+        check(full_filename);
+    }
+    (matched, exact && !has_extension(token))
+}
+
+/// Estimate only a bounded number of term headers, never scan paths or allocate an index-sized
+/// planner table. Reorder only when every term is unbounded, preserving short-prefix truncation.
+fn plan_token_order(
+    tokens: &[String],
+    options: &SearchOptions<'_>,
+    enabled: bool,
+    estimate: impl Fn(&str) -> usize,
+) -> Vec<(usize, usize)> {
+    let mut order: Vec<_> = (0..tokens.len()).map(|i| (i, 0)).collect();
+    if enabled
+        && tokens.len() > 1
+        && tokens.iter().all(|t| {
+            t.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG)
+                || t.chars().count() > options.short_prefix_threshold
+        })
+    {
+        // Planning pays for itself when it finds a tiny posting set. Otherwise retain the
+        // legacy traversal, avoiding both a second search on cutoff ties and expensive probes.
+        for (i, token) in tokens.iter().enumerate() {
+            let count = estimate(token);
+            if count <= 16 {
+                let first = order.remove(i);
+                order.insert(0, first);
+                for (_, cost) in &mut order {
+                    *cost = usize::MAX;
+                }
+                order[0].1 = count;
+                break;
+            }
+        }
+    }
+    order
+}
+
 fn last_token_bound(is_last: bool, max_docs: usize, scoring_cap: usize) -> usize {
     if is_last {
         max_docs.min(scoring_cap)
@@ -1958,11 +2254,12 @@ fn last_token_bound(is_last: bool, max_docs: usize, scoring_cap: usize) -> usize
 /// Trim a token's candidates to `keep`. The last token's candidates are trimmed
 /// over distinct documents, so the documents it keeps are the ones that the
 /// final stage would as well with deduplication.
-fn retain_token_candidates(candidates: &mut Vec<(u64, u32)>, keep: usize, is_last: bool) {
+fn retain_token_candidates(candidates: &mut Vec<(u64, u32)>, keep: usize, is_last: bool) -> bool {
     if is_last {
-        crate::search::retain_top_k_distinct(candidates, keep);
+        crate::search::retain_top_k_distinct(candidates, keep)
     } else {
         crate::search::retain_top_k(candidates, keep);
+        false
     }
 }
 
@@ -2792,5 +3089,241 @@ mod tests {
             .duration_since(crate::sync::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64
+    }
+}
+
+#[cfg(test)]
+mod query_planning_parity {
+    use super::*;
+
+    #[test]
+    fn prefix_ranges_preserve_automaton_order_for_unicode_and_exact_terms() {
+        let mut terms = vec![
+            "a", "aa", "ab", "aé", "a中", "a😀", "é", "éa", "中", "中文", "😀",
+        ];
+        terms.sort_unstable();
+        let map = fst::Map::from_iter(terms.iter().enumerate().map(|(i, term)| (*term, i as u64)))
+            .unwrap();
+        for prefix in ["", "a", "aa", "aé", "é", "中", "中文", "😀", "missing"] {
+            let matcher = Str::new(prefix).starts_with();
+            let expected = map.search(&matcher).into_stream().into_str_vec().unwrap();
+            let mut end = prefix.as_bytes().to_vec();
+            end.push(0xff);
+            let actual = map
+                .range()
+                .ge(prefix.as_bytes())
+                .lt(&end)
+                .into_stream()
+                .into_str_vec()
+                .unwrap();
+            assert_eq!(actual, expected, "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn every_base_publication_changes_generation_without_relying_on_allocator_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open_with_config(
+            dir.path(),
+            CompactorConfig {
+                flush_threshold: usize::MAX,
+                min_merge_count: usize::MAX,
+                tombstone_threshold: usize::MAX,
+            },
+            1,
+        )
+        .unwrap();
+        for i in 0..8 {
+            index
+                .insert(FilesystemEntry {
+                    path: format!("/root/needle{i}.txt").into(),
+                    volume: "local".into(),
+                    kind: Kind::File,
+                    last_modified: 1,
+                    last_accessed: 1,
+                    category: category::TEXT,
+                    volume_type: VolumeType::Local,
+                })
+                .unwrap();
+            let before = index.search_generation().unwrap();
+            index.flush().unwrap();
+            let after = index.search_generation().unwrap();
+            assert!(after.1 > before.1);
+            if i > 0 {
+                index.force_compact_all().unwrap();
+                let compacted = index.search_generation().unwrap();
+                assert!(compacted.1 > after.1);
+            }
+        }
+    }
+
+    #[test]
+    fn planning_preserves_ties_at_the_candidate_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        index
+            .insert_batch(
+                (0..20_000).map(|i| FilesystemEntry {
+                    path: format!("/root/project{:03}/report{i:06}.txt", i / 1000).into(),
+                    volume: "local".into(),
+                    kind: Kind::File,
+                    last_modified: 1_000_000,
+                    last_accessed: 1_000_000,
+                    category: category::TEXT,
+                    volume_type: VolumeType::Local,
+                }),
+                1000,
+            )
+            .unwrap();
+        for phase in 0..2 {
+            if phase == 1 {
+                index.flush().unwrap();
+            }
+            for i in 0..100 {
+                let query = match i % 5 {
+                    0 => format!("report-{i:03}"),
+                    1 => format!("project{i:03} report"),
+                    2 => "report tx".into(),
+                    3 => "report r".into(),
+                    _ => "report txt".into(),
+                };
+                let options = || SearchOptions {
+                    max_scoring_cap: Some(20),
+                    max_expansions: usize::MAX,
+                    ..Default::default()
+                };
+                let expected = index
+                    .search_with_planning(&query, 20, i % 3, options(), false)
+                    .unwrap();
+                let actual = index.search(&query, 20, i % 3, options()).unwrap();
+                assert_eq!(
+                    actual.iter().map(|r| &r.path).collect::<Vec<_>>(),
+                    expected.iter().map(|r| &r.path).collect::<Vec<_>>(),
+                    "{query:?}, phase {phase}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_candidate_probe_matches_the_indexed_tokens() {
+        let mut seed = 123u64;
+        let mut paths = vec![
+            "/root/.txt".to_string(),
+            "/root/name.".into(),
+            "/root/..txt".into(),
+            "/root/abCd123.txt/".into(),
+        ];
+        for _ in 0..500 {
+            let mut path = String::from("/root/");
+            for _ in 0..96 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                path.push(((seed >> 32) as u8 & 127) as char);
+            }
+            paths.push(path);
+        }
+        for path in paths {
+            let indexed = crate::tokenizer::extract_all_tokens(&path, "volume");
+            for term in &indexed {
+                if term.starts_with('\0') || term.starts_with('\x01') {
+                    continue;
+                }
+                for len in 1..=term.len().min(8) {
+                    let token = &term[..len];
+                    let extension = token.starts_with(crate::tokenizer::SYNTH_EXT_TOKEN_TAG);
+                    let matched = indexed.iter().any(|t| {
+                        if extension {
+                            t == token
+                        } else {
+                            t.starts_with(token)
+                        }
+                    });
+                    let exact = indexed.iter().any(|t| t == token)
+                        && (extension
+                            || !indexed.contains(&crate::tokenizer::synthesize_token(
+                                crate::tokenizer::SYNTH_EXT_TOKEN_TAG,
+                                token,
+                            )));
+                    assert_eq!(
+                        matches_ascii_indexed_term(&path, token),
+                        (matched, exact),
+                        "{path:?}, {token:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conjunction_planning_preserves_results_across_storage_filters_and_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        index
+            .insert_batch(
+                (0..20_000).map(|i| FilesystemEntry {
+                    path: format!("/root/common/needle{i:05}.txt").into(),
+                    volume: if i % 2 == 0 { "local" } else { "external" }.into(),
+                    kind: if i % 19 == 0 {
+                        Kind::Directory
+                    } else {
+                        Kind::File
+                    },
+                    last_modified: 1_000_000 + i,
+                    last_accessed: 1_000_000 + i,
+                    category: if i % 3 == 0 {
+                        category::DOCUMENT
+                    } else {
+                        category::TEXT
+                    },
+                    volume_type: VolumeType::Local,
+                }),
+                1000,
+            )
+            .unwrap();
+        for phase in 0..3 {
+            if phase == 1 {
+                index.flush().unwrap();
+            }
+            if phase == 2 {
+                index.delete_prefix("/root/common/needle000").unwrap();
+                index.force_compact_all().unwrap();
+            }
+            for i in 0..2000 {
+                let query = match i % 5 {
+                    0 => format!("common needle{i:05}.txt"),
+                    1 => format!("needle{i:05} common"),
+                    2 => "common ne".into(),
+                    3 => "common n".into(),
+                    _ => format!("common absent{i:05}"),
+                };
+                let options = || SearchOptions {
+                    kind: if i % 7 == 0 { Some(Kind::File) } else { None },
+                    category: if i % 11 == 0 {
+                        Some(category::TEXT)
+                    } else {
+                        None
+                    },
+                    volume_name: if i % 13 == 0 { Some("local") } else { None },
+                    max_scoring_cap: Some(20),
+                    max_expansions: usize::MAX,
+                    short_prefix_threshold: 1,
+                    ..SearchOptions::default()
+                };
+                let expected = index
+                    .search_with_planning(&query, 20, i as usize % 3, options(), false)
+                    .unwrap();
+                let actual = index.search(&query, 20, i as usize % 3, options()).unwrap();
+                let paths = |rows: Vec<SearchResult>| {
+                    rows.into_iter()
+                        .map(|r| (r.path, r.kind, r.last_modified, r.last_accessed, r.category))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    paths(actual),
+                    paths(expected),
+                    "phase {phase}, query {query:?}"
+                );
+            }
+        }
     }
 }
